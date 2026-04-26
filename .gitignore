@@ -2,6 +2,8 @@
 auto_mount
 auto_mount.log
 *.log
+
+# config (local only - contains sensitive data)
 auto_mount.plist
 
 # macOS
