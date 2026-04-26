@@ -10,6 +10,18 @@ macOS 自动挂载 NAS 工具。当连接到指定 WiFi 时，静默挂载指定
 - ✅ **开机自启** — 支持 LaunchAgent 配置，开机或网络变化时自动运行
 - ✅ **零依赖** — 编译后为独立可执行文件，无需安装任何依赖
 
+## 产品需求说明 (PRD)
+
+### 场景描述
+- **局域网漫游**：用户经常带着 Mac 在外网（如公司、咖啡厅）和家庭内网之间切换，期望回到家时自动挂载 NAS。
+- **复杂代理环境**：用户常驻开启代理软件（如 Clash Verge 的 TUN 模式 + Fake-IP）。这会导致系统的默认路由被接管，常规的网络高层 API 会将网络误判为“有线网络”，且内部域名（如 `nas.local`）可能被假 IP 劫持。
+- **完全静默免扰**：希望挂载过程完全在后台进行，不要弹出任何 Finder 窗口，也不要在每次网络切换或开机时弹窗请求 `sudo` 密码。
+
+### 核心功能与机制
+1. **物理层网络指纹（核心突破）**：程序完全穿透 VPN TUN 虚拟网卡，直接通过底层 ARP 协议探测物理网卡（如 `en0`）连接的**真实路由器 MAC 地址（BSSID）**作为家庭网络指纹。不再依赖 Wi-Fi SSID 名称，从而完美避开了 macOS 14+ 严格的定位隐私限制，实现了**真正的零权限（免 Sudo）运行**。
+2. **事件驱动无感监听**：程序自身不驻留后台。利用 macOS 原生 `launchd` 监听系统网络状态变化。当网络发生切换时，`launchd` 会极速唤醒程序。程序比对当前路由器 MAC 指纹，若不一致则立刻安全退出（零资源占用）；若一致则发起挂载。
+3. **域名直连兼容**：全面兼容 `.local` 等内网域名挂载。针对 Clash Fake-IP 用户，只需在 Clash 规则中将 `.local` 加入直连（Bypass）名单，即可实现极其稳定、极速的内网挂载。
+
 ## 系统要求
 
 - macOS 10.15+
@@ -28,10 +40,10 @@ clang auto_mount.m -framework SystemConfiguration -framework Foundation -framewo
 
 ### 2. 首次初始化
 
-首次运行需要使用 sudo 获取当前 WiFi SSID 并保存配置：
+连上家里的网络，执行初始化（获取当前路由器 MAC 地址作为家庭指纹，**不需要 sudo**）：
 
 ```bash
-sudo ./auto_mount --init
+./auto_mount --init
 ```
 
 输出示例：
@@ -40,8 +52,8 @@ sudo ./auto_mount --init
 Auto Mount Tool - Init Mode
 ===========================
 
-[1] Getting current WiFi SSID...
-  Current SSID: YourWiFi
+[1] Getting current network fingerprint (Gateway MAC)...
+  Current Gateway MAC: 00:11:22:33:44:55
 
 [2] Configuring mount targets...
   Enter SMB URL (or press Enter to finish): smb://server.local/share
@@ -49,10 +61,10 @@ Auto Mount Tool - Init Mode
   ✓ Added: smb://server.local/share -> /Volumes/share
   Add another? (y/n): n
 ✓ Config saved to: ./auto_mount.plist
-  Target SSID: YourWiFi
+  Target Gateway MAC: 00:11:22:33:44:55
   Mount targets: 1
 
-[DONE] Init complete! You can now run './auto_mount' without sudo.
+[DONE] Init complete! You can now run './auto_mount' seamlessly.
 ```
 
 ### 3. 测试运行
@@ -68,12 +80,17 @@ Auto Mount Tool
 ===============
 
 [1] Loading config...
-  Target SSID: YourWiFi
+  Target Gateway MAC: 00:11:22:33:44:55
 
-[2] Checking network...
+[2] Checking network fingerprint...
+  Current Gateway MAC: 00:11:22:33:44:55
+  ✓ Network fingerprint matched!
+
+[3] Checking network...
+  NAS hostname: your-server.local
   ✓ Server reachable!
 
-[3] Checking mount points...
+[4] Checking mount points...
   /Volumes/your-share-1: not mounted, mounting...
   ✓ Mounted: smb://your-server.local/your-share-1
   /Volumes/your-share-2: already mounted, skipping.
@@ -126,7 +143,7 @@ launchctl load ~/Library/LaunchAgents/com.user.auto-mount.plist
 使用 `--init` 重新初始化配置：
 
 ```bash
-sudo ./auto_mount --init
+./auto_mount --init
 ```
 
 或直接编辑 plist 文件：
@@ -142,8 +159,8 @@ nano ./auto_mount.plist
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1-0.dtd">
 <plist version="1.0">
 <dict>
-    <key>target_ssid</key>
-    <string>YourWiFiName</string>
+    <key>target_gateway_mac</key>
+    <string>00:11:22:33:44:55</string>
     <key>mount_targets</key>
     <array>
         <dict>
@@ -261,25 +278,26 @@ AutoMount/
 
 ## 常见问题
 
-### Q: 为什么首次运行需要 sudo？
+### Q: 开启了 Clash TUN 模式导致挂载失败怎么办？
 
-A: macOS 14+ 出于隐私保护，获取 WiFi SSID 需要 root 权限。首次初始化后，SSID 会保存到配置文件，后续运行无需 sudo。
+A: 本工具已经彻底重构了底层网络识别逻辑（MAC 地址物理探针），完全免疫 TUN 模式带来的“误判为有线网络”问题。如果您仍然挂载失败，通常是因为 Clash 的 **Fake-IP 机制劫持了内网域名**。
+**解决办法**：请在 Clash 的配置文件（规则）中，加入对 `.local` 域名（或您 NAS 的具体域名）的直连（Bypass）规则。例如：`DOMAIN-SUFFIX,local,DIRECT`。
 
-### Q: 如何更换目标 WiFi？
+### Q: 如何更换家庭网络/目标路由器？
 
-A: 在新的 WiFi 网络下重新运行初始化：
+A: 连接到新网络后，重新运行一次免密的初始化命令即可：
 
 ```bash
-sudo ./auto_mount --init
+./auto_mount --init
 ```
 
-### Q: 挂载失败怎么办？
+### Q: 挂载失败的常规检查点？
 
 A: 检查以下几点：
 
-1. 确认已保存过 WiFi 凭据到 Keychain（首次手动挂载时会提示保存）
+1. 确认已将 NAS 访问凭据保存到 Keychain（首次在 Finder 手动连接时勾选“记住密码”）
 2. 确认 NAS 服务器在线
-3. 确认当前连接的是目标 WiFi
+3. 确认当前所处网络的路由器没有更换（若更换了光猫或主路由，请重新 `--init`）
 
 ### Q: 提示 "Server not reachable" 但 NAS 确实在线？
 

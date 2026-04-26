@@ -100,66 +100,43 @@ launchd (开机自启 + 事件触发)
         └── 调用 mount_nas（NetFSMountURLSync 静默挂载）
 ```
 
-### 检测当前 WiFi SSID
+### 识别当前局域网环境 (物理探测)
 
-**⚠️ macOS 26+ 隐私限制（实测发现）**
+**⚠️ 痛点：macOS 隐私限制与 VPN 路由劫持（实测发现）**
 
-macOS 26 对 WiFi SSID 获取施加了严格限制：
+1. **SSID 隐私限制**：macOS 14+ 严格限制 SSID 获取，非系统应用获取到的通常是 `<redacted>`。以往使用 `wdutil info` 强行获取需要 `sudo` 权限，严重影响静默自动化的体验。
+2. **TUN 模式误导**：当使用 Clash TUN 模式等全局 VPN 时，系统默认路由被劫持到虚拟网卡（`utun`），导致 macOS 高层网络 API 误认为当前在使用“有线网络”，从而使得基于“Wi-Fi 状态检测”的逻辑直接崩盘。
 
-| 方法 | 需要 sudo | macOS 26 可用性 | 备注 |
-|------|-----------|-----------------|------|
-| `airport -I` | ❌ | ❌ 路径可能不存在 | 旧方法 |
-| `ipconfig getsummary en0` | ❌ | ❌ 返回 `<redacted>` | 隐私保护 |
-| `CoreWLAN` 框架 | ❌ | ⚠️ 需要位置权限 | 需要用户授权 |
-| `SCDynamicStore` | ❌ | ❌ 返回空 SSID | macOS 26 限制 |
-| `wdutil info` | ✅ | ✅ 可用 | 需要 sudo |
-| `networksetup` | ❌ | ⚠️ 不稳定 | 环境依赖 |
+**推荐终极方案：物理层网关 MAC 指纹（免 Sudo）**
 
-**推荐方案：Config 文件 + 首次初始化**
-
-由于获取 WiFi SSID 需要权限，推荐使用配置文件方案：
+既然高层网络 API 受到隐私和 VPN 的双重干扰，我们选择“降维探测”：直接下探到数据链路层（二层网络），询问物理网卡（如 `en0`）：“你直接连接的那个物理路由器的 MAC 地址是多少？”
 
 ```bash
-# 首次运行（保存当前 WiFi SSID 到配置文件）
-sudo ./auto_mount --init
+# 首次运行（记录当前物理路由器的 MAC 地址作为家庭指纹）
+./auto_mount --init
 
-# 后续运行（从配置文件读取 SSID，无需 sudo）
+# 后续运行（比对当前路由器的 MAC，吻合则挂载）
 ./auto_mount
 ```
 
-**获取 SSID 的代码（需要 root 权限）：**
+**获取 MAC 指纹的核心逻辑（全程无需 root）：**
 ```objc
-// 使用 wdutil 命令
-NSString* getSSIDWithWdutil() {
-    NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/usr/bin/wdutil"];
-    [task setArguments:@[@"info"]];
-    
-    NSPipe *pipe = [NSPipe pipe];
-    [task setStandardOutput:pipe];
-    [task launch];
-    [task waitUntilExit];
-    
-    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
-    NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    
-    // 解析 "SSID : xxx" 格式
-    NSArray *lines = [output componentsSeparatedByString:@"\n"];
-    for (NSString *line in lines) {
-        if ([line containsString:@"SSID"]) {
-            NSArray *parts = [line componentsSeparatedByString:@":"];
-            if ([parts count] >= 2) {
-                NSString *value = [[parts objectAtIndex:1] 
-                    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                if ([value length] > 0 && ![value isEqualToString:@"<redacted>"]) {
-                    return value;
-                }
-            }
-        }
-    }
-    return nil;
+// 1. 获取物理网关IP (使用系统底层 DHCP 状态，不受 TUN 默认路由影响)
+NSString* getPhysicalGatewayIP() {
+    // 轮询物理网卡 en0, en1 等
+    // 对应命令：/usr/sbin/ipconfig getoption en0 router
+    // 返回真实的网关局域网 IP，如 192.168.1.1
+}
+
+// 2. 根据 IP 获取网关 MAC 地址 (二层 ARP 协议)
+NSString* getMACAddressForIP(NSString *ip) {
+    // 对应命令：/usr/sbin/arp -n 192.168.1.1
+    // 解析输出获取 MAC 地址，例如 00:11:22:33:44:55
 }
 ```
+**优势：**
+- ✅ **完全免 `sudo`**：这些基础诊断命令对所有用户开放。
+- ✅ **100% 免疫 VPN 劫持**：ARP 和物理 DHCP 状态处于网络栈底层，Clash 的三层 TUN 隧道无法伪装或篡改物理路由器的 MAC。
 
 ### 检测是否已挂载
 
@@ -283,10 +260,10 @@ smb://192.168.1.100/nas_share
 
 1. **NetFSMountURLSync 是唯一可靠的静默挂载方案** — 直接从 Keychain 读取凭据，不弹窗
 2. **mount_smbfs 不能从 Keychain 读取** — 必须提供明文密码或配置文件
-3. **macOS 26 WiFi SSID 获取受限** — 多种方法返回 `<redacted>`，需要 sudo 或位置权限
-4. **系统级任务（launchd）优于 Agent Cron** — 不依赖外部服务，开机自启，实时响应
+3. **物理层 MAC 探测优于高层网络 API** — 完美绕过 macOS 14+ SSID 限制和 VPN TUN 模式导致的系统级网络类型误判，且无需 `sudo`
+4. **系统级任务（launchd）优于 Agent Cron** — 不依赖外部服务，开机自启，实时响应，不一致则秒级退出（0 开销）
 5. **C/ObjC 语言实现最轻量** — ~20KB 二进制，无依赖，启动最快
-6. **Config 文件方案** — 首次 sudo 初始化保存 SSID，后续无需密码
+6. **Config 文件方案** — 首次初始化保存物理网关 MAC 指纹，全程免密
 7. **mDNS Browse ≠ Resolve** — dns-sd -B 成功不代表主机名能解析为 IP，smbutil lookup 是可靠备用方案
 
 ## 配置文件位置建议
@@ -301,8 +278,8 @@ smb://192.168.1.100/nas_share
 ```objc
 #define CONFIG_FILE @"./auto_mount.plist"
 
-void saveConfig(NSString *ssid) {
-    NSDictionary *config = @{@"target_ssid": ssid};
+void saveConfig(NSString *fingerprint) {
+    NSDictionary *config = @{@"target_gateway_mac": fingerprint};
     [config writeToFile:CONFIG_FILE atomically:YES];
     // 设置权限为所有人可读
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0644} 
@@ -315,8 +292,8 @@ void saveConfig(NSString *ssid) {
 见 AutoMount 项目：`~/Documents/Project/projects/AutoMount/`
 
 核心功能：
-- `--init` 模式：sudo 获取 SSID 保存到配置文件
-- 正常模式：加载配置 → ping 检查服务器 → 静默挂载未挂载的卷宗
+- `--init` 模式：获取物理网关 MAC 地址作为指纹保存到配置文件（免 sudo）
+- 正常模式：加载配置 → 比对指纹 → 不一致立刻退出 → 一致则 ping 检查服务器 → 静默挂载未挂载的卷宗
 - 支持多个挂载目标
 - LaunchAgent 开机自启 + 网络变化触发
 

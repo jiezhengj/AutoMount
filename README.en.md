@@ -10,6 +10,18 @@ Silent auto-mount SMB shares on macOS when connected to designated WiFi. Zero de
 - ✅ **Auto-Start** — LaunchAgent support, runs on boot or network change
 - ✅ **Zero Dependencies** — Standalone executable, no extra packages required
 
+## Product Requirements Document (PRD)
+
+### Scenarios
+- **LAN Roaming**: Users frequently switch between external networks (e.g., company, cafe) and their home network, expecting automatic NAS mounting upon returning home.
+- **Complex Proxy Environments**: Users often have proxy software enabled (e.g., Clash Verge TUN mode + Fake-IP). This hijacks the system's default route, causing high-level network APIs to misidentify the network as "wired" and hijacking internal domains (e.g., `nas.local`) with fake IPs.
+- **Completely Silent**: The mounting process should happen entirely in the background without any Finder window popups or `sudo` password prompts during network switches.
+
+### Core Features & Mechanisms
+1. **Physical Layer Network Fingerprint (Core Breakthrough)**: The program bypasses the VPN TUN virtual interface, using the underlying ARP protocol to detect the **real router MAC address (BSSID)** connected to the physical network card (e.g., `en0`) as the home network fingerprint. It no longer relies on the WiFi SSID, completely avoiding macOS 14+ strict location privacy restrictions and achieving **true zero-permission (sudo-free) operation**.
+2. **Event-Driven Silent Monitoring**: The program does not run continuously in the background. It utilizes macOS native `launchd` to monitor system network state changes. Upon a network switch, `launchd` instantly wakes the program. It compares the current router MAC fingerprint; if mismatched, it safely exits immediately (zero resource overhead); if matched, it initiates the mount.
+3. **Domain Name Bypass Compatibility**: Fully supports `.local` domain mounts. For Clash Fake-IP users, simply add `.local` to the direct (Bypass) list in Clash rules to achieve highly stable and fast LAN mounting.
+
 ## Requirements
 
 - macOS 10.15+
@@ -28,10 +40,10 @@ clang auto_mount.m -framework SystemConfiguration -framework Foundation -framewo
 
 ### 2. First-Time Initialization
 
-Initial run requires sudo to get current WiFi SSID and save config:
+Connect to your home network and run the initialization (gets current router MAC address as the home fingerprint, **no sudo required**):
 
 ```bash
-sudo ./auto_mount --init
+./auto_mount --init
 ```
 
 Example output:
@@ -39,8 +51,8 @@ Example output:
 Auto Mount Tool - Init Mode
 ===========================
 
-[1] Getting current WiFi SSID...
-  Current SSID: YourWiFi
+[1] Getting current network fingerprint (Gateway MAC)...
+  Current Gateway MAC: 00:11:22:33:44:55
 
 [2] Configuring mount targets...
   Enter SMB URL (or press Enter to finish): smb://server.local/share
@@ -48,10 +60,10 @@ Auto Mount Tool - Init Mode
   ✓ Added: smb://server.local/share -> /Volumes/share
   Add another? (y/n): n
 ✓ Config saved to: ./auto_mount.plist
-  Target SSID: YourWiFi
+  Target Gateway MAC: 00:11:22:33:44:55
   Mount targets: 1
 
-[DONE] Init complete! You can now run './auto_mount' without sudo.
+[DONE] Init complete! You can now run './auto_mount' seamlessly.
 ```
 
 ### 3. Test Run
@@ -66,12 +78,17 @@ Auto Mount Tool
 ===============
 
 [1] Loading config...
-  Target SSID: YourWiFi
+  Target Gateway MAC: 00:11:22:33:44:55
 
-[2] Checking network...
+[2] Checking network fingerprint...
+  Current Gateway MAC: 00:11:22:33:44:55
+  ✓ Network fingerprint matched!
+
+[3] Checking network...
+  NAS hostname: your-server.local
   ✓ Server reachable!
 
-[3] Checking mount points...
+[4] Checking mount points...
   /Volumes/your-share-1: not mounted, mounting...
   ✓ Mounted: smb://your-server.local/your-share-1
   /Volumes/your-share-2: already mounted, skipping.
@@ -124,7 +141,7 @@ Config file: `./auto_mount.plist`
 Re-initialize with `--init`:
 
 ```bash
-sudo ./auto_mount --init
+./auto_mount --init
 ```
 
 Or edit the plist directly:
@@ -140,8 +157,8 @@ Config format:
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>target_ssid</key>
-    <string>YourWiFiName</string>
+    <key>target_gateway_mac</key>
+    <string>00:11:22:33:44:55</string>
     <key>mount_targets</key>
     <array>
         <dict>
@@ -162,7 +179,7 @@ Config format:
 If you change WiFi networks, re-initialize:
 
 ```bash
-sudo ./auto_mount --init
+./auto_mount --init
 ```
 
 ## How It Works
@@ -202,13 +219,13 @@ OSStatus status = NetFSMountURLSync(
 - Passing `NULL` for username and password makes the system automatically read saved credentials from Keychain
 - No Finder windows will appear
 
-### macOS Privacy Restrictions
+### macOS Privacy & VPN Restrictions
 
-macOS 14+ has strict restrictions on WiFi SSID access. This tool uses the following approach:
+macOS 14+ restricts WiFi SSID access, and VPNs (like Clash TUN) obscure network types. This tool uses a robust Layer-2 approach:
 
-1. **First-time initialization**: Uses `sudo wdutil info` to get SSID (requires root)
-2. **Save config**: Stores SSID to `./auto_mount.plist`
-3. **Daily operation**: Checks server reachability via ping to indirectly determine if on target network
+1. **Initialization**: Uses `ipconfig` and `arp` to get the physical router's MAC address (BSSID) directly from the network interface, requiring **no root/sudo privileges**.
+2. **Save config**: Stores the MAC address to `./auto_mount.plist`.
+3. **Daily operation**: Compares the current router's MAC address with the saved one, bypassing any VPN routing layer.
 
 ## Management Commands
 
@@ -260,24 +277,25 @@ Options:
 
 ## FAQ
 
-### Q: Why does the first run require sudo?
+### Q: Mount fails when Clash TUN mode is active?
 
-A: macOS 14+ restricts WiFi SSID access for privacy. After first initialization, the SSID is saved to config file, so subsequent runs don't need sudo.
+A: This tool's physical network detection bypasses TUN's "wired network" misidentification. However, Clash's **Fake-IP mechanism might hijack your NAS domain**.
+**Solution**: Add a bypass rule for your `.local` domain (or your specific NAS domain) in your Clash configuration. For example: `DOMAIN-SUFFIX,local,DIRECT`.
 
-### Q: How to change target WiFi?
+### Q: How to change target home network/router?
 
-A: Re-initialize under the new WiFi network:
+A: Connect to the new network and run the initialization command again:
 
 ```bash
-sudo ./auto_mount --init
+./auto_mount --init
 ```
 
-### Q: Mount failed?
+### Q: Standard checks for mount failure?
 
 A: Check the following:
-1. Ensure WiFi credentials are saved to Keychain (first manual mount will prompt to save)
-2. Ensure NAS server is online
-3. Ensure you're connected to the target WiFi
+1. Ensure NAS credentials are saved to Keychain (check "Remember password" on first manual Finder connection).
+2. Ensure NAS server is online.
+3. Ensure your router hasn't changed (if you replaced your main router, re-run `--init`).
 
 ### Q: "Server not reachable" but NAS is actually online?
 

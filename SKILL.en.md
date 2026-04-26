@@ -100,66 +100,43 @@ launchd (boot startup + event trigger)
         └── Call mount_nas (NetFSMountURLSync silent mount)
 ```
 
-### Detecting Current WiFi SSID
+### Identifying Local Network Environment (Physical Probing)
 
-**⚠️ macOS 26+ Privacy Restrictions (Discovered Through Testing)**
+**⚠️ Pain Points: macOS Privacy Restrictions & VPN Routing Hijack (Discovered Through Testing)**
 
-macOS 26 imposes strict restrictions on WiFi SSID access:
+1. **SSID Privacy Restrictions**: macOS 14+ strictly limits SSID access. Non-system apps usually get `<redacted>`. Previously, forcing access with `wdutil info` required `sudo`, ruining the silent automation experience.
+2. **TUN Mode Misdirection**: When using global VPNs like Clash TUN mode, the system's default route is hijacked to a virtual interface (`utun`). This causes high-level macOS network APIs to mistakenly believe the system is using a "wired network," causing any logic based on "Wi-Fi state detection" to fail entirely.
 
-| Method | Requires sudo | macOS 26 Availability | Notes |
-|--------|---------------|----------------------|-------|
-| `airport -I` | ❌ | ❌ Path may not exist | Legacy method |
-| `ipconfig getsummary en0` | ❌ | ❌ Returns `<redacted>` | Privacy protection |
-| `CoreWLAN` framework | ❌ | ⚠️ Requires location permission | Needs user authorization |
-| `SCDynamicStore` | ❌ | ❌ Returns empty SSID | macOS 26 restriction |
-| `wdutil info` | ✅ | ✅ Available | Requires sudo |
-| `networksetup` | ❌ | ⚠️ Unstable | Environment dependent |
+**Recommended Ultimate Solution: Physical Layer Gateway MAC Fingerprint (Sudo-Free)**
 
-**Recommended: Config File + First-Time Initialization**
-
-Since getting WiFi SSID requires permissions, config file approach is recommended:
+Since high-level network APIs are compromised by privacy limits and VPNs, we choose "low-level probing": going directly to the data link layer (Layer 2) and asking the physical network card (e.g., `en0`), "What is the MAC address of the physical router you are directly connected to?"
 
 ```bash
-# First run (save current WiFi SSID to config file)
-sudo ./auto_mount --init
+# First run (records the current physical router's MAC address as the home fingerprint)
+./auto_mount --init
 
-# Subsequent runs (read SSID from config file, no sudo needed)
+# Subsequent runs (compares current router's MAC, mounts if it matches)
 ./auto_mount
 ```
 
-**Code for getting SSID (requires root):**
+**Core Logic for Getting MAC Fingerprint (No root required):**
 ```objc
-// Using wdutil command
-NSString* getSSIDWithWdutil() {
-    NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/usr/bin/wdutil"];
-    [task setArguments:@[@"info"]];
-    
-    NSPipe *pipe = [NSPipe pipe];
-    [task setStandardOutput:pipe];
-    [task launch];
-    [task waitUntilExit];
-    
-    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
-    NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    
-    // Parse "SSID : xxx" format
-    NSArray *lines = [output componentsSeparatedByString:@"\n"];
-    for (NSString *line in lines) {
-        if ([line containsString:@"SSID"]) {
-            NSArray *parts = [line componentsSeparatedByString:@":"];
-            if ([parts count] >= 2) {
-                NSString *value = [[parts objectAtIndex:1] 
-                    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                if ([value length] > 0 && ![value isEqualToString:@"<redacted>"]) {
-                    return value;
-                }
-            }
-        }
-    }
-    return nil;
+// 1. Get physical gateway IP (Uses system underlying DHCP state, unaffected by TUN default route)
+NSString* getPhysicalGatewayIP() {
+    // Poll physical interfaces en0, en1, etc.
+    // Corresponding command: /usr/sbin/ipconfig getoption en0 router
+    // Returns the real gateway LAN IP, e.g., 192.168.1.1
+}
+
+// 2. Get gateway MAC address from IP (Layer 2 ARP protocol)
+NSString* getMACAddressForIP(NSString *ip) {
+    // Corresponding command: /usr/sbin/arp -n 192.168.1.1
+    // Parse output to get MAC address, e.g., 00:11:22:33:44:55
 }
 ```
+**Advantages:**
+- ✅ **Completely `sudo`-free**: These basic diagnostic commands are available to all users.
+- ✅ **100% Immune to VPN Hijacking**: ARP and physical DHCP states operate at the bottom of the network stack. Clash's Layer 3 TUN tunnel cannot spoof or alter the physical router's MAC address.
 
 ### Check if Already Mounted
 
@@ -283,10 +260,10 @@ But note that Keychain credentials are stored by server name; using IP may requi
 
 1. **NetFSMountURLSync is the only reliable silent mounting solution** — Reads credentials directly from Keychain, no popups
 2. **mount_smbfs cannot read from Keychain** — Requires plaintext password or config file
-3. **macOS 26 WiFi SSID access restricted** — Multiple methods return `<redacted>`, need sudo or location permission
-4. **System-level tasks (launchd) outperform Agent Cron** — No external service dependency, boot auto-start, real-time response
+3. **Physical layer MAC probing outperforms high-level network APIs** — Perfectly bypasses macOS 14+ SSID restrictions and VPN TUN mode misidentifications, requiring no `sudo`.
+4. **System-level tasks (launchd) outperform Agent Cron** — No external service dependency, boot auto-start, real-time response, exits in milliseconds if mismatched (0 overhead).
 5. **C/ObjC implementation is lightest** — ~20KB binary, no dependencies, fastest startup
-6. **Config file approach** — First sudo initialization saves SSID, subsequent runs password-free
+6. **Config file approach** — First initialization saves physical gateway MAC fingerprint, fully password-free.
 7. **mDNS Browse ≠ Resolve** — dns-sd -B success doesn't mean hostname resolves to IP; smbutil lookup is reliable fallback
 
 ## Config File Location Recommendation
@@ -301,8 +278,8 @@ Reasons:
 ```objc
 #define CONFIG_FILE @"./auto_mount.plist"
 
-void saveConfig(NSString *ssid) {
-    NSDictionary *config = @{@"target_ssid": ssid};
+void saveConfig(NSString *fingerprint) {
+    NSDictionary *config = @{@"target_gateway_mac": fingerprint};
     [config writeToFile:CONFIG_FILE atomically:YES];
     // Set permissions to world-readable
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0644} 
@@ -315,8 +292,8 @@ void saveConfig(NSString *ssid) {
 See AutoMount project: `~/Documents/Project/projects/AutoMount/`
 
 Core features:
-- `--init` mode: sudo gets SSID and saves to config file
-- Normal mode: Load config → ping check server → silent mount unmounted volumes
+- `--init` mode: Gets physical gateway MAC address as fingerprint and saves to config file (no sudo)
+- Normal mode: Load config → compare fingerprint → exit immediately if mismatched → if matched, ping check server → silent mount unmounted volumes
 - Supports multiple mount targets
 - LaunchAgent boot auto-start + network change trigger
 

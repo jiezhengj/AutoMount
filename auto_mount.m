@@ -61,9 +61,9 @@ static NSArray *getMountTargets() {
 }
 
 // 保存配置
-void saveConfig(NSString *ssid, NSArray *mountTargets) {
+void saveConfig(NSString *fingerprint, NSArray *mountTargets) {
     NSDictionary *config = @{
-        @"target_ssid": ssid,
+        @"target_gateway_mac": fingerprint ?: @"",
         @"mount_targets": mountTargets ?: @[],
         @"created_at": [NSDate date],
     };
@@ -77,7 +77,7 @@ void saveConfig(NSString *ssid, NSArray *mountTargets) {
                                  ofItemAtPath:getConfigPath() 
                                         error:nil];
     printf("✓ Config saved to: %s\n", [getConfigPath() UTF8String]);
-    printf("  Target SSID: %s\n", [ssid UTF8String]);
+    printf("  Target Gateway MAC: %s\n", [fingerprint UTF8String]);
     printf("  Mount targets: %d\n", (int)[mountTargets count]);
 }
 
@@ -116,42 +116,60 @@ NSArray* inputMountTargets() {
     return targets;
 }
 
-// 使用 wdutil 获取当前 WiFi SSID（需要 root 权限）
-NSString* getSSIDWithWdutil() {
-    NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/usr/bin/wdutil"];
-    [task setArguments:@[@"info"]];
-    NSPipe *pipe = [NSPipe pipe];
-    [task setStandardOutput:pipe];
-    [task setStandardError:pipe];
-    [task launch];
-    [task waitUntilExit];
-    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
-    NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    NSArray *lines = [output componentsSeparatedByString:@"\n"];
-    for (NSString *line in lines) {
-        if ([line containsString:@"SSID"]) {
-            NSArray *parts = [line componentsSeparatedByString:@":"];
-            if ([parts count] >= 2) {
-                NSString *value = [[parts objectAtIndex:1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                if ([value length] > 0 && ![value isEqualToString:@"<redacted>"]) return value;
+// 获取物理网关IP (穿透 TUN 隧道)
+NSString* getPhysicalGatewayIP() {
+    NSArray *interfaces = @[@"en0", @"en1", @"en2", @"en3"];
+    for (NSString *interface in interfaces) {
+        NSTask *task = [[NSTask alloc] init];
+        [task setLaunchPath:@"/usr/sbin/ipconfig"];
+        [task setArguments:@[@"getoption", interface, @"router"]];
+        NSPipe *pipe = [NSPipe pipe];
+        [task setStandardOutput:pipe];
+        [task launch];
+        [task waitUntilExit];
+        if ([task terminationStatus] == 0) {
+            NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+            NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            output = [output stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (output.length > 0) {
+                return output;
             }
         }
     }
     return nil;
 }
 
-// 检查 WiFi 是否已连接（通过是否有 IP）
-BOOL isWiFiConnected() {
-    FILE *fp = popen("/usr/sbin/ipconfig getsummary en0", "r");
-    if (fp == NULL) return NO;
-    char buf[256];
-    BOOL hasIPv4 = NO;
-    while (fgets(buf, sizeof(buf), fp) != NULL) {
-        if (strstr(buf, "IPv4") != NULL) { hasIPv4 = YES; break; }
+// 根据IP获取MAC地址 (二层 ARP 协议)
+NSString* getMACAddressForIP(NSString *ip) {
+    if (!ip || ip.length == 0) return nil;
+    NSTask *task = [[NSTask alloc] init];
+    [task setLaunchPath:@"/usr/sbin/arp"];
+    [task setArguments:@[@"-n", ip]];
+    NSPipe *pipe = [NSPipe pipe];
+    [task setStandardOutput:pipe];
+    [task launch];
+    [task waitUntilExit];
+    if ([task terminationStatus] == 0) {
+        NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        // Parse output: ? (192.168.1.1) at b0:be:76:xx:xx:xx on en0 ifscope [ethernet]
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"at\\s+([0-9a-fA-F:]+)\\s+on" options:0 error:nil];
+        NSTextCheckingResult *match = [regex firstMatchInString:output options:0 range:NSMakeRange(0, output.length)];
+        if (match) {
+            NSString *mac = [output substringWithRange:[match rangeAtIndex:1]];
+            return [mac lowercaseString];
+        }
     }
-    pclose(fp);
-    return hasIPv4;
+    return nil;
+}
+
+// 获取当前网络指纹（物理路由器的 MAC 地址）
+NSString* getCurrentNetworkFingerprint() {
+    NSString *gatewayIP = getPhysicalGatewayIP();
+    if (gatewayIP) {
+        return getMACAddressForIP(gatewayIP);
+    }
+    return nil;
 }
 
 // 检查挂载点是否已挂载
@@ -200,7 +218,7 @@ NSString* extractHostname(NSString *smbURL) {
 
 // 打印使用说明
 void printUsage() {
-    printf("Auto Mount Tool\n===============\n\nUsage:\n  sudo ./auto_mount --init    First time setup\n  ./auto_mount                Normal run\n  ./auto_mount --help         Help\n\nConfig file: %s\n", [getConfigPath() UTF8String]);
+    printf("Auto Mount Tool\n===============\n\nUsage:\n  ./auto_mount --init         First time setup (No sudo required)\n  ./auto_mount                Normal run\n  ./auto_mount --help         Help\n\nConfig file: %s\n", [getConfigPath() UTF8String]);
 }
 
 int main(int argc, const char * argv[]) {
@@ -214,23 +232,19 @@ int main(int argc, const char * argv[]) {
         if (isInit) {
             printf("Auto Mount Tool - Init Mode\n===========================\n\n");
             writeLog(@"Init mode started");
-            if (getuid() != 0) {
-                fprintf(stderr, "✗ Init mode requires root. Run: sudo ./auto_mount --init\n");
+            printf("[1] Getting current network fingerprint (Gateway MAC)...\n");
+            writeLog(@"Getting current network fingerprint");
+            NSString *fingerprint = getCurrentNetworkFingerprint();
+            if (fingerprint == nil) {
+                fprintf(stderr, "✗ Could not get network fingerprint. Are you connected to a network?\n");
+                writeLog(@"Could not get network fingerprint");
                 return 1;
             }
-            printf("[1] Getting current WiFi SSID...\n");
-            writeLog(@"Getting current WiFi SSID");
-            NSString *ssid = getSSIDWithWdutil();
-            if (ssid == nil) {
-                fprintf(stderr, "✗ Could not get WiFi SSID.\n");
-                writeLog(@"Could not get WiFi SSID");
-                return 1;
-            }
-            printf("  Current SSID: %s\n", [ssid UTF8String]);
-            writeLog([NSString stringWithFormat:@"Current SSID: %@", ssid]);
+            printf("  Current Gateway MAC: %s\n", [fingerprint UTF8String]);
+            writeLog([NSString stringWithFormat:@"Current Gateway MAC: %@", fingerprint]);
             NSArray *mountTargets = inputMountTargets();
-            saveConfig(ssid, mountTargets);
-            printf("\n[DONE] Init complete!\n");
+            saveConfig(fingerprint, mountTargets);
+            printf("\n[DONE] Init complete! You can now run './auto_mount' seamlessly.\n");
             writeLog(@"Init complete");
             return 0;
         }
@@ -240,24 +254,37 @@ int main(int argc, const char * argv[]) {
         printf("[1] Loading config...\n");
         NSDictionary *config = loadConfig();
         if (config == nil) {
-            fprintf(stderr, "✗ Config not found. Run: sudo ./auto_mount --init\n");
+            fprintf(stderr, "✗ Config not found. Run: ./auto_mount --init\n");
             writeLog(@"Config not found, exiting");
             return 1;
         }
-        NSString *targetSSID = config[@"target_ssid"];
-        printf("  Target SSID: %s\n", [targetSSID UTF8String]);
-        writeLog([NSString stringWithFormat:@"Target SSID: %@", targetSSID]);
+        // 兼容老版本的 target_ssid 字段
+        NSString *targetFingerprint = config[@"target_gateway_mac"] ?: config[@"target_ssid"];
+        if (!targetFingerprint) {
+            fprintf(stderr, "✗ Invalid config. Run: ./auto_mount --init\n");
+            writeLog(@"Invalid config, exiting");
+            return 1;
+        }
+        printf("  Target Gateway MAC: %s\n", [targetFingerprint UTF8String]);
+        writeLog([NSString stringWithFormat:@"Target Gateway MAC: %@", targetFingerprint]);
         
-        // 检查 WiFi 状态
-        printf("\n[2] Checking WiFi...\n");
-        BOOL wifiConnected = isWiFiConnected();
-        printf("  WiFi status: %s\n", wifiConnected ? "connected" : "not connected");
-        
-        if (!wifiConnected) {
-            printf("  ✗ WiFi not connected, exiting.\n");
-            writeLog(@"WiFi not connected, exiting");
+        // 检查当前网络环境（指纹比对）
+        printf("\n[2] Checking network fingerprint...\n");
+        NSString *currentFingerprint = getCurrentNetworkFingerprint();
+        if (currentFingerprint == nil) {
+            printf("  ✗ No physical network connection found, exiting.\n");
+            writeLog(@"No physical network connection found, exiting");
             return 0;
         }
+        printf("  Current Gateway MAC: %s\n", [currentFingerprint UTF8String]);
+        
+        if (![currentFingerprint isEqualToString:targetFingerprint] && ![currentFingerprint isEqualToString:[targetFingerprint lowercaseString]]) {
+            printf("  ✗ Network fingerprint mismatch, skipping mount.\n");
+            writeLog(@"Network fingerprint mismatch, skipping mount");
+            return 0;
+        }
+        printf("  ✓ Network fingerprint matched!\n");
+        writeLog(@"Network fingerprint matched");
         
         // 检查网络（ping NAS）- 必须通才算在目标网络
         printf("\n[3] Checking network...\n");
