@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>created_at</key>
+	<date>2026-04-25T09:56:09Z</date>
+	<key>mount_targets</key>
+	<array>
+		<dict>
+			<key>path</key>
+			<string>/Volumes/personal_folder</string>
+			<key>url</key>
+			<string>smb://dx4600.local/personal_folder</string>
+		</dict>
+	</array>
+	<key>target_ssid</key>
+	<string>finalhome</string>
+</dict>
+</plist>

@@ -1,0 +1,25 @@
+[2026-04-26 22:52:15] Auto Mount Tool started
+[2026-04-26 22:52:15] Target SSID: finalhome
+[2026-04-26 22:52:15] Server not reachable (not on target WiFi?), exiting
+[2026-04-26 22:55:39] Auto Mount Tool started
+[2026-04-26 22:55:39] Target SSID: finalhome
+[2026-04-26 22:55:39] Could not get WiFi SSID, exiting
+[2026-04-26 22:55:41] Server reachable
+[2026-04-26 22:55:53] Mounted: smb://dx4600.local/personal_folder
+[2026-04-26 22:55:53] Done: 1/1 volumes mounted
+[2026-04-26 22:56:46] Auto Mount Tool started
+[2026-04-26 22:56:46] Target SSID: finalhome
+[2026-04-26 22:56:46] Could not get WiFi SSID, exiting
+[2026-04-26 22:56:47] Server reachable
+[2026-04-26 22:56:47] Done: 1/1 volumes mounted
+[2026-04-26 23:15:41] Auto Mount Tool started
+[2026-04-26 23:15:41] Target SSID: finalhome
+[2026-04-26 23:15:41] Could not get WiFi SSID, exiting
+[2026-04-26 23:29:56] Auto Mount Tool started
+[2026-04-26 23:29:56] Target SSID: finalhome
+[2026-04-26 23:29:57] Server reachable
+[2026-04-26 23:29:57] Done: 1/1 volumes mounted
+[2026-04-26 23:30:29] Auto Mount Tool started
+[2026-04-26 23:30:29] Target SSID: finalhome
+[2026-04-26 23:30:31] Server reachable
+[2026-04-26 23:30:31] Done: 1/1 volumes mounted
