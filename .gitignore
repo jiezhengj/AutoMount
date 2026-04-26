@@ -1,0 +1,9 @@
+# auto_mount
+auto_mount
+auto_mount.log
+*.log
+auto_mount.plist
+
+# macOS
+.DS_Store
+._*
