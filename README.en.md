@@ -367,6 +367,11 @@ MIT License
 
 ## Changelog
 
+### v1.2.0 (2026-04-30)
+
+- 🔧 **Improvement**: Optimized logging behavior - now only logs error/exception cases, reducing log file bloat
+- 📝 Updated documentation
+
 ### v1.1.0 (2026-04-20)
 
 - 🐛 **Fix**: Changed SMB URL from `hostname._smb._tcp.local` to `hostname.local` format to resolve mDNS SRV record parsing failures in some network environments

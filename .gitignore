@@ -2,6 +2,7 @@
 auto_mount
 auto_mount.log
 *.log
+*.bak
 
 # config (local only - contains sensitive data)
 auto_mount.plist

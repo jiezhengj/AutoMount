@@ -198,7 +198,6 @@ BOOL silentMount(NSString *smbURL) {
     if (mountPoints != NULL) CFRelease(mountPoints);
     if (status == noErr) {
         printf("  ✓ Mounted: %s\n", [smbURL UTF8String]);
-        writeLog([NSString stringWithFormat:@"Mounted: %@", smbURL]);
         return YES;
     } else {
         fprintf(stderr, "  ✗ Failed to mount: %s (error: %d)\n", [smbURL UTF8String], (int)status);
@@ -231,9 +230,7 @@ int main(int argc, const char * argv[]) {
         
         if (isInit) {
             printf("Auto Mount Tool - Init Mode\n===========================\n\n");
-            writeLog(@"Init mode started");
             printf("[1] Getting current network fingerprint (Gateway MAC)...\n");
-            writeLog(@"Getting current network fingerprint");
             NSString *fingerprint = getCurrentNetworkFingerprint();
             if (fingerprint == nil) {
                 fprintf(stderr, "✗ Could not get network fingerprint. Are you connected to a network?\n");
@@ -241,16 +238,13 @@ int main(int argc, const char * argv[]) {
                 return 1;
             }
             printf("  Current Gateway MAC: %s\n", [fingerprint UTF8String]);
-            writeLog([NSString stringWithFormat:@"Current Gateway MAC: %@", fingerprint]);
             NSArray *mountTargets = inputMountTargets();
             saveConfig(fingerprint, mountTargets);
             printf("\n[DONE] Init complete! You can now run './auto_mount' seamlessly.\n");
-            writeLog(@"Init complete");
             return 0;
         }
         
         printf("Auto Mount Tool\n===============\n\n");
-        writeLog(@"Auto Mount Tool started");
         printf("[1] Loading config...\n");
         NSDictionary *config = loadConfig();
         if (config == nil) {
@@ -266,7 +260,6 @@ int main(int argc, const char * argv[]) {
             return 1;
         }
         printf("  Target Gateway MAC: %s\n", [targetFingerprint UTF8String]);
-        writeLog([NSString stringWithFormat:@"Target Gateway MAC: %@", targetFingerprint]);
         
         // 检查当前网络环境（指纹比对）
         printf("\n[2] Checking network fingerprint...\n");
@@ -284,7 +277,6 @@ int main(int argc, const char * argv[]) {
             return 0;
         }
         printf("  ✓ Network fingerprint matched!\n");
-        writeLog(@"Network fingerprint matched");
         
         // 检查网络（ping NAS）- 必须通才算在目标网络
         printf("\n[3] Checking network...\n");
@@ -315,7 +307,6 @@ int main(int argc, const char * argv[]) {
             return 0;
         }
         printf("  ✓ Server reachable!\n");
-        writeLog(@"Server reachable");
         
         // 遍历挂载
         printf("\n[4] Checking mount points...\n");
@@ -334,7 +325,6 @@ int main(int argc, const char * argv[]) {
             if (silentMount(smbURL)) mounted_count++;
         }
         printf("\n[DONE] %d/%d volumes mounted.\n", mounted_count, (int)[targets count]);
-        writeLog([NSString stringWithFormat:@"Done: %d/%d volumes mounted", mounted_count, (int)[targets count]]);
     }
     return 0;
 }
