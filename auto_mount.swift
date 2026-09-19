@@ -99,7 +99,7 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.4.0"
+let autoMountVersion = "2.4.1"
 let githubRepo = "jiezhengj/AutoMount"
 
 struct MatchRule: Codable {
@@ -200,7 +200,8 @@ func syncConfigToInstalledDirIfNeeded() {
         if FileManager.default.fileExists(atPath: srcURL.path) {
             try? FileManager.default.removeItem(at: dstURL)
             try? FileManager.default.copyItem(at: srcURL, to: dstURL)
-            print("✓ Synchronized updated configuration to LaunchAgent runtime: \(dstURL.path)")
+            print(tr("✓ 已同步最新配置至后台守护服务: \(dstURL.path)",
+                     "✓ Synchronized updated configuration to LaunchAgent runtime: \(dstURL.path)"))
             writeLog("Synchronized configuration to \(dstURL.path)")
         }
     }
@@ -215,7 +216,8 @@ func saveConfig(_ config: AutoMountConfig) {
         let data = try encoder.encode(config)
         try data.write(to: configURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: configURL.path)
-        print("✓ Config saved to: \(configURL.path)")
+        print(tr("✓ 配置已即时保存至: \(configURL.path)",
+                 "✓ Config saved to: \(configURL.path)"))
         syncConfigToInstalledDirIfNeeded()
     } catch {
         fputs("✗ Failed to save config: \(error.localizedDescription)\n", stderr)
@@ -1246,7 +1248,7 @@ func manageConfiguration() {
           [4] \(remoteActionTitle)
           [5] 守护服务管理 (部署/重载、查看详情、卸载服务)
           [6] 自动更新信道与版本维护 (设置更新策略、立即检查并升级)
-          [0] 保存配置并退出
+          [0] 退出配置管理
         """, """
 
         Software Version: v\(autoMountVersion) | Auto-Update Channel: \(channelDisplay)
@@ -1259,7 +1261,7 @@ func manageConfiguration() {
           [4] \(remoteActionTitle)
           [5] Daemon management (deploy/reload, view details, uninstall)
           [6] Auto-update channel & version maintenance
-          [0] Save configuration and exit
+          [0] Exit configuration management
         """))
 
         print(tr("请输入选项 [0-6]: ", "Enter choice [0-6]: "), terminator: "")
@@ -1304,6 +1306,7 @@ func manageConfiguration() {
             if sel < activeMounts.count {
                 let m = activeMounts[sel]
                 config.profiles[profileIndex].targets.append(MountTarget(url: m.url, mountPath: m.path))
+                saveConfig(config)
                 print(tr("✓ 已添加: \(m.path) <- \(m.url)", "✓ Added: \(m.path) <- \(m.url)"))
             } else {
                 // 手动输入
@@ -1322,6 +1325,7 @@ func manageConfiguration() {
                 let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let path = pathInput.isEmpty ? defaultPath : pathInput
                 config.profiles[profileIndex].targets.append(MountTarget(url: url, mountPath: path))
+                saveConfig(config)
                 print(tr("✓ 已添加: \(path) <- \(url)", "✓ Added: \(path) <- \(url)"))
             }
 
@@ -1348,6 +1352,7 @@ func manageConfiguration() {
                let delIdx = Int(delStr), delIdx >= 1 && delIdx <= flatTargets.count {
                 let item = flatTargets[delIdx - 1]
                 config.profiles[item.profileIndex].targets.remove(at: item.targetIndex)
+                saveConfig(config)
                 print(tr("✓ 已删除目标。", "✓ Target removed."))
             }
 
@@ -1365,6 +1370,7 @@ func manageConfiguration() {
                              "Press Enter to accept, or enter custom MAC [Default: \(curMAC)]: "), terminator: "")
                     let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     config.profiles[idx].match.value = input.isEmpty ? curMAC : input
+                    saveConfig(config)
                     print(tr("✓ 本地网关 MAC 已更新为: \(config.profiles[idx].match.value)",
                              "✓ Local gateway MAC updated to: \(config.profiles[idx].match.value)"))
                 } else {
@@ -1373,6 +1379,7 @@ func manageConfiguration() {
                     let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     if !input.isEmpty {
                         config.profiles[idx].match.value = input
+                        saveConfig(config)
                         print(tr("✓ 本地网关 MAC 已更新为: \(config.profiles[idx].match.value)",
                                  "✓ Local gateway MAC updated to: \(config.profiles[idx].match.value)"))
                     }
@@ -1462,6 +1469,7 @@ func manageConfiguration() {
             if let rIdx = existingRemoteIdx {
                 config.profiles[rIdx].match.value = newHost
                 config.profiles[rIdx].description = tr("远程互联 (\(selectedDisplayName))", "Remote Network (\(selectedDisplayName))")
+                saveConfig(config)
                 print(tr("✓ 远程探测目标已更新为: \(newHost) (\(selectedDisplayName))",
                          "✓ Remote probe target updated to: \(newHost) (\(selectedDisplayName))"))
             } else {
@@ -1499,6 +1507,7 @@ func manageConfiguration() {
                     targets: newTargets
                 )
                 config.profiles.append(newProfile)
+                saveConfig(config)
                 print(tr("✓ 远程策略已成功创建并加入配置。", "✓ Remote profile created and added to configuration."))
             }
 
@@ -1561,12 +1570,15 @@ func manageConfiguration() {
             switch uChoice {
             case "1":
                 config.updateChannel = "off"
+                saveConfig(config)
                 print(tr("✓ 自动更新策略已设置为: off", "✓ Auto-update policy set to: off"))
             case "2":
                 config.updateChannel = "notify"
+                saveConfig(config)
                 print(tr("✓ 自动更新策略已设置为: notify", "✓ Auto-update policy set to: notify"))
             case "3":
                 config.updateChannel = "auto"
+                saveConfig(config)
                 print(tr("✓ 自动更新策略已设置为: auto", "✓ Auto-update policy set to: auto"))
             case "4":
                 handleManualUpdateCommand()
@@ -1575,8 +1587,7 @@ func manageConfiguration() {
             }
 
         case "0":
-            saveConfig(config)
-            print(tr("✓ 配置管理已完成，修改已保存并生效。", "✓ Configuration management complete. Changes saved and applied."))
+            print(tr("✓ 已退出配置管理。", "✓ Exited configuration management."))
             return
 
         default:

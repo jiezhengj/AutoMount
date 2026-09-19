@@ -79,7 +79,7 @@ swift auto_mount.swift
 终端将弹出交互式一站式控制中心：
 
 ```text
-Auto Mount Tool - 日常配置管理 (v2.4.0)
+Auto Mount Tool - 日常配置管理 (v2.4.1)
 ====================================
 
 当前已配置策略：
@@ -88,20 +88,20 @@ Auto Mount Tool - 日常配置管理 (v2.4.0)
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-软件版本: v2.4.0 | 自动更新信道: off (关闭自动检查，纯手动)
+软件版本: v2.4.1 | 自动更新信道: off (关闭自动检查，纯手动)
 后台守护服务状态: 已注册运行 (gui/501/com.user.auto-mount)
 
 请选择操作：
   [1] 添加挂载目标 (支持从当前已挂载项中导入或手动输入，本地挂载点自动推导)
   [2] 删除已有挂载目标
-  [3] 重新检测/更新家庭网关 MAC
-  [4] 重新检测/更新远程 Tailscale 目标 (若未配置 Tailscale 则显示为：配置并添加远程 Tailscale 策略)
+  [3] 重新检测/更新本地网关 MAC
+  [4] 重新配置/更新远程互联主机 (Tailscale / 域名 / IP)
   [5] 守护服务管理 (部署/重载、查看详情、卸载服务)
   [6] 自动更新信道与版本维护 (设置更新策略、立即检查并升级)
-  [0] 保存配置并退出
+  [0] 退出配置管理
 ```
 
-退出保存时，程序不仅会更新工作区的 `auto_mount.plist`，还会自动同步至后台守护进程所在的配置目录，修改即刻全局生效。
+配置项在每次修改后均立即原子落盘至 `auto_mount.plist`，并自动同步至后台守护服务运行目录，无需单独执行保存，修改即刻全局生效。
 
 ## 部署开机与切网自动守护 (`--install`)
 
@@ -136,7 +136,7 @@ Auto Mount Tool - 日常配置管理 (v2.4.0)
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.4.0</string>
+    <string>2.4.1</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -222,7 +222,7 @@ Auto Mount Tool - 日常配置管理 (v2.4.0)
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.4.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
+| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.4.1`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
 | `update_channel` | String | 软件自动更新策略，可选值为 `off`（关闭，默认）、`notify`（通知提醒）、`auto`（自动静默热升级）。 |
 | `last_update_check_timestamp` | Real | 上次执行更新检查的 Unix 时间戳，用于 24 小时冷却时间窗口管理。 |
 | `last_notified_version` | String | 已发送通知的最新远端版本号，确保同一版本最多仅提醒 1 次防打扰。 |
