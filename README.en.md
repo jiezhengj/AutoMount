@@ -79,16 +79,15 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 The interactive management menu displays:
 
 ```text
-Auto Mount Tool - Daily Configuration Management (v2.1.0)
-======================================================
+Auto Mount Tool - Daily Configuration Management (v2.2.0)
+===================================================
 
-Currently configured profiles:
-  [1] home_lan (Home LAN Direct High-Speed) - 0 mount targets (Exclusion Gatekeeper, no local mounts)
-  [2] tailscale_remote (Tailscale Remote Peer (dx4600)) - 2 mount targets
+Configured Profiles:
+  [1] home_lan (Home LAN Direct - Multi-Gigabit)
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-Software Version: v2.1.0 | Auto-Update Channel: off (Disabled, manual update)
+Software Version: v2.2.0 | Auto-Update Channel: off (Disabled, manual update)
 Background Daemon Status: Active & running (gui/501/com.user.auto-mount)
 
 Select an action:
@@ -136,7 +135,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.1.0</string>
+    <string>2.2.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -222,7 +221,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.1.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
+| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.2.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
 | `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
 | `last_update_check_timestamp` | Real | Unix timestamp of the last update check, enforcing the 24-hour cooldown window. |
 | `last_notified_version` | String | Latest remote release tag that was notified, ensuring at most one notification per new version. |

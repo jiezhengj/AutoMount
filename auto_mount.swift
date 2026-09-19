@@ -99,7 +99,7 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.1.0"
+let autoMountVersion = "2.2.0"
 let githubRepo = "jiezhengj/AutoMount"
 
 struct MatchRule: Codable {

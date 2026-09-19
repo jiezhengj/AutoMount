@@ -79,7 +79,7 @@ swift auto_mount.swift
 终端将弹出交互式一站式控制中心：
 
 ```text
-Auto Mount Tool - 日常配置管理 (v2.1.0)
+Auto Mount Tool - 日常配置管理 (v2.2.0)
 ====================================
 
 当前已配置策略：
@@ -88,7 +88,7 @@ Auto Mount Tool - 日常配置管理 (v2.1.0)
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-软件版本: v2.1.0 | 自动更新信道: off (关闭自动检查，纯手动)
+软件版本: v2.2.0 | 自动更新信道: off (关闭自动检查，纯手动)
 后台守护服务状态: 已注册运行 (gui/501/com.user.auto-mount)
 
 请选择操作：
@@ -136,7 +136,7 @@ Auto Mount Tool - 日常配置管理 (v2.1.0)
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.1.0</string>
+    <string>2.2.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -222,7 +222,7 @@ Auto Mount Tool - 日常配置管理 (v2.1.0)
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.1.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
+| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.2.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
 | `update_channel` | String | 软件自动更新策略，可选值为 `off`（关闭，默认）、`notify`（通知提醒）、`auto`（自动静默热升级）。 |
 | `last_update_check_timestamp` | Real | 上次执行更新检查的 Unix 时间戳，用于 24 小时冷却时间窗口管理。 |
 | `last_notified_version` | String | 已发送通知的最新远端版本号，确保同一版本最多仅提醒 1 次防打扰。 |
