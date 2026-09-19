@@ -99,7 +99,7 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.2.0"
+let autoMountVersion = "2.3.0"
 let githubRepo = "jiezhengj/AutoMount"
 
 struct MatchRule: Codable {
@@ -2051,6 +2051,89 @@ func triggerBackgroundUpdateCheckIfNeeded(config: inout AutoMountConfig) {
     }
 }
 
+func getInstalledAppVersion() -> String? {
+    let installDir = getInstalledDir()
+    let installedBinary = installDir.appendingPathComponent("auto_mount").path
+    let installedSwift = installDir.appendingPathComponent("auto_mount.swift").path
+
+    let targetPath = FileManager.default.fileExists(atPath: installedBinary) ? installedBinary : (FileManager.default.fileExists(atPath: installedSwift) ? installedSwift : nil)
+    guard let exePath = targetPath else { return nil }
+
+    let result = runCommand(executable: exePath, arguments: ["--version"])
+    if result.status == 0 {
+        let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed.range(of: #"^\d+\.\d+\.\d+$"#, options: .regularExpression) != nil {
+            return trimmed
+        }
+    }
+
+    let swiftPath = FileManager.default.fileExists(atPath: installedSwift) ? installedSwift : (FileManager.default.fileExists(atPath: installedBinary) ? installedBinary : nil)
+    if let path = swiftPath, let content = try? String(contentsOfFile: path, encoding: .utf8) {
+        let pattern = #"let\s+autoMountVersion\s*=\s*"([^"]+)""#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: content, range: NSRange(content.startIndex..., in: content)),
+           let range = Range(match.range(at: 1), in: content) {
+            return String(content[range])
+        }
+    }
+    return nil
+}
+
+func syncCurrentToInstalledDaemon() -> Bool {
+    let currentAppDir = getAppDir()
+    let installDir = getInstalledDir()
+    guard FileManager.default.fileExists(atPath: installDir.path) else { return false }
+
+    let filesToSync = ["auto_mount", "auto_mount.swift", "auto_mount.plist"]
+    for fileName in filesToSync {
+        let srcURL = currentAppDir.appendingPathComponent(fileName)
+        let dstURL = installDir.appendingPathComponent(fileName)
+        if FileManager.default.fileExists(atPath: srcURL.path) {
+            try? FileManager.default.removeItem(at: dstURL)
+            try? FileManager.default.copyItem(at: srcURL, to: dstURL)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dstURL.path)
+        }
+    }
+
+    let uid = getuid()
+    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
+    let plistURL = getLaunchAgentPlistURL()
+    if FileManager.default.fileExists(atPath: plistURL.path) {
+        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
+        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootstrap", "gui/\(uid)", plistURL.path])
+    }
+    writeLog("Synchronized current workspace build to LaunchAgent runtime and reloaded daemon.")
+    return true
+}
+
+func checkAndSyncInstalledIfOutdated(currentVersion: String, installedVersion: String?) {
+    guard let instVer = installedVersion else { return }
+    guard isNewerVersion(currentVersion, than: instVer) else {
+        if instVer == currentVersion {
+            print(tr("✓ 后台守护服务版本一致 (v\(instVer))，无需同步。",
+                     "✓ Daemon service is in sync (v\(instVer))."))
+        }
+        return
+    }
+
+    print(tr("\n💡 检测到后台守护服务版本 (v\(instVer)) 落后于当前工作区 (v\(currentVersion))！",
+             "\n💡 Daemon service version (v\(instVer)) is older than current workspace (v\(currentVersion))!"))
+    print(tr("是否立即将当前工作区最新程序同步至后台守护服务？(Y/n) [默认 Y]: ",
+             "Synchronize current workspace build to daemon service now? (Y/n) [Default Y]: "), terminator: "")
+    let confirm = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y")
+    if confirm == "y" || confirm == "yes" || confirm.isEmpty {
+        if syncCurrentToInstalledDaemon() {
+            print(tr("✓ 已成功将后台守护服务同步升级至 v\(currentVersion)，并已热重载生效！",
+                     "✓ Successfully updated and reloaded daemon service to v\(currentVersion)!"))
+        } else {
+            print(tr("✗ 同步至后台守护服务失败，请尝试运行 './auto_mount --install'。",
+                     "✗ Failed to sync daemon service. Try running './auto_mount --install' manually."))
+        }
+    } else {
+        print(tr("已跳过后台守护服务同步。", "Skipped daemon service sync."))
+    }
+}
+
 func handleManualUpdateCommand() {
     print(tr("""
     Auto Mount Tool - 软件版本检测与自升级
@@ -2060,9 +2143,29 @@ func handleManualUpdateCommand() {
     =================================
     """))
 
-    print(tr("当前本地版本: v\(autoMountVersion)", "Current local version: v\(autoMountVersion)"))
-    print(tr("正在检索 GitHub 官方最新发布版本 (https://github.com/\(githubRepo))...",
-             "Checking latest release from GitHub (https://github.com/\(githubRepo))..."))
+    let currentVersion = autoMountVersion
+    let installedVersion = getInstalledAppVersion()
+    let currentDir = getAppDir()
+    let installDir = getInstalledDir()
+    let isRunningFromWorkspace = currentDir.path != installDir.path
+
+    if isRunningFromWorkspace {
+        print(tr("  • 当前运行程序: \(currentDir.appendingPathComponent("auto_mount").path) (v\(currentVersion))",
+                 "  • Current Executable: \(currentDir.appendingPathComponent("auto_mount").path) (v\(currentVersion))"))
+        if let instVer = installedVersion {
+            let status = (instVer == currentVersion) ? tr("版本一致", "In sync") : tr("待更新", "Out of sync")
+            print(tr("  • 后台守护服务: \(installDir.appendingPathComponent("auto_mount").path) (v\(instVer), \(status))",
+                     "  • Daemon Service: \(installDir.appendingPathComponent("auto_mount").path) (v\(instVer), \(status))"))
+        } else {
+            print(tr("  • 后台守护服务: 未安装", "  • Daemon Service: Not installed"))
+        }
+    } else {
+        print(tr("  • 当前运行程序: \(installDir.appendingPathComponent("auto_mount").path) (v\(currentVersion), 守护服务运行目录)",
+                 "  • Current Executable: \(installDir.appendingPathComponent("auto_mount").path) (v\(currentVersion), Daemon Runtime)"))
+    }
+
+    print(tr("\n正在检索 GitHub 官方最新发布版本 (https://github.com/\(githubRepo))...",
+             "\nChecking latest release from GitHub (https://github.com/\(githubRepo))..."))
 
     let fetchResult = fetchLatestReleaseInfo()
     let release: GitHubReleaseInfo
@@ -2070,21 +2173,24 @@ func handleManualUpdateCommand() {
     case .success(let info):
         release = info
     case .noReleasesFound:
-        print(tr("✓ 官方仓库目前尚未发布正式 Release 版本，本地 (v\(autoMountVersion)) 为最新状态。",
-                 "✓ No official release published yet on remote. Current local (v\(autoMountVersion)) is up to date."))
+        print(tr("✓ 官方仓库目前尚未发布正式 Release 版本，本地 (v\(currentVersion)) 为最新状态。",
+                 "✓ No official release published yet on remote. Current local (v\(currentVersion)) is up to date."))
+        checkAndSyncInstalledIfOutdated(currentVersion: currentVersion, installedVersion: installedVersion)
         return
     case .networkError:
         print(tr("✗ 无法连接到 GitHub 检查更新，请检查网络连接或稍后重试。",
                  "✗ Failed to check for updates. Please check network connection."))
+        checkAndSyncInstalledIfOutdated(currentVersion: currentVersion, installedVersion: installedVersion)
         return
     }
 
     let remoteVersion = release.tagName
     print(tr("远端最新版本: \(remoteVersion)", "Latest remote release: \(remoteVersion)"))
 
-    if !isNewerVersion(remoteVersion, than: autoMountVersion) {
-        print(tr("✓ 当前已经是最新版本 (v\(autoMountVersion))，无需升级。",
-                 "✓ You are running the latest version (v\(autoMountVersion))."))
+    if !isNewerVersion(remoteVersion, than: currentVersion) {
+        print(tr("✓ 当前运行程序已经是最新版本 (v\(currentVersion))。",
+                 "✓ Current executable is already up to date (v\(currentVersion))."))
+        checkAndSyncInstalledIfOutdated(currentVersion: currentVersion, installedVersion: installedVersion)
         return
     }
 
@@ -2126,7 +2232,8 @@ func printUsage() {
       ./auto_mount --uninstall    移除自启动配置与部署文件
       ./auto_mount --status       查看服务运行状态与挂载详情
       ./auto_mount --update       检查并升级软件至最新版本 (支持本地语法校验)
-      ./auto_mount --help         显示帮助说明
+      ./auto_mount --version, -v  查看当前软件版本号
+      ./auto_mount --help, -h     显示帮助说明
 
     环境变量:
       AUTO_MOUNT_LANG=zh|en       强制指定终端界面语言
@@ -2144,7 +2251,8 @@ func printUsage() {
       ./auto_mount --uninstall    Remove LaunchAgent daemon and deployed files
       ./auto_mount --status       Show service status and active mount details
       ./auto_mount --update       Check and self-update to latest release
-      ./auto_mount --help         Show this help message
+      ./auto_mount --version, -v  Show software version
+      ./auto_mount --help, -h     Show this help message
 
     Environment Variables:
       AUTO_MOUNT_LANG=zh|en       Explicitly specify terminal UI language
@@ -2178,6 +2286,9 @@ func main() {
             exit(0)
         case "--update":
             handleManualUpdateCommand()
+            exit(0)
+        case "--version", "-v":
+            print(autoMountVersion)
             exit(0)
         case "--help", "-h":
             printUsage()

@@ -79,7 +79,7 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 The interactive management menu displays:
 
 ```text
-Auto Mount Tool - Daily Configuration Management (v2.2.0)
+Auto Mount Tool - Daily Configuration Management (v2.3.0)
 ===================================================
 
 Configured Profiles:
@@ -87,7 +87,7 @@ Configured Profiles:
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-Software Version: v2.2.0 | Auto-Update Channel: off (Disabled, manual update)
+Software Version: v2.3.0 | Auto-Update Channel: off (Disabled, manual update)
 Background Daemon Status: Active & running (gui/501/com.user.auto-mount)
 
 Select an action:
@@ -135,7 +135,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.2.0</string>
+    <string>2.3.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -221,7 +221,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.2.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
+| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.3.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
 | `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
 | `last_update_check_timestamp` | Real | Unix timestamp of the last update check, enforcing the 24-hour cooldown window. |
 | `last_notified_version` | String | Latest remote release tag that was notified, ensuring at most one notification per new version. |
@@ -262,10 +262,20 @@ Check for updates and self-upgrade AutoMount anytime via:
 ./auto_mount --update
 ```
 
-The self-update pipeline incorporates three safety guarantees:
+The self-update pipeline incorporates four safety guarantees:
 1. **Semantic Version Comparison**: Queries GitHub Releases metadata to compare the current build against remote releases, cleanly skipping updates if already on the latest build.
-2. **Local Syntax Check Circuit Breaker**: Downloaded source code is verified in an isolated temporary location via `/usr/bin/swiftc -parse`. If syntax validation fails, the upgrade halts immediately to protect the running environment.
-3. **Dual Runtime Sync & Hot Reload**: Upon validation, updates are committed to both the workspace script and the `~/Library/Application Support/AutoMount` runtime, followed by an atomic `launchctl bootout / bootstrap` reload for instant effect.
+2. **Cross-Instance Version Awareness & Daemon Sync**: Evaluates both the active executable and the background daemon service at `~/Library/Application Support/AutoMount`. If the workspace is ahead of the daemon, `--update` offers a one-click synchronization to upgrade the daemon without requiring manual `--install`.
+3. **Local Syntax Check Circuit Breaker**: Downloaded source code is verified in an isolated temporary location via `/usr/bin/swiftc -parse`. If syntax validation fails, the upgrade halts immediately to protect the running environment.
+4. **Dual Runtime Sync & Hot Reload**: Upon validation, updates are committed to both the workspace script and the `~/Library/Application Support/AutoMount` runtime, followed by an atomic `launchctl bootout / bootstrap` reload for instant effect.
+
+## Print Version (`--version`, `-v`)
+
+Output raw version number directly for scripting or environment inspection:
+
+```bash
+./auto_mount --version
+```
+
 
 ## Operation Logs
 

@@ -79,7 +79,7 @@ swift auto_mount.swift
 终端将弹出交互式一站式控制中心：
 
 ```text
-Auto Mount Tool - 日常配置管理 (v2.2.0)
+Auto Mount Tool - 日常配置管理 (v2.3.0)
 ====================================
 
 当前已配置策略：
@@ -88,7 +88,7 @@ Auto Mount Tool - 日常配置管理 (v2.2.0)
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-软件版本: v2.2.0 | 自动更新信道: off (关闭自动检查，纯手动)
+软件版本: v2.3.0 | 自动更新信道: off (关闭自动检查，纯手动)
 后台守护服务状态: 已注册运行 (gui/501/com.user.auto-mount)
 
 请选择操作：
@@ -136,7 +136,7 @@ Auto Mount Tool - 日常配置管理 (v2.2.0)
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.2.0</string>
+    <string>2.3.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -222,7 +222,7 @@ Auto Mount Tool - 日常配置管理 (v2.2.0)
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.2.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
+| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.3.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
 | `update_channel` | String | 软件自动更新策略，可选值为 `off`（关闭，默认）、`notify`（通知提醒）、`auto`（自动静默热升级）。 |
 | `last_update_check_timestamp` | Real | 上次执行更新检查的 Unix 时间戳，用于 24 小时冷却时间窗口管理。 |
 | `last_notified_version` | String | 已发送通知的最新远端版本号，确保同一版本最多仅提醒 1 次防打扰。 |
@@ -263,10 +263,20 @@ Auto Mount Tool - 日常配置管理 (v2.2.0)
 ./auto_mount --update
 ```
 
-升级流程具备三层安全保障机制：
+升级流程具备四层安全保障机制：
 1. **语义化版本比对**：从 GitHub 官方 Release 元数据解析最新版本并进行 SemVer 对比。若远端无新版本或尚未发布正式 Release，友好提示无需更新。
-2. **本地语法分析断路器**：下载的最新源码会在系统临时目录中调用 `/usr/bin/swiftc -parse` 进行完整的抽象语法树预检。若语法校验未通过，更新立即自动终止，绝不损坏当前正常工作的守护服务。
-3. **双重运行环境同步与热重载**：升级成功后，不仅同步更新工作区源码，同时更新 `~/Library/Application Support/AutoMount` 部署目录下的核心程序，并自动执行 `launchctl bootout / bootstrap` 完成服务热重载，即刻无缝生效。
+2. **多路径副本感知与后台一键同步**：`--update` 运行时同时检查当前运行程序与 `~/Library/Application Support/AutoMount` 后台守护服务的版本。如果工作区已升级但后台服务滞后，程序会主动识别并提示一键将后台守护服务同步更新至最新版本，杜绝版本脱节。
+3. **本地语法分析断路器**：下载的最新源码会在系统临时目录中调用 `/usr/bin/swiftc -parse` 进行完整的抽象语法树预检。若语法校验未通过，更新立即自动终止，绝不损坏当前正常工作的守护服务。
+4. **双重运行环境同步与热重载**：升级成功后，不仅同步更新工作区源码，同时更新 `~/Library/Application Support/AutoMount` 部署目录下的核心程序，并自动执行 `launchctl bootout / bootstrap` 完成服务热重载，即刻无缝生效。
+
+## 查看软件版本 (`--version`, `-v`)
+
+通过 `--version` 或 `-v` 选项可直接输出纯文本版本号，适用于脚本自动化集成与环境检查：
+
+```bash
+./auto_mount --version
+```
+
 
 ## 审计日志
 
