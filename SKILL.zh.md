@@ -1,170 +1,240 @@
 ---
 name: macos-silent-smb-mount
-version: 1.1.0
-description: "macOS 静默挂载 SMB 共享的最佳实践：mount_smbfs 的局限性、NetFSMountURLSync 解决方案、macOS 26 隐私限制处理"
+version: 2.0.0
+description: "macOS 静默挂载与多网络策略路由规范：涵盖 NetFSMountURLSync 免密调用、内核 MNT_NOWAIT 非阻塞查询、失效挂载超时熔断、Spotlight 索引防护及 launchd 自动化驱动。"
 metadata:
   requires:
     bins:
-      - clang
-  prerequisite_skills: []
+      - swift
+      - launchctl
+      - ipconfig
+      - arp
+      - smbutil
+      - diskutil
+    frameworks:
+      - NetFS
+      - SystemConfiguration
+      - CoreFoundation
 ---
 
-# macOS 静默挂载 SMB 共享
+# 核心架构与决策模型
 
-## 问题背景
+在 macOS 自动化流程中挂载网络存储卷宗时，必须避开高层阻塞 API 与权限陷阱，遵循确定性技术路线：
 
-macOS（特别是 26+）不会在开机后自动挂载局域网 SMB 卷宗，即使 NAS 在线且已保存凭据。需要在脚本或自动化流程中实现静默挂载（不弹出 Finder 窗口）。
-
-## mount_smbfs 的局限性（实测发现）
-
-**❌ mount_smbfs 不能直接从 Keychain 读取密码**
-
-```bash
-# 这会失败！
-mount_smbfs -N //user@server/share /Volumes/xxx
-# 输出：Authentication error
+```mermaid
+flowchart TD
+    Start["触发网络挂载评估"] --> CheckGW["物理二层网关探测\n(ipconfig + ARP)"]
+    CheckGW --> HotspotFilter{"是否属于排除网关\n(如 172.20.10.1 热点)?"}
+    HotspotFilter -- 是 --> ExitSilence["静默退出 (保护蜂窝流量)"]
+    HotspotFilter -- 否 --> RouteMatch{"匹配网络策略 (Profiles)"}
+    
+    RouteMatch -- "局域网 MAC 吻合" --> CheckMount["MNT_NOWAIT 内核挂载表检查"]
+    RouteMatch -- "异地节点可达" --> ProbeRetry["Tailscale 握手重试窗口"]
+    ProbeRetry --> CheckMount
+    RouteMatch -- "无规则匹配" --> ExitSilence
+    
+    CheckMount --> SourceAudit{"已挂载且同源?"}
+    SourceAudit -- 是 --> Done["保持挂载，退出"]
+    SourceAudit -- "源不符/失效" --> ForceUnmount["3秒超时强制解挂断路器"]
+    ForceUnmount --> NetFSMount["NetFSMountURLSync 静默挂载"]
+    SourceAudit -- 未挂载 --> NetFSMount
+    
+    NetFSMount --> IndexProtect["注入 .metadata_never_index\n执行 mdutil -i off"]
+    IndexProtect --> Done
 ```
 
-**原因：**
-- mount_smbfs 需要从 `~/Library/Preferences/nsmb.conf` 读取密码
-- 或者交互式输入密码
-- **它不能直接从 macOS Keychain 读取凭据**
+## 挂载 API 的确定性选型
 
-**mount_smbfs 的 `-o nobrowse` 选项：**
-```bash
-# 可以隐藏挂载点（不显示在桌面/Finder 侧边栏）
-mount_smbfs -o nobrowse //user@server/share /Volumes/xxx
-```
+* **禁止使用 `mount_smbfs`**：该命令无法直接读取 macOS 钥匙串 (Keychain)，强制要求明文密码配置文件或交互输入，且高版本 macOS 中容易产生权限弹窗。
+* **强制使用 `NetFSMountURLSync`**：系统级 C 接口，传入 `nil` 凭据参数时自动无缝唤起钥匙串静默鉴权，不产生任何访达窗口或交互请求。
 
-**结论：mount_smbfs 不适合自动化场景**，因为需要明文密码配置文件或交互式输入。
+## 网络拓扑探测的抗干扰选型
 
-## 正确方案：NetFSMountURLSync API
+* **高层 Wi-Fi API 的局限**：自 macOS 14 起，CoreWLAN 读取 SSID 受到严格权限隔离；且当系统运行全局 VPN（如 TUN 虚拟网卡）时，系统网络栈默认路由被劫持，导致高层网络状态判断失效。
+* **物理二层 ARP 网关指纹**：通过遍历物理接口（`en0` 等）并读取 DHCP 路由器 IP，再通过二层 ARP 表获取路由器的物理 MAC 地址。该机制完全穿透 TUN 隧道，100% 反映真实接入的物理硬件，且完全免 `sudo`。
 
-**✅ 使用 NetFS 框架的 NetFSMountURLSync 函数**
 
-```c
-#include <CoreFoundation/CoreFoundation.h>
-#include <NetFS/NetFS.h>
+# 生产级核心代码模式 (Swift)
 
-int main() {
-    CFURLRef url = CFURLCreateWithBytes(NULL,
-        (UInt8*)"smb://server.local/share",
-        30, kCFStringEncodingUTF8, 0);
-    
-    CFArrayRef mountPoints = NULL;
-    OSStatus status = NetFSMountURLSync(
-        url,
-        NULL,  // MountPath（自动选择）
-        NULL,  // User（nil = 自动从 Keychain 读取）
-        NULL,  // Pass（nil = 自动从 Keychain 读取）
-        NULL,  // OpenOptions
-        NULL,  // MountOptions
-        &mountPoints
-    );
-    
-    if (mountPoints) CFRelease(mountPoints);
-    CFRelease(url);
-    
-    return (status == noErr) ? 0 : 1;
-}
-```
+## 钥匙串免密静默挂载范式
 
-**优势：**
-- ✅ 直接从 Keychain 读取凭据（nil 参数触发）
-- ✅ 完全静默，不弹出 Finder 窗口
-- ✅ 不需要密码配置文件
-- ✅ 适合自动化场景
+通过系统 `NetFS` 框架直接挂载，不弹出访达窗口：
 
-**Swift 语言原生调用范式：**
 ```swift
 import Foundation
 import NetFS
 
-func silentMount(urlString: String) -> Bool {
-    guard let url = CFURLCreateWithString(kCFAllocatorDefault, urlString as CFString, nil) else { return false }
+func mountSMBVolumeSilently(urlString: String) -> Bool {
+    guard let url = CFURLCreateWithString(kCFAllocatorDefault, urlString as CFString, nil) else {
+        return false
+    }
+    
     var mountPoints: Unmanaged<CFArray>?
-    let status = NetFSMountURLSync(url, nil, nil, nil, nil, nil, &mountPoints)
-    if let mp = mountPoints { mp.release() }
+    // 关键：User、Password 均传 nil，强制底层读取系统 Keychain
+    let status = NetFSMountURLSync(
+        url,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil,
+        &mountPoints
+    )
+    
+    if let points = mountPoints {
+        points.release()
+    }
+    
     return status == noErr
 }
 ```
 
-**编译方式（C 或 Swift 均可，Swift 无需编译直接通过 `swift` 命令运行）：**
-```bash
-# C 编译
-clang mount_nas.c -framework CoreFoundation -framework NetFS -o mount_nas
+## 内核挂载表非阻塞扫描 (防假死核心)
 
-# Swift 原生运行（推荐）
-swift auto_mount.swift
-```
+严禁在远程网络卷宗可能断网失效时使用 `FileManager.default.fileExists` 或 POSIX `stat()`，否则会导致调用线程进入内核级等待并触发系统彩虹球假死。必须使用 `getfsstat` 配合 `MNT_NOWAIT` 标志位：
 
-## 自动化挂载需求清单
+```swift
+import Darwin
 
-实现以下功能的完整方案：
-
-1. **开机自动检测** — launchd 开机启动
-2. **WiFi SSID 过滤** — 只在指定 WiFi 下挂载
-3. **连入指定 WiFi 自动挂载** — 事件触发
-4. **已挂载不再尝试** — 状态检测
-
-### 推荐架构：launchd + Shell 脚本
-
-```
-launchd (开机自启 + 事件触发)
-    └── check_and_mount.sh
-        ├── mount | grep 检测是否已挂载
-        ├── airport -I 获取当前 WiFi SSID
-        ├── 判断是否是指定 SSID
-        └── 调用 mount_nas（NetFSMountURLSync 静默挂载）
-```
-
-### 识别当前局域网环境 (物理探测)
-
-**⚠️ 痛点：macOS 隐私限制与 VPN 路由劫持（实测发现）**
-
-1. **SSID 隐私限制**：macOS 14+ 严格限制 SSID 获取，非系统应用获取到的通常是 `<redacted>`。以往使用 `wdutil info` 强行获取需要 `sudo` 权限，严重影响静默自动化的体验。
-2. **TUN 模式误导**：当使用 Clash TUN 模式等全局 VPN 时，系统默认路由被劫持到虚拟网卡（`utun`），导致 macOS 高层网络 API 误认为当前在使用“有线网络”，从而使得基于“Wi-Fi 状态检测”的逻辑直接崩盘。
-
-**推荐终极方案：物理层网关 MAC 指纹（免 Sudo）**
-
-既然高层网络 API 受到隐私和 VPN 的双重干扰，我们选择“降维探测”：直接下探到数据链路层（二层网络），询问物理网卡（如 `en0`）：“你直接连接的那个物理路由器的 MAC 地址是多少？”
-
-```bash
-# 首次运行（记录当前物理路由器的 MAC 地址作为家庭指纹）
-./auto_mount --init
-
-# 后续运行（比对当前路由器的 MAC，吻合则挂载）
-./auto_mount
-```
-
-**获取 MAC 指纹的核心逻辑（全程无需 root）：**
-```objc
-// 1. 获取物理网关IP (使用系统底层 DHCP 状态，不受 TUN 默认路由影响)
-NSString* getPhysicalGatewayIP() {
-    // 轮询物理网卡 en0, en1 等
-    // 对应命令：/usr/sbin/ipconfig getoption en0 router
-    // 返回真实的网关局域网 IP，如 192.168.1.1
+struct ActiveMountRecord {
+    let mountPath: String
+    let sourceURL: String
 }
 
-// 2. 根据 IP 获取网关 MAC 地址 (二层 ARP 协议)
-NSString* getMACAddressForIP(NSString *ip) {
-    // 对应命令：/usr/sbin/arp -n 192.168.1.1
-    // 解析输出获取 MAC 地址，例如 00:11:22:33:44:55
+func queryActiveKernelMounts() -> [ActiveMountRecord] {
+    let count = getfsstat(nil, 0, MNT_NOWAIT)
+    guard count > 0 else { return [] }
+    
+    var buffer = [statfs](repeating: statfs(), count: Int(count))
+    let actualCount = buffer.withUnsafeMutableBufferPointer { ptr in
+        getfsstat(ptr.baseAddress, count * Int32(MemoryLayout<statfs>.size), MNT_NOWAIT)
+    }
+    
+    var results: [ActiveMountRecord] = []
+    for i in 0..<Int(actualCount) {
+        let entry = buffer[i]
+        let path = withUnsafePointer(to: entry.f_mntonname) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        }
+        let source = withUnsafePointer(to: entry.f_mntfromname) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        }
+        results.append(ActiveMountRecord(mountPath: path, sourceURL: source))
+    }
+    return results
 }
 ```
-**优势：**
-- ✅ **完全免 `sudo`**：这些基础诊断命令对所有用户开放。
-- ✅ **100% 免疫 VPN 劫持**：ARP 和物理 DHCP 状态处于网络栈底层，Clash 的三层 TUN 隧道无法伪装或篡改物理路由器的 MAC。
 
-### 检测是否已挂载
+## 失效挂载的超时熔断与强制清理
 
-```bash
-if mount | grep -q "/Volumes/nas_share"; then
-    echo "已挂载"
-fi
+当网络环境改变导致已有挂载点变为“僵死”状态时，必须施加严格的 3 秒超时限制，采用两级强退机制：
+
+```swift
+import Foundation
+import Darwin
+
+func forceUnmountStaleVolume(at mountPath: String, timeout: Double = 3.0) -> Bool {
+    let group = DispatchGroup()
+    var success = false
+    
+    group.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+        // 第一阶段：优雅强制卸载
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        task.arguments = ["unmount", "force", mountPath]
+        try? task.run()
+        task.waitUntilExit()
+        
+        if task.terminationStatus == 0 {
+            success = true
+        } else {
+            // 第二阶段：POSIX 内核层强制解挂
+            success = (unmount(mountPath, MNT_FORCE) == 0)
+        }
+        group.leave()
+    }
+    
+    let result = group.wait(timeout: .now() + timeout)
+    return result == .success && success
+}
 ```
 
-### launchd 事件触发配置
+## Spotlight 检索防护与移动热点保护
+
+挂载成功后必须立即执行元数据检索屏蔽，避免远端大容量磁盘检索造成系统发热与网络卡顿：
+
+```swift
+import Foundation
+
+func protectVolumeFromSpotlight(mountPath: String) {
+    let flagFile = (mountPath as NSString).appendingPathComponent(".metadata_never_index")
+    if !FileManager.default.fileExists(atPath: flagFile) {
+        FileManager.default.createFile(atPath: flagFile, contents: nil)
+    }
+    
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/mdutil")
+    task.arguments = ["-i", "off", mountPath]
+    try? task.run()
+    task.waitUntilExit()
+}
+```
+
+## 物理网络拓扑与 ARP 硬件提取
+
+绕过 TUN 路由劫持，直探物理链路层：
+
+```swift
+import Foundation
+import SystemConfiguration
+
+func getPhysicalGatewayIP() -> (ip: String, interface: String)? {
+    guard let interfaces = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] else { return nil }
+    for iface in interfaces {
+        guard let name = SCNetworkInterfaceGetBSDName(iface) as String?, name.starts(with: "en") else { continue }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/ipconfig")
+        task.arguments = ["getoption", name, "router"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        try? task.run()
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let ip = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !ip.isEmpty {
+            return (ip, name)
+        }
+    }
+    return nil
+}
+
+func getGatewayMAC(for ip: String) -> String? {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+    task.arguments = ["-n", ip]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    try? task.run()
+    task.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let output = String(data: data, encoding: .utf8) else { return nil }
+    
+    let pattern = "([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})"
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+          let range = Range(match.range(at: 1), in: output) else {
+        return nil
+    }
+    return String(output[range]).lowercased()
+}
+```
+
+
+# 系统级常驻自动化规范 (LaunchAgent)
+
+不同于依赖上层轮询的 Cron 机制，macOS 原生网络监听通过 launchd 的 `WatchPaths` 订阅系统网络配置目录，实现零内存常驻、秒级事件唤醒。
+
+## 描述文件配置标准 (`~/Library/LaunchAgents/com.user.auto-mount.plist`)
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -172,10 +242,10 @@ fi
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.mount-nas</string>
+    <string>com.user.auto-mount</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/path/to/check_and_mount.sh</string>
+        <string>/Users/USERNAME/Library/Application Support/AutoMount/auto_mount</string>
     </array>
     <key>WatchPaths</key>
     <array>
@@ -183,143 +253,50 @@ fi
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/com.user.auto-mount.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.user.auto-mount.stderr.log</string>
 </dict>
 </plist>
 ```
 
-## 方案选择指南
+## 现代注册与生命周期管理命令
 
-| 场景 | 推荐方案 |
-|------|----------|
-| 静默挂载单个 SMB 共享 | C 命令行工具 + NetFSMountURLSync |
-| 开机自动检测 | launchd RunAtLoad |
-| WiFi 变化触发 | launchd WatchPaths 或守护进程 |
-| 需要 GUI 配置管理 | 完整的 Swift macOS 应用（如 AutoMount 项目） |
-
-## 架构选择：系统级 vs Agent Cron
-
-**关键发现：系统级任务应使用 launchd，而非 Agent Cron**
-
-| 方案 | 依赖 Agent | 响应速度 | 适用场景 |
-|------|-----------|----------|----------|
-| Agent Cron | ✅ 依赖 | 分钟级 | 需要 AI 判断、消息通知 |
-| launchd | ❌ 不依赖 | 秒级 | 系统级任务、实时响应 |
-| 守护进程 | ❌ 不依赖 | 毫秒级 | 高性能实时监控 |
-
-**NAS 自动挂载适合系统级方案的原因：**
-- ✅ 需要开机自启
-- ✅ 需要实时响应 WiFi 变化
-- ✅ 不需要 AI 逻辑
-- ✅ 不依赖外部服务
-
-**Agent Cron 更适合：**
-- 需要复杂判断逻辑
-- 需要调用 AI 能力
-- 需要发送消息通知
-- 任务频率不需要太高
-
-## mDNS 解析失败排查（2026-04-20 实测）
-
-**问题现象：** `NAS_HOSTNAME._smb._tcp.local` 无法解析，`ping` 和 `nslookup` 都失败，但 NAS 实际在线。
-
-**排查步骤：**
-```bash
-# 1. 确认 mDNS 能发现服务（Browse 成功不代表 Resolve 成功）
-dns-sd -B _smb._tcp local.
-
-# 2. 用 smbutil 直接查询 IP（绕过 mDNS DNS 解析）
-smbutil lookup NAS_HOSTNAME
-# 输出：IP address of NAS_HOSTNAME: 192.168.1.100
-
-# 3. 用 IP 地址验证连通性
-ping 192.168.1.100
-```
-
-**根因分析：**
-- mDNS 有两个阶段：Browse（发现服务）和 Resolve（解析为 IP）
-- Browse 可以成功，但 Resolve 可能失败
-- 常见原因：有线网络多播路由问题、防火墙阻止 UDP 5353、DNS 配置优先级问题
-
-**解决方案 — smbutil lookup：**
-```bash
-# 获取 SMB 服务器 IP
-SERVER_IP=$(smbutil lookup NAS_HOSTNAME 2>/dev/null | grep "IP address" | awk '{print $NF}')
-if [ -n "$SERVER_IP" ]; then
-    ping -c 1 -t 2 "$SERVER_IP"
-fi
-```
-
-**在 AutoMount 工具中的改进方案：**
-```objc
-// 原始：直接 ping 主机名（mDNS 失败则整体失败）
-ping -c 1 -t 2 NAS_HOSTNAME._smb._tcp.local
-
-// 改进：先尝试主机名，失败后用 smbutil lookup 获取 IP
-NSString* resolveServerIP(NSString *hostname) {
-    // 先尝试 ping 主机名
-    // 如果失败，用 smbutil lookup 获取 IP
-    NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/usr/bin/smbutil"];
-    [task setArguments:@[@"lookup", hostname]];
-    // ... 解析输出获取 IP
-}
-```
-
-**注意：** NetFSMountURLSync 传入 SMB URL 时，系统内部也会做解析。如果 mDNS 不通，建议把 URL 里的主机名也换成 IP：
-```objc
-// 原始
-smb://NAS_HOSTNAME._smb._tcp.local/nas_share
-// 备用
-smb://192.168.1.100/nas_share
-```
-但需注意 Keychain 凭据是按服务器名存储的，用 IP 可能需要重新保存凭据。
-
-## 关键发现
-
-1. **NetFSMountURLSync 是唯一可靠的静默挂载方案** — 直接从 Keychain 读取凭据，不弹窗
-2. **mount_smbfs 不能从 Keychain 读取** — 必须提供明文密码或配置文件
-3. **物理层 MAC 探测优于高层网络 API** — 完美绕过 macOS 14+ SSID 限制和 VPN TUN 模式导致的系统级网络类型误判，且无需 `sudo`
-4. **系统级任务（launchd）优于 Agent Cron** — 不依赖外部服务，开机自启，实时响应，不一致则秒级退出（0 开销）
-5. **C/ObjC 语言实现最轻量** — ~20KB 二进制，无依赖，启动最快
-6. **Config 文件方案** — 首次初始化保存物理网关 MAC 指纹，全程免密
-7. **mDNS Browse ≠ Resolve** — dns-sd -B 成功不代表主机名能解析为 IP，smbutil lookup 是可靠备用方案
-
-## 配置文件位置建议
-
-**推荐使用公共位置：`./auto_mount.plist`**
-
-原因：
-- sudo 运行时保存到 `/var/root/.auto_mount_config.plist`，普通用户无法读取
-- 公共位置 + `0644` 权限，所有用户可读
-- 只有首次 init 需要 sudo 写入
-
-```objc
-#define CONFIG_FILE @"./auto_mount.plist"
-
-void saveConfig(NSString *fingerprint) {
-    NSDictionary *config = @{@"target_gateway_mac": fingerprint};
-    [config writeToFile:CONFIG_FILE atomically:YES];
-    // 设置权限为所有人可读
-    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0644} 
-                                 ofItemAtPath:CONFIG_FILE error:nil];
-}
-```
-
-## 完整 Objective-C 实现
-
-见 AutoMount 项目：`~/Documents/Project/projects/AutoMount/`
-
-核心功能：
-- `--init` 模式：获取物理网关 MAC 地址作为指纹保存到配置文件（免 sudo）
-- 正常模式：加载配置 → 比对指纹 → 不一致立刻退出 → 一致则 ping 检查服务器 → 静默挂载未挂载的卷宗
-- 支持多个挂载目标
-- LaunchAgent 开机自启 + 网络变化触发
-
-## 运行与编译
-
-可以直接使用原生 Swift 运行（免编译开箱即用）：
+在 macOS 13+ / 26+ / 27+ 环境中，弃用已废弃的 `launchctl load / unload`，采用现代 `bootstrap / bootout` 子命令：
 
 ```bash
-cd ~/Documents/Project/projects/AutoMount
-./auto_mount
+# 获取当前控制台用户 UID
+UID=$(id -u)
+
+# 卸载旧服务 (若存在)
+launchctl bootout "gui/${UID}/com.user.auto-mount" 2>/dev/null || true
+
+# 注册并加载服务
+launchctl bootstrap "gui/${UID}" ~/Library/LaunchAgents/com.user.auto-mount.plist
+
+# 验证服务当前运行状态
+launchctl list | grep com.user.auto-mount
 ```
+
+
+# 故障诊断与边缘场景排障手册
+
+## 异地 WireGuard / Tailscale 握手延迟
+
+* **现象**：刚切换至外网时，Tailscale 节点已激活，但首次挂载偶发超时失败。
+* **原因**：WireGuard 隧道建立需要数十毫秒至数百毫秒的协商握手期。
+* **解决方案**：引入轻量重试窗口，在主机可达性探测阶段设置 3 次探测重试（每次间隔 1.0 秒），捕获握手就绪时刻后再发起 NetFS 调用。
+
+## 局域网 mDNS 解析不稳定
+
+* **现象**：`smb://server.local/share` 偶发无法解析，但主机实际在线。
+* **排查手段**：
+  ```bash
+  # 1. 检查服务宣告状态
+  dns-sd -B _smb._tcp local.
+
+  # 2. 绕过 mDNS 查询直连 IP
+  smbutil lookup server
+  ```
+* **容灾方案**：在配置中使用静态主机名或固定 IP 替代单点 mDNS 广播，或在策略中维护备用 IP 回退列表。
