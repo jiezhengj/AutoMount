@@ -288,3 +288,20 @@ launchctl list | grep com.user.auto-mount
   smbutil lookup server
   ```
 * **Mitigation**: Configure static hostnames or IP addresses instead of relying solely on mDNS broadcasts, or maintain fallback IP mappings in configuration profiles.
+
+# CLI Control Layer & Interaction Architecture
+
+## Unified Configuration Dashboard & Orthogonal Subcommands
+
+AutoMount CLI merges the classic UNIX orthogonal philosophy with modern interactive console UX:
+
+* **Underlying Orthogonal Commands**: `--install`, `--uninstall`, and `--status` serve as dedicated, non-interactive subcommands designed for automated provisioning, scripts, and CI/CD operations.
+* **Aggregated Configuration Center**: `--config` functions as an all-in-one control center displaying the live LaunchAgent status (`gui/<uid>`) while incorporating service deployment, reload, status checks, and uninstallation into a unified menu.
+* **Streamlined Initial Setup**: `--init` pairs profile generation with LaunchAgent daemon deployment into a 4-step workflow, eliminating friction between configuration creation and system daemon activation.
+* **Defensive Parameter Validation**: Enforces strict CLI argument validation; unrecognized options are immediately rejected with standard usage instructions, preventing unintended execution of unmount or mount sequences.
+
+## Zero-Dependency Native Localization (i18n)
+
+* **System Language Adaptation**: Inspects `Locale.preferredLanguages` dynamically, defaulting seamlessly to English on non-Chinese systems.
+* **Environment Variable Override**: Supports `AUTO_MOUNT_LANG=zh|en` for explicit language specification and testing.
+* **Lightweight Embedded Translation Engine**: Dispatches localized strings directly within the standalone Swift file without external `.strings` bundles, preserving portability and zero external dependencies.

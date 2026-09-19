@@ -23,7 +23,26 @@ import SystemConfiguration
 import NetFS
 import Darwin
 
-// MARK: - 基础辅助函数
+// MARK: - 基础辅助函数与国际化 (i18n)
+
+var isEnglish: Bool {
+    if let envLang = ProcessInfo.processInfo.environment["AUTO_MOUNT_LANG"]?.lowercased() {
+        if envLang.starts(with: "en") { return true }
+        if envLang.starts(with: "zh") { return false }
+    }
+    if let preferred = Locale.preferredLanguages.first?.lowercased() {
+        if preferred.starts(with: "zh") { return false }
+        return true
+    }
+    if let lang = ProcessInfo.processInfo.environment["LANG"]?.lowercased() {
+        if lang.starts(with: "zh") { return false }
+    }
+    return true
+}
+
+func tr(_ zh: String, _ en: String) -> String {
+    return isEnglish ? en : zh
+}
 
 // 获取可执行文件所在目录
 func getAppDir() -> URL {
@@ -647,7 +666,7 @@ func promptInteractiveCheckbox(title: String, options: [SelectionOption]) -> [In
             let sub = opt.subtitle != nil ? " (\(opt.subtitle!))" : ""
             print("  [\(i + 1)] \(opt.title)\(sub)")
         }
-        print("请输入要选择的序号 (例如 1,2 或 all，按回车全不选): ", terminator: "")
+        print(tr("请输入要选择的序号 (例如 1,2 或 all，按回车全不选): ", "Enter options to select (e.g. 1,2 or all, Enter to skip): "), terminator: "")
         guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
             return []
         }
@@ -679,7 +698,8 @@ func promptInteractiveCheckbox(title: String, options: [SelectionOption]) -> [In
     }
 
     print("\(title)")
-    print("\u{1b}[90m(↑/↓ 移动光标，Space 切换勾选，a 全选，Enter 确认提交)\u{1b}[0m")
+    print(tr("\u{1b}[90m(↑/↓ 移动光标，Space 切换勾选，a 全选，Enter 确认提交)\u{1b}[0m",
+             "\u{1b}[90m(↑/↓ Move cursor, Space toggle, a select all, Enter confirm)\u{1b}[0m"))
     render(isFirst: true)
 
     while true {
@@ -708,7 +728,7 @@ func promptInteractiveCheckbox(title: String, options: [SelectionOption]) -> [In
             return res
         case .cancel:
             TerminalUI.disableRawMode(orig: origTerm)
-            print("\n操作已取消。")
+            print(tr("\n操作已取消。", "\nOperation cancelled."))
             exit(0)
         default:
             break
@@ -726,7 +746,7 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
             let sub = opt.subtitle != nil ? " (\(opt.subtitle!))" : ""
             print("  [\(i + 1)] \(opt.title)\(sub)")
         }
-        print("请选择序号 [默认 \(defaultIndex + 1)]: ", terminator: "")
+        print(tr("请选择序号 [默认 \(defaultIndex + 1)]: ", "Select index [Default \(defaultIndex + 1)]: "), terminator: "")
         guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
             return defaultIndex
         }
@@ -758,7 +778,8 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
     }
 
     print("\(title)")
-    print("\u{1b}[90m(↑/↓ 移动光标，Enter 选定确认)\u{1b}[0m")
+    print(tr("\u{1b}[90m(↑/↓ 移动光标，Enter 选定确认)\u{1b}[0m",
+             "\u{1b}[90m(↑/↓ Move cursor, Enter confirm selection)\u{1b}[0m"))
     render(isFirst: true)
 
     while true {
@@ -776,7 +797,7 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
             return cursorIndex
         case .cancel:
             TerminalUI.disableRawMode(orig: origTerm)
-            print("\n操作已取消。")
+            print(tr("\n操作已取消。", "\nOperation cancelled."))
             exit(0)
         default:
             break
@@ -787,67 +808,82 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
 // MARK: - 初始化向导 (--init)
 
 func runInitWizard() {
-    print("""
+    print(tr("""
     Auto Mount Tool - 初始化配置向导 (v2.0)
     ======================================
-    """)
+    """, """
+    Auto Mount Tool - Setup Wizard (v2.0)
+    ====================================
+    """))
+
+    if loadConfig() != nil {
+        print(tr("  [提示] 检测到已存在配置文件，继续向导将全量重写配置；如需增删目标请使用 './auto_mount --config'。\n",
+                 "  [Note] Existing configuration detected. Continuing will overwrite it; use './auto_mount --config' for incremental edits.\n"))
+    }
 
     // 1. 物理网关 MAC 探测
-    print("[1/3] 局域网物理网关指纹检测")
+    print(tr("[1/4] 局域网物理网关指纹检测", "[1/4] LAN Gateway Hardware Fingerprint Detection"))
     var homeMAC = ""
     if let detectedMAC = getCurrentNetworkFingerprint() {
-        print("  ✓ 自动探测到物理网关 MAC: \(detectedMAC)")
+        print(tr("  ✓ 自动探测到物理网关 MAC: \(detectedMAC)", "  ✓ Detected physical gateway MAC: \(detectedMAC)"))
         while homeMAC.isEmpty {
-            print("  按回车直接使用此指纹，或输入自定义 MAC 覆盖 [默认: \(detectedMAC)]: ", terminator: "")
+            print(tr("  按回车直接使用此指纹，或输入自定义 MAC 覆盖 [默认: \(detectedMAC)]: ",
+                     "  Press Enter to use this fingerprint, or enter custom MAC [Default: \(detectedMAC)]: "), terminator: "")
             let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             homeMAC = input.isEmpty ? detectedMAC : input
             if homeMAC.isEmpty {
-                print("  ✗ 网关 MAC 不能为空，请重新输入。")
+                print(tr("  ✗ 网关 MAC 不能为空，请重新输入。", "  ✗ Gateway MAC cannot be empty, please re-enter."))
             }
         }
     } else {
         while homeMAC.isEmpty {
-            print("  未能自动获取物理网关 MAC，请输入网关 MAC 地址: ", terminator: "")
+            print(tr("  未能自动获取物理网关 MAC，请输入网关 MAC 地址: ",
+                     "  Failed to detect gateway MAC. Please enter gateway MAC: "), terminator: "")
             homeMAC = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if homeMAC.isEmpty {
-                print("  ✗ 网关 MAC 不能为空，请重新输入。")
+                print(tr("  ✗ 网关 MAC 不能为空，请重新输入。", "  ✗ Gateway MAC cannot be empty, please re-enter."))
             }
         }
     }
 
     // 2. 挂载目标选择 (自动嗅探 + 复选框多选)
-    print("\n[2/3] 选择家庭局域网挂载目标")
+    print(tr("\n[2/4] 选择家庭局域网挂载目标", "\n[2/4] Select Home LAN Mount Targets"))
     var homeTargets: [MountTarget] = []
     let activeMounts = discoverActiveSMBMounts()
 
     if !activeMounts.isEmpty {
         let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
         let selectedIndices = promptInteractiveCheckbox(
-            title: "发现当前系统中已挂载的 SMB 卷宗，请选择需要纳入自动挂载的目标 (直接按回车跳过)：",
+            title: tr("发现当前系统中已挂载的 SMB 卷宗，请选择需要纳入自动挂载的目标 (直接按回车跳过)：",
+                      "Discovered currently mounted SMB volumes. Select targets to auto-mount (Enter to skip):"),
             options: options
         )
         for idx in selectedIndices {
             let item = activeMounts[idx]
             homeTargets.append(MountTarget(url: item.url, mountPath: item.path))
-            print("  ✓ 已添加: \(item.path) (\(item.url))")
+            print(tr("  ✓ 已添加: \(item.path) (\(item.url))", "  ✓ Added: \(item.path) (\(item.url))"))
         }
     }
 
     // 若未勾选任何已挂载项，引导手动录入或直接跳过
     if homeTargets.isEmpty {
-        print("  当前未选择已挂载卷宗，可手动录入 (直接按回车可跳过此步骤)：")
+        print(tr("  当前未选择已挂载卷宗，可手动录入 (直接按回车可跳过此步骤)：",
+                 "  No active mounts selected. You can enter manually (Enter to skip this step):"))
         while true {
-            print("  请输入 SMB 地址 (例如 smb://server.local/share，按回车跳过): ", terminator: "")
+            print(tr("  请输入 SMB 地址 (例如 smb://server.local/share，按回车跳过): ",
+                     "  Enter SMB URL (e.g. smb://server.local/share, Enter to skip): "), terminator: "")
             guard let urlStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !urlStr.isEmpty else {
                 break
             }
             let defaultPath = deriveDefaultMountPath(from: urlStr)
-            print("  请输入本地挂载路径 [默认: \(defaultPath)]: ", terminator: "")
+            print(tr("  请输入本地挂载路径 [默认: \(defaultPath)]: ",
+                     "  Enter local mount path [Default: \(defaultPath)]: "), terminator: "")
             let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let pathStr = pathInput.isEmpty ? defaultPath : pathInput
             homeTargets.append(MountTarget(url: urlStr, mountPath: pathStr))
-            print("  ✓ 已添加: \(pathStr) (\(urlStr))")
-            print("  继续添加另一个挂载目标？(y/n) [默认 n]: ", terminator: "")
+            print(tr("  ✓ 已添加: \(pathStr) (\(urlStr))", "  ✓ Added: \(pathStr) (\(urlStr))"))
+            print(tr("  继续添加另一个挂载目标？(y/n) [默认 n]: ",
+                     "  Add another mount target? (y/n) [Default n]: "), terminator: "")
             let cont = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
             if cont != "y" && cont != "yes" {
                 break
@@ -856,12 +892,14 @@ func runInitWizard() {
     }
 
     if homeTargets.isEmpty {
-        print("  ✓ 局域网内不挂载任何共享，该网络仅作为外出判定排他基准。")
+        print(tr("  ✓ 局域网内不挂载任何共享，该网络仅作为外出判定排他基准。",
+                 "  ✓ No shares configured for LAN. This network acts solely as an exclusion gatekeeper."))
     }
 
+    let homeProfileDesc = tr("家庭局域网直连 (千兆/2.5G 高速)", "Home LAN Direct (Gigabit/2.5G)")
     let homeProfile = NetworkProfile(
         id: "home_lan",
-        description: "家庭局域网直连 (千兆/2.5G 高速)",
+        description: homeProfileDesc,
         match: MatchRule(type: "gateway_mac", value: homeMAC, retryCount: nil, retryInterval: nil),
         excludeGatewayIPs: nil,
         preventSpotlightIndex: true,
@@ -869,21 +907,24 @@ func runInitWizard() {
     )
 
     // 3. Tailscale 远程降级策略配置
-    print("\n[3/3] 配置 Tailscale 远程互联降级策略")
+    print(tr("\n[3/4] 配置 Tailscale 远程互联降级策略", "\n[3/4] Configure Tailscale Remote Fallback Profile"))
     var profiles: [NetworkProfile] = [homeProfile]
     let discoveredPeers = discoverTailscalePeers()
 
     if discoveredPeers.isEmpty {
-        print("  未检测到 Tailscale 正在运行或在线节点，已跳过远程策略配置。")
-        print("  （提示：后续连接 Tailscale 后，可运行 './auto_mount --config' 随时补齐远程策略）")
+        print(tr("  未检测到 Tailscale 正在运行或在线节点，已跳过远程策略配置。",
+                 "  Tailscale is not running or no active peers found. Remote profile setup skipped."))
+        print(tr("  （提示：后续连接 Tailscale 后，可运行 './auto_mount --config' 随时补齐远程策略）",
+                 "  (Tip: Run './auto_mount --config' anytime later to configure Tailscale remote profile)"))
     } else {
         var peerOptions = discoveredPeers.map {
-            SelectionOption(title: $0.name, subtitle: "MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)")
+            SelectionOption(title: $0.name, subtitle: tr("MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)",
+                                                         "MagicDNS: \($0.magicDNS ?? "None"), IP: \($0.ip), OS: \($0.os)"))
         }
-        peerOptions.append(SelectionOption(title: "跳过配置远程策略", subtitle: nil))
+        peerOptions.append(SelectionOption(title: tr("跳过配置远程策略", "Skip remote profile setup"), subtitle: nil))
 
         let selected = promptInteractiveRadio(
-            title: "检测到 Tailscale 正在运行，请选择对端访问设备：",
+            title: tr("检测到 Tailscale 正在运行，请选择对端访问设备：", "Tailscale detected. Select target remote peer:"),
             options: peerOptions,
             defaultIndex: 0
         )
@@ -896,15 +937,25 @@ func runInitWizard() {
             // 选择连接地址格式：MagicDNS 域名 或 虚拟 IP
             var addrOptions: [SelectionOption] = []
             if let dns = peer.magicDNS {
-                addrOptions.append(SelectionOption(title: "MagicDNS 域名: \(dns)", subtitle: "推荐：IP 变动不失效，钥匙串凭据稳定"))
+                addrOptions.append(SelectionOption(
+                    title: tr("MagicDNS 域名: \(dns)", "MagicDNS Domain: \(dns)"),
+                    subtitle: tr("推荐：IP 变动不失效，钥匙串凭据稳定", "Recommended: stable credentials across IP changes")
+                ))
             }
             if !peer.ip.isEmpty {
-                addrOptions.append(SelectionOption(title: "Tailscale IP: \(peer.ip)", subtitle: "直连无 DNS 解析依赖"))
+                addrOptions.append(SelectionOption(
+                    title: tr("Tailscale IP: \(peer.ip)", "Tailscale IP: \(peer.ip)"),
+                    subtitle: tr("直连无 DNS 解析依赖", "Direct connection without DNS dependency")
+                ))
             }
 
             if !addrOptions.isEmpty {
-                let chosenAddr = promptInteractiveRadio(title: "请选择连接方式：", options: addrOptions, defaultIndex: 0)
-                if addrOptions[chosenAddr].title.starts(with: "MagicDNS") {
+                let chosenAddr = promptInteractiveRadio(
+                    title: tr("请选择连接方式：", "Select connection address:"),
+                    options: addrOptions,
+                    defaultIndex: 0
+                )
+                if addrOptions[chosenAddr].title.contains("MagicDNS") {
                     selectedHost = peer.magicDNS ?? peer.ip
                 } else {
                     selectedHost = peer.ip
@@ -918,7 +969,8 @@ func runInitWizard() {
             // 路径 1：若已配置家庭局域网目标，询问是否自动映射
             var didAutoMap = false
             if !homeTargets.isEmpty {
-                print("\n  是否自动将已选的家庭局域网共享目录映射为该远程主机目标？(Y/n) [默认 Y]: ", terminator: "")
+                print(tr("\n  是否自动将已选的家庭局域网共享目录映射为该远程主机目标？(Y/n) [默认 Y]: ",
+                         "\n  Auto-map selected LAN shares to this remote host? (Y/n) [Default Y]: "), terminator: "")
                 let autoMap = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y") != "n"
                 if autoMap {
                     didAutoMap = true
@@ -932,7 +984,8 @@ func runInitWizard() {
                         }
                         let remoteURL = "smb://\(selectedHost)\(pathPart)"
                         remoteTargets.append(MountTarget(url: remoteURL, mountPath: target.mountPath))
-                        print("  ✓ 自动映射: \(remoteURL) -> \(target.mountPath)")
+                        print(tr("  ✓ 自动映射: \(remoteURL) -> \(target.mountPath)",
+                                 "  ✓ Auto-mapped: \(remoteURL) -> \(target.mountPath)"))
                     }
                 }
             }
@@ -949,19 +1002,25 @@ func runInitWizard() {
 
                 if !matchingMounts.isEmpty {
                     let mOptions = matchingMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
-                    let picked = promptInteractiveCheckbox(title: "检测到当前已挂载该设备的共享卷宗，请勾选需要自动挂载的项 (直接回车跳过)：", options: mOptions)
+                    let picked = promptInteractiveCheckbox(
+                        title: tr("检测到当前已挂载该设备的共享卷宗，请勾选需要自动挂载的项 (直接回车跳过)：",
+                                  "Discovered active mounts for this device. Select items to include (Enter to skip):"),
+                        options: mOptions
+                    )
                     for pIdx in picked {
                         let item = matchingMounts[pIdx]
                         remoteTargets.append(MountTarget(url: item.url, mountPath: item.path))
-                        print("  ✓ 已添加: \(item.path) (\(item.url))")
+                        print(tr("  ✓ 已添加: \(item.path) (\(item.url))", "  ✓ Added: \(item.path) (\(item.url))"))
                     }
                 }
 
                 // 路径 3：若仍未选定，半自动录入共享名（或直接跳过）
                 if remoteTargets.isEmpty {
-                    print("  请输入远程主机上的共享文件夹名称 (直接按回车可跳过)：")
+                    print(tr("  请输入远程主机上的共享文件夹名称 (直接按回车可跳过)：",
+                             "  Enter share folder name on remote host (Enter to skip):"))
                     while true {
-                        print("  请输入共享文件夹名称 (例如 data，按回车跳过): ", terminator: "")
+                        print(tr("  请输入共享文件夹名称 (例如 data，按回车跳过): ",
+                                 "  Enter share folder name (e.g. data, Enter to skip): "), terminator: "")
                         guard let shareName = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !shareName.isEmpty else {
                             break
                         }
@@ -970,12 +1029,14 @@ func runInitWizard() {
                         while cleanShare.hasSuffix("/") { cleanShare.removeLast() }
                         let remoteURL = "smb://\(selectedHost)/\(cleanShare)"
                         let defaultPath = "/Volumes/\(cleanShare)"
-                        print("  请输入本地挂载路径 [默认: \(defaultPath)]: ", terminator: "")
+                        print(tr("  请输入本地挂载路径 [默认: \(defaultPath)]: ",
+                                 "  Enter local mount path [Default: \(defaultPath)]: "), terminator: "")
                         let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                         let pathStr = pathInput.isEmpty ? defaultPath : pathInput
                         remoteTargets.append(MountTarget(url: remoteURL, mountPath: pathStr))
-                        print("  ✓ 已添加: \(pathStr) (\(remoteURL))")
-                        print("  继续添加另一个远程挂载目标？(y/n) [默认 n]: ", terminator: "")
+                        print(tr("  ✓ 已添加: \(pathStr) (\(remoteURL))", "  ✓ Added: \(pathStr) (\(remoteURL))"))
+                        print(tr("  继续添加另一个远程挂载目标？(y/n) [默认 n]: ",
+                                 "  Add another remote target? (y/n) [Default n]: "), terminator: "")
                         let cont = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
                         if cont != "y" && cont != "yes" {
                             break
@@ -985,7 +1046,9 @@ func runInitWizard() {
             }
 
             if !remoteTargets.isEmpty {
-                let desc = selectedPeerName.isEmpty ? "Tailscale 异地互联 (外出降级通道)" : "Tailscale 异地互联 (\(selectedPeerName))"
+                let desc = selectedPeerName.isEmpty ?
+                    tr("Tailscale 异地互联 (外出降级通道)", "Tailscale Remote Fallback") :
+                    tr("Tailscale 异地互联 (\(selectedPeerName))", "Tailscale Remote (\(selectedPeerName))")
                 let remoteProfile = NetworkProfile(
                     id: "tailscale_remote",
                     description: desc,
@@ -996,71 +1059,123 @@ func runInitWizard() {
                 )
                 profiles.append(remoteProfile)
             } else {
-                print("  ✓ 未配置远程挂载目标，跳过远程策略。")
+                print(tr("  ✓ 未配置远程挂载目标，跳过远程策略。", "  ✓ No remote targets configured. Skipped remote profile."))
             }
         } else {
-            print("  ✓ 已跳过配置远程策略。")
+            print(tr("  ✓ 已跳过配置远程策略。", "  ✓ Skipped remote profile configuration."))
         }
     }
 
-    // 4. 保存配置
+    // 保存配置
     let config = AutoMountConfig(version: "2.0", profiles: profiles)
     saveConfig(config)
-    print("\n[DONE] 初始化完成！配置已写入 \(getConfigURL().path)")
+    print(tr("\n[DONE] 初始化完成！配置已写入 \(getConfigURL().path)",
+             "\n[DONE] Setup complete! Configuration written to \(getConfigURL().path)"))
+
+    // 4. 部署后台自启动守护服务
+    print(tr("\n[4/4] 部署自启动后台守护服务", "\n[4/4] Deploy Background Auto-Mount Daemon"))
+    print(tr("  是否立即将 AutoMount 注册为系统的后台自动挂载守护服务？(Y/n) [默认 Y]: ",
+             "  Register AutoMount as system LaunchAgent daemon for auto-mounting on login & network change? (Y/n) [Default Y]: "), terminator: "")
+    let installChoice = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y")
+    if installChoice != "n" && installChoice != "no" {
+        print("")
+        installLaunchAgent()
+    } else {
+        print(tr("  ✓ 已跳过后台服务安装。后续可随时运行 './auto_mount --install' 进行部署。\n",
+                 "  ✓ Daemon deployment skipped. You can run './auto_mount --install' anytime later.\n"))
+    }
 }
 
 // MARK: - 日常配置维护菜单 (--config)
 
+func getLaunchAgentStatusSummary() -> String {
+    let plistURL = getLaunchAgentPlistURL()
+    if !FileManager.default.fileExists(atPath: plistURL.path) {
+        return tr("未安装 (可选择 [5] 部署守护)", "Not installed (Select [5] to deploy)")
+    }
+    let uid = getuid()
+    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
+    let check = runCommand(executable: "/bin/launchctl", arguments: ["print", serviceTarget])
+    if check.status == 0 {
+        return tr("已注册运行 (\(serviceTarget))", "Active & running (\(serviceTarget))")
+    } else {
+        return tr("已部署描述文件但未处于激活状态", "Deployed but inactive in launchd")
+    }
+}
+
 func manageConfiguration() {
-    print("""
+    print(tr("""
     Auto Mount Tool - 日常配置管理 (v2.0)
     ====================================
-    """)
+    """, """
+    Auto Mount Tool - Daily Configuration Management (v2.0)
+    ======================================================
+    """))
 
     guard var config = loadConfig() else {
-        fputs("✗ 未找到配置文件，请先运行 './auto_mount --init' 初始化。\n", stderr)
+        fputs(tr("✗ 未找到配置文件，请先运行 './auto_mount --init' 初始化。\n",
+                 "✗ Configuration not found. Please run './auto_mount --init' first.\n"), stderr)
         exit(1)
     }
 
     while true {
-        print("\n当前已配置策略：")
+        print(tr("\n当前已配置策略：", "\nCurrently configured profiles:"))
         for (i, p) in config.profiles.enumerated() {
             if p.targets.isEmpty {
-                print("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述")) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)")
+                print(tr("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述")) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)",
+                         "  [\(i + 1)] \(p.id) (\(p.description ?? "No description")) - 0 mount targets (Exclusion Gatekeeper, no local mounts)"))
             } else {
-                print("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述")) - \(p.targets.count) 个挂载目标")
+                print(tr("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述")) - \(p.targets.count) 个挂载目标",
+                         "  [\(i + 1)] \(p.id) (\(p.description ?? "No description")) - \(p.targets.count) mount targets"))
                 for t in p.targets {
                     print("      • \(t.mountPath) <- \(t.url)")
                 }
             }
         }
 
+        let daemonSummary = getLaunchAgentStatusSummary()
         let hasTailscale = config.profiles.contains(where: { $0.id == "tailscale_remote" })
-        let tailscaleActionTitle = hasTailscale ? "重新检测/更新远程 Tailscale 目标" : "配置并添加远程 Tailscale 策略"
+        let tailscaleActionTitle = hasTailscale ?
+            tr("重新检测/更新远程 Tailscale 目标", "Re-detect / update remote Tailscale peer") :
+            tr("配置并添加远程 Tailscale 策略", "Configure & add remote Tailscale profile")
 
-        print("""
+        print(tr("""
+
+        后台守护服务状态: \(daemonSummary)
 
         请选择操作：
           [1] 添加挂载目标 (支持从当前已挂载项中导入或手动输入)
           [2] 删除已有挂载目标
           [3] 重新检测/更新家庭网关 MAC
           [4] \(tailscaleActionTitle)
+          [5] 守护服务管理 (部署/重载、查看详情、卸载服务)
           [0] 保存配置并退出
-        """)
-        print("请输入选项 [0-4]: ", terminator: "")
+        """, """
+
+        Background Daemon Status: \(daemonSummary)
+
+        Select an action:
+          [1] Add mount target (import from active mounts or manual entry)
+          [2] Remove existing mount target
+          [3] Re-detect / update home gateway MAC
+          [4] \(tailscaleActionTitle)
+          [5] Daemon management (deploy/reload, view details, uninstall)
+          [0] Save configuration and exit
+        """))
+        print(tr("请输入选项 [0-5]: ", "Enter choice [0-5]: "), terminator: "")
         let choice = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
 
         switch choice {
         case "1":
             // 添加挂载目标
-            print("\n选择要添加到的策略：")
+            print(tr("\n选择要添加到的策略：", "\nSelect profile to add target to:"))
             for (i, p) in config.profiles.enumerated() {
                 print("  [\(i + 1)] \(p.id)")
             }
-            print("请选择策略序号: ", terminator: "")
+            print(tr("请选择策略序号: ", "Select profile index: "), terminator: "")
             guard let pStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines),
                   let pIdx = Int(pStr), pIdx >= 1 && pIdx <= config.profiles.count else {
-                print("✗ 无效选择。")
+                print(tr("✗ 无效选择。", "✗ Invalid selection."))
                 continue
             }
 
@@ -1068,24 +1183,30 @@ func manageConfiguration() {
             var added = false
             if !activeMounts.isEmpty {
                 let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
-                let selected = promptInteractiveCheckbox(title: "发现当前系统中已挂载的 SMB 卷宗，请选择添加项 (直接回车跳过)：", options: options)
+                let selected = promptInteractiveCheckbox(
+                    title: tr("发现当前系统中已挂载的 SMB 卷宗，请选择添加项 (直接回车跳过)：",
+                              "Discovered active SMB mounts. Select items to add (Enter to skip):"),
+                    options: options
+                )
                 for idx in selected {
                     let item = activeMounts[idx]
                     config.profiles[pIdx - 1].targets.append(MountTarget(url: item.url, mountPath: item.path))
-                    print("  ✓ 已添加: \(item.path) (\(item.url))")
+                    print(tr("  ✓ 已添加: \(item.path) (\(item.url))", "  ✓ Added: \(item.path) (\(item.url))"))
                     added = true
                 }
             }
             if !added {
-                print("请输入 SMB 地址 (例如 smb://server.local/share): ", terminator: "")
+                print(tr("请输入 SMB 地址 (例如 smb://server.local/share): ",
+                         "Enter SMB URL (e.g. smb://server.local/share): "), terminator: "")
                 let urlStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if !urlStr.isEmpty {
                     let defaultPath = deriveDefaultMountPath(from: urlStr)
-                    print("请输入本地挂载路径 [默认: \(defaultPath)]: ", terminator: "")
+                    print(tr("请输入本地挂载路径 [默认: \(defaultPath)]: ",
+                             "Enter local mount path [Default: \(defaultPath)]: "), terminator: "")
                     let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     let pathStr = pathInput.isEmpty ? defaultPath : pathInput
                     config.profiles[pIdx - 1].targets.append(MountTarget(url: urlStr, mountPath: pathStr))
-                    print("  ✓ 已添加: \(pathStr) (\(urlStr))")
+                    print(tr("  ✓ 已添加: \(pathStr) (\(urlStr))", "  ✓ Added: \(pathStr) (\(urlStr))"))
                 }
             }
 
@@ -1098,57 +1219,69 @@ func manageConfiguration() {
                 }
             }
             if flatTargets.isEmpty {
-                print("当前无挂载目标可删除。")
+                print(tr("当前无挂载目标可删除。", "No mount targets available to remove."))
                 continue
             }
-            print("\n现有挂载目标列表：")
+            print(tr("\n现有挂载目标列表：", "\nExisting mount targets:"))
             for (idx, item) in flatTargets.enumerated() {
                 print("  [\(idx + 1)] \(item.display)")
             }
-            print("请输入要删除的项目序号: ", terminator: "")
+            print(tr("请输入要删除的项目序号: ", "Enter target index to remove: "), terminator: "")
             if let delStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines),
                let delIdx = Int(delStr), delIdx >= 1 && delIdx <= flatTargets.count {
                 let item = flatTargets[delIdx - 1]
                 config.profiles[item.profileIndex].targets.remove(at: item.targetIndex)
-                print("✓ 已删除目标。")
+                print(tr("✓ 已删除目标。", "✓ Target removed."))
             }
 
         case "3":
             // 更新家庭网关 MAC
             if let homeIdx = config.profiles.firstIndex(where: { $0.id == "home_lan" }) {
-                print("\n当前家庭网关 MAC: \(config.profiles[homeIdx].match.value)")
+                print(tr("\n当前家庭网关 MAC: \(config.profiles[homeIdx].match.value)",
+                         "\nCurrent home gateway MAC: \(config.profiles[homeIdx].match.value)"))
                 if let curMAC = getCurrentNetworkFingerprint() {
-                    print("自动探测到当前网络物理网关 MAC: \(curMAC)")
-                    print("按回车采纳，或输入自定义 MAC 覆盖 [默认: \(curMAC)]: ", terminator: "")
+                    print(tr("自动探测到当前网络物理网关 MAC: \(curMAC)",
+                             "Detected current physical gateway MAC: \(curMAC)"))
+                    print(tr("按回车采纳，或输入自定义 MAC 覆盖 [默认: \(curMAC)]: ",
+                             "Press Enter to accept, or enter custom MAC [Default: \(curMAC)]: "), terminator: "")
                     let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     config.profiles[homeIdx].match.value = input.isEmpty ? curMAC : input
-                    print("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)")
+                    print(tr("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)",
+                             "✓ Home gateway MAC updated to: \(config.profiles[homeIdx].match.value)"))
                 } else {
-                    print("未能自动获取当前物理网关 MAC，请输入自定义 MAC: ", terminator: "")
+                    print(tr("未能自动获取当前物理网关 MAC，请输入自定义 MAC: ",
+                             "Failed to auto-detect gateway MAC. Enter custom MAC: "), terminator: "")
                     let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     if !input.isEmpty {
                         config.profiles[homeIdx].match.value = input
-                        print("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)")
+                        print(tr("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)",
+                                 "✓ Home gateway MAC updated to: \(config.profiles[homeIdx].match.value)"))
                     }
                 }
             } else {
-                print("未找到 home_lan 策略。")
+                print(tr("未找到 home_lan 策略。", "home_lan profile not found."))
             }
 
         case "4":
             // 更新或新建远程 Tailscale 目标
             let peers = discoverTailscalePeers()
             if peers.isEmpty {
-                print("未检测到 Tailscale 在线设备。请确认 Tailscale 已启动并登录。")
+                print(tr("未检测到 Tailscale 在线设备。请确认 Tailscale 已启动并登录。",
+                         "No Tailscale peers detected. Ensure Tailscale is running and signed in."))
                 continue
             }
             var peerOptions = peers.map {
-                SelectionOption(title: $0.name, subtitle: "MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)")
+                SelectionOption(title: $0.name, subtitle: tr("MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)",
+                                                             "MagicDNS: \($0.magicDNS ?? "None"), IP: \($0.ip), OS: \($0.os)"))
             }
-            peerOptions.append(SelectionOption(title: "取消", subtitle: nil))
-            let sel = promptInteractiveRadio(title: "发现可用 Tailscale 设备，请选择：", options: peerOptions, defaultIndex: 0)
+            peerOptions.append(SelectionOption(title: tr("取消", "Cancel"), subtitle: nil))
+            let sel = promptInteractiveRadio(
+                title: tr("发现可用 Tailscale 设备，请选择：", "Select available Tailscale peer:"),
+                options: peerOptions,
+                defaultIndex: 0
+            )
             guard sel < peers.count else {
-                print("已取消操作。")
+                print(tr("已取消操作。", "Operation cancelled."))
                 continue
             }
 
@@ -1158,27 +1291,38 @@ func manageConfiguration() {
 
             var addrOptions: [SelectionOption] = []
             if let dns = peer.magicDNS {
-                addrOptions.append(SelectionOption(title: "MagicDNS 域名: \(dns)", subtitle: "推荐：IP 变动不失效，钥匙串凭据稳定"))
+                addrOptions.append(SelectionOption(
+                    title: tr("MagicDNS 域名: \(dns)", "MagicDNS Domain: \(dns)"),
+                    subtitle: tr("推荐：IP 变动不失效，钥匙串凭据稳定", "Recommended: stable credentials across IP changes")
+                ))
             }
             if !peer.ip.isEmpty {
-                addrOptions.append(SelectionOption(title: "Tailscale IP: \(peer.ip)", subtitle: "直连无 DNS 解析依赖"))
+                addrOptions.append(SelectionOption(
+                    title: tr("Tailscale IP: \(peer.ip)", "Tailscale IP: \(peer.ip)"),
+                    subtitle: tr("直连无 DNS 解析依赖", "Direct connection without DNS dependency")
+                ))
             }
             if !addrOptions.isEmpty {
-                let chosen = promptInteractiveRadio(title: "请选择连接方式：", options: addrOptions, defaultIndex: 0)
-                newHost = addrOptions[chosen].title.starts(with: "MagicDNS") ? (peer.magicDNS ?? peer.ip) : peer.ip
+                let chosen = promptInteractiveRadio(
+                    title: tr("请选择连接方式：", "Select connection address:"),
+                    options: addrOptions,
+                    defaultIndex: 0
+                )
+                newHost = addrOptions[chosen].title.contains("MagicDNS") ? (peer.magicDNS ?? peer.ip) : peer.ip
             } else {
                 newHost = peer.ip
             }
 
             if let rIdx = config.profiles.firstIndex(where: { $0.id == "tailscale_remote" }) {
                 config.profiles[rIdx].match.value = newHost
-                print("✓ 远程探测目标已更新为: \(newHost)")
+                print(tr("✓ 远程探测目标已更新为: \(newHost)", "✓ Remote probe target updated to: \(newHost)"))
             } else {
                 // 动态新建 tailscale_remote 策略
-                print("\n正在为新策略配置挂载目标：")
+                print(tr("\n正在为新策略配置挂载目标：", "\nConfiguring mount targets for new remote profile:"))
                 var newTargets: [MountTarget] = []
                 while true {
-                    print("请输入该主机上的共享文件夹名称 (例如 data，按回车结束): ", terminator: "")
+                    print(tr("请输入该主机上的共享文件夹名称 (例如 data，按回车结束): ",
+                             "Enter share folder name on remote host (e.g. data, Enter to finish): "), terminator: "")
                     guard let sName = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !sName.isEmpty else {
                         break
                     }
@@ -1187,17 +1331,21 @@ func manageConfiguration() {
                     while clean.hasSuffix("/") { clean.removeLast() }
                     let rURL = "smb://\(newHost)/\(clean)"
                     let dPath = "/Volumes/\(clean)"
-                    print("请输入本地挂载路径 [默认: \(dPath)]: ", terminator: "")
+                    print(tr("请输入本地挂载路径 [默认: \(dPath)]: ",
+                             "Enter local mount path [Default: \(dPath)]: "), terminator: "")
                     let pIn = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     let pStr = pIn.isEmpty ? dPath : pIn
                     newTargets.append(MountTarget(url: rURL, mountPath: pStr))
-                    print("  ✓ 已添加: \(pStr) (\(rURL))")
-                    print("继续添加另一个目标？(y/n) [默认 n]: ", terminator: "")
+                    print(tr("  ✓ 已添加: \(pStr) (\(rURL))", "  ✓ Added: \(pStr) (\(rURL))"))
+                    print(tr("继续添加另一个目标？(y/n) [默认 n]: ",
+                             "Add another target? (y/n) [Default n]: "), terminator: "")
                     let c = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
                     if c != "y" && c != "yes" { break }
                 }
 
-                let desc = selectedPeerName.isEmpty ? "Tailscale 异地互联 (外出降级通道)" : "Tailscale 异地互联 (\(selectedPeerName))"
+                let desc = selectedPeerName.isEmpty ?
+                    tr("Tailscale 异地互联 (外出降级通道)", "Tailscale Remote Fallback") :
+                    tr("Tailscale 异地互联 (\(selectedPeerName))", "Tailscale Remote (\(selectedPeerName))")
                 let newProfile = NetworkProfile(
                     id: "tailscale_remote",
                     description: desc,
@@ -1207,16 +1355,46 @@ func manageConfiguration() {
                     targets: newTargets
                 )
                 config.profiles.append(newProfile)
-                print("✓ 远程 Tailscale 策略已成功创建并加入配置。")
+                print(tr("✓ 远程 Tailscale 策略已成功创建并加入配置。", "✓ Remote Tailscale profile created and added to configuration."))
+            }
+
+        case "5":
+            // 守护服务管理
+            print(tr("""
+
+            守护服务管理：
+              [1] 部署 / 重新加载自启动守护服务 (LaunchAgent)
+              [2] 查看守护服务运行状态与挂载详情
+              [3] 卸载并移除自启动守护服务
+              [0] 返回上级菜单
+            """, """
+
+            Daemon Management:
+              [1] Deploy / reload LaunchAgent daemon
+              [2] View service status and active mount details
+              [3] Uninstall and remove LaunchAgent daemon
+              [0] Back to main menu
+            """))
+            print(tr("请输入选项 [0-3]: ", "Enter choice [0-3]: "), terminator: "")
+            let subChoice = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+            switch subChoice {
+            case "1":
+                installLaunchAgent()
+            case "2":
+                checkServiceStatus()
+            case "3":
+                uninstallLaunchAgent()
+            default:
+                break
             }
 
         case "0":
             saveConfig(config)
-            print("✓ 配置管理已完成，修改已保存并生效。")
+            print(tr("✓ 配置管理已完成，修改已保存并生效。", "✓ Configuration management complete. Changes saved and applied."))
             return
 
         default:
-            print("未知选项，请重新输入。")
+            print(tr("未知选项，请重新输入。", "Unknown option, please try again."))
         }
     }
 }
@@ -1236,13 +1414,17 @@ func getInstalledDir() -> URL {
 }
 
 func installLaunchAgent() {
-    print("""
+    print(tr("""
     Auto Mount Tool - 安装并启用自启动守护服务
     ===========================================
-    """)
+    """, """
+    Auto Mount Tool - Install LaunchAgent Daemon
+    ============================================
+    """))
 
     guard let config = loadConfig(), !config.profiles.isEmpty else {
-        fputs("✗ 未找到有效配置，请先运行 './auto_mount --init' 初始化配置。\n", stderr)
+        fputs(tr("✗ 未找到有效配置，请先运行 './auto_mount --init' 初始化配置。\n",
+                 "✗ Configuration not found. Please run './auto_mount --init' first.\n"), stderr)
         writeLog("Install aborted: config missing or invalid")
         exit(1)
     }
@@ -1256,7 +1438,7 @@ func installLaunchAgent() {
         try FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true, attributes: nil)
         try FileManager.default.createDirectory(at: launchAgentsDir, withIntermediateDirectories: true, attributes: nil)
     } catch {
-        fputs("✗ 创建目录失败: \(error.localizedDescription)\n", stderr)
+        fputs(tr("✗ 创建目录失败: \(error.localizedDescription)\n", "✗ Failed to create directory: \(error.localizedDescription)\n"), stderr)
         exit(1)
     }
 
@@ -1271,7 +1453,8 @@ func installLaunchAgent() {
             do {
                 try FileManager.default.copyItem(at: srcURL, to: dstURL)
             } catch {
-                fputs("✗ 拷贝 \(fileName) 失败: \(error.localizedDescription)\n", stderr)
+                fputs(tr("✗ 拷贝 \(fileName) 失败: \(error.localizedDescription)\n",
+                         "✗ Failed to copy \(fileName): \(error.localizedDescription)\n"), stderr)
                 exit(1)
             }
         }
@@ -1283,7 +1466,8 @@ func installLaunchAgent() {
     try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedSwift)
 
     let executablePath = FileManager.default.fileExists(atPath: installedWrapper) ? installedWrapper : installedSwift
-    print("✓ 已将运行程序与配置同步部署至:\n  \(installDir.path)")
+    print(tr("✓ 已将运行程序与配置同步部署至:\n  \(installDir.path)",
+             "✓ Deployed executable and configuration to:\n  \(installDir.path)"))
 
     let plistData: [String: Any] = [
         "Label": launchAgentLabel,
@@ -1298,9 +1482,10 @@ func installLaunchAgent() {
         let data = try PropertyListSerialization.data(fromPropertyList: plistData, format: .xml, options: 0)
         try data.write(to: plistURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: plistURL.path)
-        print("✓ 已生成服务描述文件:\n  \(plistURL.path)")
+        print(tr("✓ 已生成服务描述文件:\n  \(plistURL.path)", "✓ Generated LaunchAgent plist:\n  \(plistURL.path)"))
     } catch {
-        fputs("✗ 写入描述文件失败: \(error.localizedDescription)\n", stderr)
+        fputs(tr("✗ 写入描述文件失败: \(error.localizedDescription)\n",
+                 "✗ Failed to write plist file: \(error.localizedDescription)\n"), stderr)
         exit(1)
     }
 
@@ -1312,26 +1497,44 @@ func installLaunchAgent() {
     let bootResult = runCommand(executable: "/bin/launchctl", arguments: ["bootstrap", domainTarget, plistURL.path])
 
     if bootResult.status == 0 {
-        print("✓ 成功注册并加载至系统 launchd 守护进程 (gui/\(uid))")
-        print("\n服务详情:")
-        print("  • 标识 (Label): \(launchAgentLabel)")
-        print("  • 执行路径: \(executablePath)")
-        print("  • 触发时机: 开机登录 (RunAtLoad) & 网络状态切换 (WatchPaths)")
-        print("  • 日志路径: /tmp/\(launchAgentLabel).stdout.log")
-        print("\n自启动与网络监听服务已生效。")
+        print(tr("✓ 成功注册并加载至系统 launchd 守护进程 (gui/\(uid))",
+                 "✓ Successfully registered and loaded into system launchd (gui/\(uid))"))
+        print(tr("""
+
+        服务详情:
+          • 标识 (Label): \(launchAgentLabel)
+          • 执行路径: \(executablePath)
+          • 触发时机: 开机登录 (RunAtLoad) & 网络状态切换 (WatchPaths)
+          • 日志路径: /tmp/\(launchAgentLabel).stdout.log
+
+        自启动与网络监听服务已生效。
+        """, """
+
+        Service Details:
+          • Label: \(launchAgentLabel)
+          • Program: \(executablePath)
+          • Trigger: Login (RunAtLoad) & Network Configuration Changes (WatchPaths)
+          • Log file: /tmp/\(launchAgentLabel).stdout.log
+
+        Auto-mount daemon is active and running.
+        """))
         writeLog("LaunchAgent installed and loaded successfully to \(installDir.path)")
     } else {
-        fputs("✗ 加载服务失败 (代码 \(bootResult.status)): \(bootResult.stderr)\n", stderr)
+        fputs(tr("✗ 加载服务失败 (代码 \(bootResult.status)): \(bootResult.stderr)\n",
+                 "✗ Failed to bootstrap service (Code \(bootResult.status)): \(bootResult.stderr)\n"), stderr)
         writeLog("Failed to bootstrap LaunchAgent: \(bootResult.stderr)")
         exit(1)
     }
 }
 
 func uninstallLaunchAgent() {
-    print("""
+    print(tr("""
     Auto Mount Tool - 卸载自启动服务
     =================================
-    """)
+    """, """
+    Auto Mount Tool - Uninstall LaunchAgent Daemon
+    ==============================================
+    """))
 
     let uid = getuid()
     let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
@@ -1341,49 +1544,55 @@ func uninstallLaunchAgent() {
     var unloaded = false
     let bootResult = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
     if bootResult.status == 0 {
-        print("✓ 成功从系统 launchd 中卸载服务 (\(serviceTarget))")
+        print(tr("✓ 成功从系统 launchd 中卸载服务 (\(serviceTarget))",
+                 "✓ Unloaded service from system launchd (\(serviceTarget))"))
         unloaded = true
     } else {
-        print("• 服务当前未在运行或已被卸载。")
+        print(tr("• 服务当前未在运行或已被卸载。", "• Service is not currently running or already unloaded."))
     }
 
     var removedPlist = false
     if FileManager.default.fileExists(atPath: plistURL.path) {
         do {
             try FileManager.default.removeItem(at: plistURL)
-            print("✓ 已删除服务描述文件: \(plistURL.path)")
+            print(tr("✓ 已删除服务描述文件: \(plistURL.path)", "✓ Removed LaunchAgent plist: \(plistURL.path)"))
             removedPlist = true
         } catch {
-            fputs("✗ 删除描述文件失败: \(error.localizedDescription)\n", stderr)
+            fputs(tr("✗ 删除描述文件失败: \(error.localizedDescription)\n",
+                     "✗ Failed to remove plist: \(error.localizedDescription)\n"), stderr)
         }
     } else {
-        print("• 描述文件不存在: \(plistURL.path)")
+        print(tr("• 描述文件不存在: \(plistURL.path)", "• Plist file does not exist: \(plistURL.path)"))
     }
 
     var removedDir = false
     if FileManager.default.fileExists(atPath: installDir.path) {
         do {
             try FileManager.default.removeItem(at: installDir)
-            print("✓ 已清理部署运行目录: \(installDir.path)")
+            print(tr("✓ 已清理部署运行目录: \(installDir.path)", "✓ Removed runtime directory: \(installDir.path)"))
             removedDir = true
         } catch {
-            fputs("✗ 清理目录失败: \(error.localizedDescription)\n", stderr)
+            fputs(tr("✗ 清理目录失败: \(error.localizedDescription)\n",
+                     "✗ Failed to clean directory: \(error.localizedDescription)\n"), stderr)
         }
     }
 
     if unloaded || removedPlist || removedDir {
-        print("\n自启动服务与部署文件已彻底移除。")
+        print(tr("\n自启动服务与部署文件已彻底移除。", "\nLaunchAgent service and deployed files completely removed."))
         writeLog("LaunchAgent uninstalled")
     } else {
-        print("\n无需清理。")
+        print(tr("\n无需清理。", "\nNothing to clean."))
     }
 }
 
 func checkServiceStatus() {
-    print("""
+    print(tr("""
     Auto Mount Tool - 运行状态总览 (v2.0)
     ====================================
-    """)
+    """, """
+    Auto Mount Tool - Service Status Overview (v2.0)
+    ================================================
+    """))
 
     let plistURL = getLaunchAgentPlistURL()
     let installDir = getInstalledDir()
@@ -1391,16 +1600,18 @@ func checkServiceStatus() {
     let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
 
     let plistExists = FileManager.default.fileExists(atPath: plistURL.path)
-    print("  • LaunchAgent 服务配置: \(plistExists ? "已安装 (\(plistURL.path))" : "未安装")")
+    print(tr("  • LaunchAgent 服务配置: \(plistExists ? "已安装 (\(plistURL.path))" : "未安装")",
+             "  • LaunchAgent Configuration: \(plistExists ? "Installed (\(plistURL.path))" : "Not Installed")"))
 
     let installedExists = FileManager.default.fileExists(atPath: installDir.path)
     if installedExists {
-        print("  • 部署运行目录: \(installDir.path)")
+        print(tr("  • 部署运行目录: \(installDir.path)", "  • Runtime Directory: \(installDir.path)"))
     }
 
     let res = runCommand(executable: "/bin/launchctl", arguments: ["print", serviceTarget])
     if res.status == 0 {
-        print("  • launchd 运行状态: 已加载并处于激活监听中 (gui/\(uid))")
+        print(tr("  • launchd 运行状态: 已加载并处于激活监听中 (gui/\(uid))",
+                 "  • launchd Status: Active & listening (gui/\(uid))"))
         for line in res.stdout.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.starts(with: "state = ") || trimmed.starts(with: "last exit code = ") || trimmed.starts(with: "pid = ") {
@@ -1408,65 +1619,91 @@ func checkServiceStatus() {
             }
         }
     } else {
-        print("  • launchd 运行状态: 未加载 / 处于休眠状态")
+        print(tr("  • launchd 运行状态: 未加载 / 处于休眠状态", "  • launchd Status: Inactive / Not loaded"))
     }
 
-    print("\n  • 当前物理网络状态:")
+    print(tr("\n  • 当前物理网络状态:", "\n  • Physical Network Status:"))
     if let gw = getPhysicalGatewayInfo() {
-        print("    物理网卡: \(gw.interface)")
-        print("    物理网关 IP: \(gw.ip)")
+        print(tr("    物理网卡: \(gw.interface)", "    Physical Interface: \(gw.interface)"))
+        print(tr("    物理网关 IP: \(gw.ip)", "    Physical Gateway IP: \(gw.ip)"))
         if let mac = getMACAddress(for: gw.ip, interface: gw.interface) {
-            print("    物理网关 MAC: \(mac)")
+            print(tr("    物理网关 MAC: \(mac)", "    Physical Gateway MAC: \(mac)"))
         } else {
-            print("    物理网关 MAC: (ARP 缓存中未找到)")
+            print(tr("    物理网关 MAC: (ARP 缓存中未找到)", "    Physical Gateway MAC: (Not found in ARP cache)"))
         }
     } else {
-        print("    未检测到活跃的底层物理网络。")
+        print(tr("    未检测到活跃的底层物理网络。", "    No active physical network detected."))
     }
 
-    print("\n  • 已配置策略列表:")
+    print(tr("\n  • 已配置策略列表:", "\n  • Configured Policy Profiles:"))
     if let config = loadConfig() {
-        print("    配置版本: \(config.version)")
+        print(tr("    配置版本: \(config.version)", "    Config Version: \(config.version)"))
         let kernelEntries = getKernelMountEntries()
 
         for (idx, profile) in config.profiles.enumerated() {
-            print("\n    [\(idx + 1)] 策略: \(profile.id) (\(profile.description ?? "无描述"))")
-            print("        匹配条件: \(profile.match.type) = \(profile.match.value)")
+            print(tr("\n    [\(idx + 1)] 策略: \(profile.id) (\(profile.description ?? "无描述"))",
+                     "\n    [\(idx + 1)] Profile: \(profile.id) (\(profile.description ?? "No description"))"))
+            print(tr("        匹配条件: \(profile.match.type) = \(profile.match.value)",
+                     "        Match Rule: \(profile.match.type) = \(profile.match.value)"))
             if let excludes = profile.excludeGatewayIPs, !excludes.isEmpty {
-                print("        排除网关: \(excludes.joined(separator: ", "))")
+                print(tr("        排除网关: \(excludes.joined(separator: ", "))",
+                         "        Exclude Gateways: \(excludes.joined(separator: ", "))"))
             }
-            print("        挂载目标 (\(profile.targets.count)):")
+            print(tr("        挂载目标 (\(profile.targets.count)):", "        Mount Targets (\(profile.targets.count)):"))
             for t in profile.targets {
                 let stdPath = URL(fileURLWithPath: t.mountPath).standardizedFileURL.path
                 if let entry = kernelEntries.first(where: { URL(fileURLWithPath: $0.mountPath).standardizedFileURL.path == stdPath }) {
-                    print("          - \(t.mountPath) -> 已挂载 (来源: \(entry.source))")
+                    print(tr("          - \(t.mountPath) -> 已挂载 (来源: \(entry.source))",
+                             "          - \(t.mountPath) -> Mounted (Source: \(entry.source))"))
                 } else {
-                    print("          - \(t.mountPath) -> 未挂载 (目标: \(t.url))")
+                    print(tr("          - \(t.mountPath) -> 未挂载 (目标: \(t.url))",
+                             "          - \(t.mountPath) -> Not Mounted (Target: \(t.url))"))
                 }
             }
         }
     } else {
-        print("    未找到配置文件 (可运行: ./auto_mount --init 初始化)")
+        print(tr("    未找到配置文件 (可运行: ./auto_mount --init 初始化)",
+                 "    Configuration file not found (Run: ./auto_mount --init to initialize)"))
     }
 }
 
 func printUsage() {
     let configPath = getConfigURL().path
-    print("""
+    print(tr("""
     Auto Mount Tool (v2.0)
     ======================
 
-    Usage:
+    使用方法:
       ./auto_mount                正常执行 (评估网络策略并挂载匹配目标)
       ./auto_mount --init         初始化配置向导 (支持自动嗅探与复选框交互)
-      ./auto_mount --config       日常配置管理 (增删目标、修改网关或远程节点)
+      ./auto_mount --config       日常配置管理 (增删目标、修改网关或远程节点、服务管理)
       ./auto_mount --install      配置并启用自启动后台守护服务 (LaunchAgent)
       ./auto_mount --uninstall    移除自启动配置与部署文件
       ./auto_mount --status       查看服务运行状态与挂载详情
       ./auto_mount --help         显示帮助说明
 
+    环境变量:
+      AUTO_MOUNT_LANG=zh|en       强制指定终端界面语言
+
     配置文件: \(configPath)
-    """)
+    """, """
+    Auto Mount Tool (v2.0)
+    ======================
+
+    Usage:
+      ./auto_mount                Run normal evaluation and mount targets
+      ./auto_mount --init         Interactive setup wizard (with device discovery)
+      ./auto_mount --config       Daily configuration & daemon management menu
+      ./auto_mount --install      Deploy and enable background LaunchAgent daemon
+      ./auto_mount --uninstall    Remove LaunchAgent daemon and deployed files
+      ./auto_mount --status       Show service status and active mount details
+      ./auto_mount --help         Show this help message
+
+    Environment Variables:
+      AUTO_MOUNT_LANG=zh|en       Explicitly specify terminal UI language
+
+    Configuration: \(configPath)
+    """))
 }
 
 // MARK: - 主流程执行逻辑
@@ -1474,62 +1711,74 @@ func printUsage() {
 func main() {
     let args = CommandLine.arguments
 
-    for arg in args.dropFirst() {
-        if arg == "--init" {
+    if args.count > 1 {
+        let arg = args[1]
+        switch arg {
+        case "--init":
             runInitWizard()
             exit(0)
-        } else if arg == "--config" {
+        case "--config":
             manageConfiguration()
             exit(0)
-        } else if arg == "--install" {
+        case "--install":
             installLaunchAgent()
             exit(0)
-        } else if arg == "--uninstall" {
+        case "--uninstall":
             uninstallLaunchAgent()
             exit(0)
-        } else if arg == "--status" {
+        case "--status":
             checkServiceStatus()
             exit(0)
-        } else if arg == "--help" || arg == "-h" {
+        case "--help", "-h":
             printUsage()
             exit(0)
+        default:
+            fputs(tr("✗ 未知参数: '\(arg)'\n\n", "✗ Unknown option: '\(arg)'\n\n"), stderr)
+            printUsage()
+            exit(1)
         }
     }
 
-    print("""
+    print(tr("""
     Auto Mount Tool (v2.0)
     ======================
-    """)
+    """, """
+    Auto Mount Tool (v2.0)
+    ======================
+    """))
 
     guard let config = loadConfig(), !config.profiles.isEmpty else {
-        fputs("✗ 未找到有效配置，请先运行 './auto_mount --init' 初始化。\n", stderr)
+        fputs(tr("✗ 未找到有效配置，请先运行 './auto_mount --init' 初始化。\n",
+                 "✗ Configuration not found or empty. Please run './auto_mount --init' first.\n"), stderr)
         writeLog("Config not found or empty, exiting")
         exit(1)
     }
 
     // 1. 采集物理网络信息
-    print("[1] Evaluating network environment...")
+    print(tr("[1] 评估当前底层物理网络环境...", "[1] Evaluating network environment..."))
     let currentGateway = getPhysicalGatewayInfo()
     let currentMAC = getCurrentNetworkFingerprint()
 
     if let gw = currentGateway {
-        print("  Physical Gateway: \(gw.ip) on \(gw.interface)")
+        print(tr("  物理网关: \(gw.ip) (网卡: \(gw.interface))", "  Physical Gateway: \(gw.ip) on \(gw.interface)"))
     } else {
-        print("  Physical Gateway: None (offline)")
+        print(tr("  物理网关: 无 (处于离线状态)", "  Physical Gateway: None (offline)"))
     }
     if let mac = currentMAC {
-        print("  Physical Gateway MAC: \(mac)")
+        print(tr("  物理网关 MAC: \(mac)", "  Physical Gateway MAC: \(mac)"))
     }
 
     // 2. 顺序评估策略路由
-    print("\n[2] Evaluating policy profiles...")
+    print(tr("\n[2] 顺序评估网络策略路由...", "\n[2] Evaluating policy profiles..."))
     var matchedProfile: NetworkProfile?
 
     for (idx, profile) in config.profiles.enumerated() {
-        print("  Checking [\(idx + 1)] '\(profile.id)' (\(profile.description ?? "")):")
+        print(tr("  正在校验 [\(idx + 1)] '\(profile.id)' (\(profile.description ?? "")):",
+                 "  Checking [\(idx + 1)] '\(profile.id)' (\(profile.description ?? "")):"))
 
         if let excludes = profile.excludeGatewayIPs, let gwIP = currentGateway?.ip, excludes.contains(gwIP) {
-            print("    ✗ Skipped: Gateway IP \(gwIP) is excluded (Hotspot bypass).")
+            print(tr("    ✗ 已跳过: 网关 IP \(gwIP) 处于排除名单中 (蜂窝热点流量保护)。",
+                     "    ✗ Skipped: Gateway IP \(gwIP) is excluded (Hotspot bypass)."))
             writeLog("Profile \(profile.id) skipped: Gateway IP \(gwIP) is in exclude_gateway_ips")
             continue
         }
@@ -1537,29 +1786,35 @@ func main() {
         switch profile.match.type {
         case "gateway_mac":
             guard let curMAC = currentMAC else {
-                print("    ✗ No gateway MAC detected.")
+                print(tr("    ✗ 未探测到物理网关 MAC 指纹。", "    ✗ No gateway MAC detected."))
                 continue
             }
             if curMAC.caseInsensitiveCompare(profile.match.value) == .orderedSame {
-                print("    ✓ Matched! (Gateway MAC matches \(profile.match.value))")
+                print(tr("    ✓ 策略命中！(网关 MAC 吻合 \(profile.match.value))",
+                         "    ✓ Matched! (Gateway MAC matches \(profile.match.value))"))
                 matchedProfile = profile
             } else {
-                print("    ✗ Mismatch (Current MAC: \(curMAC) != \(profile.match.value))")
+                print(tr("    ✗ 不匹配 (当前 MAC: \(curMAC) != 期望: \(profile.match.value))",
+                         "    ✗ Mismatch (Current MAC: \(curMAC) != \(profile.match.value))"))
             }
 
         case "probe_host":
             let retries = profile.match.retryCount ?? 3
             let interval = profile.match.retryInterval ?? 1.0
-            print("    Probing \(profile.match.value) (Retry window: \(retries) attempts, interval: \(interval)s)...")
+            print(tr("    正在探测主机 \(profile.match.value) (重试窗口: \(retries) 次, 间隔: \(interval) 秒)...",
+                     "    Probing \(profile.match.value) (Retry window: \(retries) attempts, interval: \(interval)s)..."))
             if probeHostWithRetries(host: profile.match.value, retries: retries, interval: interval) {
-                print("    ✓ Matched! (Host \(profile.match.value) is reachable)")
+                print(tr("    ✓ 策略命中！(主机 \(profile.match.value) 可达)",
+                         "    ✓ Matched! (Host \(profile.match.value) is reachable)"))
                 matchedProfile = profile
             } else {
-                print("    ✗ Host \(profile.match.value) unreachable after \(retries) attempts.")
+                print(tr("    ✗ 在 \(retries) 次尝试后主机 \(profile.match.value) 依然不可达。",
+                         "    ✗ Host \(profile.match.value) unreachable after \(retries) attempts."))
             }
 
         default:
-            print("    ✗ Unknown match type: \(profile.match.type)")
+            print(tr("    ✗ 未知匹配规则类型: \(profile.match.type)",
+                     "    ✗ Unknown match type: \(profile.match.type)"))
         }
 
         if matchedProfile != nil {
@@ -1568,27 +1823,28 @@ func main() {
     }
 
     guard let profile = matchedProfile else {
-        print("\n[DONE] No matching profile for current network state. Exiting cleanly.")
+        print(tr("\n[DONE] 当前网络状态未匹配到任何策略。正常退出。",
+                 "\n[DONE] No matching profile for current network state. Exiting cleanly."))
         writeLog("No matching profile for current network, exiting")
         exit(0)
     }
 
-    print("\n[3] Executing active profile: '\(profile.id)'")
+    print(tr("\n[3] 执行匹配策略: '\(profile.id)'", "\n[3] Executing active profile: '\(profile.id)'"))
     writeLog("Executing profile: \(profile.id)")
 
     var mountedCount = 0
     for target in profile.targets {
-        print("  Target: \(target.mountPath) (\(target.url))")
+        print(tr("  目标: \(target.mountPath) (\(target.url))", "  Target: \(target.mountPath) (\(target.url))"))
 
         let status = ensureMountPointReady(target: target)
         switch status {
         case .alreadyMountedHealthy:
-            print("    ✓ Already mounted and responsive, skipping.")
+            print(tr("    ✓ 卷宗已挂载且响应正常，跳过。", "    ✓ Already mounted and responsive, skipping."))
             mountedCount += 1
             continue
 
         case .readyToMount:
-            print("    Mounting volume via NetFS...")
+            print(tr("    正在通过 NetFS 系统框架静默挂载...", "    Mounting volume via NetFS..."))
             if silentMount(urlString: target.url) {
                 mountedCount += 1
                 if profile.preventSpotlightIndex ?? true {
@@ -1597,11 +1853,12 @@ func main() {
             }
 
         case .unmountFailed:
-            print("    ✗ Mount point busy or cannot be cleared, skipping.")
+            print(tr("    ✗ 挂载点繁忙或无法清除，跳过此目标。", "    ✗ Mount point busy or cannot be cleared, skipping."))
         }
     }
 
-    print("\n[DONE] \(mountedCount)/\(profile.targets.count) volumes mounted under '\(profile.id)'.")
+    print(tr("\n[DONE] 策略 '\(profile.id)' 下已成功挂载 \(mountedCount)/\(profile.targets.count) 个卷宗。",
+             "\n[DONE] \(mountedCount)/\(profile.targets.count) volumes mounted under '\(profile.id)'."))
     writeLog("Finished execution of '\(profile.id)': \(mountedCount)/\(profile.targets.count) mounted.")
 }
 

@@ -11,7 +11,9 @@ AutoMount is a native, lightweight network storage (SMB) automation tool designe
 - **Tailscale Handshake Readiness Retry Window**: Provides a lightweight retry window (default 3 attempts with 1.0s intervals) to accommodate the delay required for WireGuard tunnels to establish handshakes upon lid open or network handoff.
 - **Cellular Hotspot & Spotlight Protection**: Automatically executes `mdutil -i off` and writes `.metadata_never_index` upon mounting to suppress remote metadata indexing, conserving mobile data and avoiding unnecessary NAS disk spin-ups; supports `exclude_gateway_ips` to filter metered gateways like iPhone personal hotspots (`172.20.10.1`).
 - **Modern Terminal Interactive UI**: Built with native ANSI Raw Mode terminal controls supporting arrow keys, Space to toggle, Enter to submit, and `a` for select all; dynamic discovery scans currently mounted SMB shares and active Tailscale peers with MagicDNS auto-mapping during `--init`.
-- **Daily Configuration Management (`--config`)**: Provides an interactive maintenance menu to add/remove mount targets, update gateway MACs, or refresh remote nodes without re-initializing, automatically syncing updates to the active LaunchAgent runtime.
+- **Daily Configuration Management (`--config`)**: Provides an all-in-one interactive control center displaying real-time daemon status, allowing you to add/remove mount targets, update router MACs, and manage LaunchAgent daemon services (deploy, reload, view, uninstall) without re-initializing, automatically syncing updates to the runtime.
+- **Bilingual Terminal Localization (i18n)**: Automatically detects macOS system preferred languages to display English or Simplified Chinese, with override support via `AUTO_MOUNT_LANG=en|zh`.
+- **Strict Argument Validation & POSIX Help**: Features standard `--help` / `-h` usage output, strictly validating input arguments and rejecting unknown options to prevent unintended mount triggers.
 - **Zero Sudo & Zero External Dependencies**: Implemented purely in native Swift, executed directly via macOS built-in Swift runtime without compilation, requiring no root/sudo privileges during daily operations.
 
 # Quick Start
@@ -42,12 +44,12 @@ Connect to your home network and run the initialization wizard:
 ./auto_mount --init
 ```
 
-The wizard guides you through:
+The wizard guides you through a 4-step streamlined workflow:
 
-1. **Automatic Gateway MAC Capture**: Detects and displays the physical router hardware fingerprint, with support for custom MAC overrides (cannot be empty, serving as the network exclusion baseline).
-2. **Active SMB Mount Discovery**: Scans currently mounted SMB volumes in the kernel and presents an ANSI checkbox menu for multi-selection via Space and arrow keys; **supports pressing Enter directly to skip** (mounting zero volumes in this LAN, using it solely as an exclusion condition for remote access); for manual entry, local mount points auto-derive from share names and accept default on Enter (e.g., `/Volumes/<share>`).
-3. **Tailscale Peer Discovery**: Queries `tailscale status --json` to list active nodes; gracefully skips if no active peers are found; upon device selection, supports auto-mapping from local shares, checkbox selection of active mounts, or entering a share folder name with auto-constructed URL and mount path.
-4. **Configuration Generation**: Writes the structured `auto_mount.plist` with zero manual syntax required.
+1. **[1/4] Automatic Gateway MAC Capture**: Detects and displays the physical router hardware fingerprint, with support for custom MAC overrides (cannot be empty, serving as the network exclusion baseline).
+2. **[2/4] Active SMB Mount Discovery**: Scans currently mounted SMB volumes in the kernel and presents an ANSI checkbox menu for multi-selection via Space and arrow keys; **supports pressing Enter directly to skip** (mounting zero volumes in this LAN, using it solely as an exclusion condition for remote access); for manual entry, local mount points auto-derive from share names and accept default on Enter (e.g., `/Volumes/<share>`).
+3. **[3/4] Tailscale Peer Discovery**: Queries `tailscale status --json` to list active nodes; gracefully skips if no active peers are found; upon device selection, supports auto-mapping from local shares, checkbox selection of active mounts, or entering a share folder name with auto-constructed URL and mount path.
+4. **[4/4] Save Configuration & One-Click Daemon Deployment**: Writes the structured `auto_mount.plist`, and prompts whether to immediately register and activate the system LaunchAgent background daemon (defaults to `Y`, pressing Enter deploys and starts service immediately).
 
 Terminal Checkbox Controls:
 - `↑` / `k`: Move cursor up
@@ -74,7 +76,7 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 
 The interactive management menu displays:
 
-```
+```text
 Auto Mount Tool - Daily Configuration Management (v2.0)
 ======================================================
 
@@ -83,11 +85,14 @@ Currently configured profiles:
   [2] tailscale_remote (Tailscale Remote Peer) - 1 mount target
       • /Volumes/personal_folder <- smb://dx4600.xxx.ts.net/personal_folder
 
-Please select an action:
-  [1] Add mount target (Dynamic kernel scan or manual entry with auto-derived path)
-  [2] Remove mount target
-  [3] Re-detect/Update home gateway MAC
-  [4] Re-detect/Update remote Tailscale target (or Configure and Add if not present)
+Background Daemon Status: Active & running (gui/501/com.user.auto-mount)
+
+Select an action:
+  [1] Add mount target (import from active mounts or manual entry)
+  [2] Remove existing mount target
+  [3] Re-detect / update home gateway MAC
+  [4] Re-detect / update remote Tailscale peer
+  [5] Daemon management (deploy/reload, view details, uninstall)
   [0] Save configuration and exit
 ```
 
@@ -95,7 +100,7 @@ Upon saving, changes are committed to the local `auto_mount.plist` and automatic
 
 ## Background Daemon Deployment (`--install`)
 
-Register AutoMount with the system service manager:
+If you skipped daemon deployment during `--init` or prefer managing the service via command line (also available under `./auto_mount --config` option `[5]`):
 
 ```bash
 # Install and activate LaunchAgent daemon (no sudo needed)
@@ -106,6 +111,9 @@ Register AutoMount with the system service manager:
 
 # Uninstall service and clean deployment files
 ./auto_mount --uninstall
+
+# Show CLI usage and environment variable options
+./auto_mount --help
 ```
 
 `--install` deploys the script and configuration into `~/Library/Application Support/AutoMount`, bypassing macOS TCC sandbox restrictions on user folders (Documents/Downloads), and registers `com.user.auto-mount.plist` inside `~/Library/LaunchAgents`. The daemon triggers automatically upon system network events or waking from sleep.
