@@ -148,12 +148,14 @@ struct AutoMountConfig: Codable {
     var version: String
     var updateChannel: String?                 // "off" (默认), "notify", "auto"
     var lastUpdateCheckTimestamp: Double?     // 24小时冷却时间戳
+    var lastNotifiedVersion: String?          // 单版本仅提醒 1 次防打扰
     var profiles: [NetworkProfile]
 
     enum CodingKeys: String, CodingKey {
         case version
         case updateChannel = "update_channel"
         case lastUpdateCheckTimestamp = "last_update_check_timestamp"
+        case lastNotifiedVersion = "last_notified_version"
         case profiles
     }
 }
@@ -1105,7 +1107,7 @@ func runInitWizard() {
     print(tr("  ✓ 软件更新策略已设置为: \(selectedChannel)", "  ✓ Software update policy set to: \(selectedChannel)"))
 
     // 保存配置
-    let config = AutoMountConfig(version: "2.1", updateChannel: selectedChannel, lastUpdateCheckTimestamp: nil, profiles: profiles)
+    let config = AutoMountConfig(version: "2.1", updateChannel: selectedChannel, lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: profiles)
     saveConfig(config)
     print(tr("\n[DONE] 初始化完成！配置已写入 \(getConfigURL().path)",
              "\n[DONE] Setup complete! Configuration written to \(getConfigURL().path)"))
@@ -2003,6 +2005,12 @@ func triggerBackgroundUpdateCheckIfNeeded(config: inout AutoMountConfig) {
     writeLog("New version discovered: \(remoteVersion) (current: \(autoMountVersion)), channel: \(channel)")
 
     if channel == "notify" {
+        // 单版本仅提醒 1 次防打扰机制
+        if config.lastNotifiedVersion == remoteVersion {
+            writeLog("Update notification for \(remoteVersion) already presented once. Skipping.")
+            return
+        }
+
         showMacOSNotification(
             title: tr("AutoMount 新版本提醒", "AutoMount Update Available"),
             subtitle: tr("发现新版本 \(remoteVersion) (当前: v\(autoMountVersion))",
@@ -2010,6 +2018,9 @@ func triggerBackgroundUpdateCheckIfNeeded(config: inout AutoMountConfig) {
             message: tr("可运行 './auto_mount --update' 完成升级。",
                          "Run './auto_mount --update' to upgrade.")
         )
+
+        config.lastNotifiedVersion = remoteVersion
+        saveConfig(config)
     } else if channel == "auto" {
         if let sourceCode = downloadLatestSource(tag: remoteVersion) {
             _ = performSelfUpdate(newVersion: remoteVersion, newContent: sourceCode, isSilent: true)

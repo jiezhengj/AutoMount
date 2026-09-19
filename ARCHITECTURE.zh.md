@@ -323,8 +323,10 @@ flowchart TD
     ParseSemVer -- "否/无 Release" --> SkipUpdate
     ParseSemVer -- "是" --> ChannelBranch{"当前信道类型"}
     
-    ChannelBranch -- "notify" --> SendBanner["调用 osascript 发送 macOS 系统通知\n(提示用户手动运行 --update)"]
-    SendBanner --> UpdateTimestamp["写回冷却时间戳，安全退出"]
+    ChannelBranch -- "notify" --> CheckNotified{"该版本是否已提醒过\n(last_notified == remote)?"}
+    CheckNotified -- "是 (已提醒)" --> SkipUpdate
+    CheckNotified -- "否 (首次发现)" --> SendBanner["调用 osascript 发送 macOS 系统通知\n(提示用户手动运行 --update)"]
+    SendBanner --> UpdateTimestamp["持久化 last_notified_version 与时间戳，退出"]
     
     ChannelBranch -- "auto 或 手动确认" --> DownloadSource["拉取最新源码至 /tmp/automount_check_*.swift"]
     DownloadSource --> SyntaxGate{"核心安全门: 本地 Swift 语法预检\n/usr/bin/swiftc -parse <temp_file>"}
@@ -341,12 +343,17 @@ flowchart TD
 * **低频轻量原则**：即便配置了 `notify` 或 `auto` 策略，守护进程每次因网络切换被唤醒时，首先比对 `last_update_check_timestamp`。若距离上次检查不足 86,400 秒（24 小时），更新逻辑在纳秒级直接短路返回，杜绝高频切网（如频繁插拔网线或 Wi-Fi 信号跳动）对 GitHub API 造成滥用或触发速率限制（Rate Limit）。
 * **任务优先级让渡**：后台更新检查始终放置于网络挂载执行完成后触发，确保核心的网络存储挂载任务以毫秒级最高优先级执行，不因远端 HTTP 请求延迟干扰挂载体验。
 
-## 2. 本地 `swiftc -parse` 语法预检断路器
+## 2. 单版本单次提醒防打扰机制
+
+* **防疲劳轰炸设计**：针对 `notify` 模式，系统在配置文件中维护 `last_notified_version` 属性。当检测到远端新版本并成功投递 1 次系统通知横幅后，该版本号即刻固化存盘。
+* **版本更新触发**：后续即便跨越了 24 小时冷却窗口且多次触发网络切换，只要远端最新版本依然等于 `last_notified_version`，通知逻辑将自动抑制跳过，绝对不反复骚扰用户；仅当官方后续发布了更新的版本时，才会解除抑制并发送针对新版本的单次通知。
+
+## 3. 本地 `swiftc -parse` 语法预检断路器
 
 * **单文件自升级的崩溃风险**：对于无外部依赖的单文件脚本，若从远端下载的代码遭遇网络截断、代理劫持注入或语法破坏，直接覆盖运行文件将导致后续 `launchd` 唤醒时进程崩溃死锁。
 * **编译期抽象语法树安全门**：AutoMount 在落地新文件前，必须将下载的源码写入临时文件，并调用系统内置的 `/usr/bin/swiftc -parse <tempFile>` 驱动 Swift 前端完成完整的抽象语法树解析。只有返回码为 0 时才判定为可执行代码，任何解析错误均立即触发断路器阻断部署，保障已部署系统的稳定运行。
 
-## 3. 双端原子同步与平滑热重载
+## 4. 双端原子同步与平滑热重载
 
 * **双环境同步机制**：`performSelfUpdate` 识别当前是否同时存在工作区源码与 `~/Library/Application Support/AutoMount` 部署目录。若两处皆存在，自升级引擎原子同步更新两个副本，消除“开发者更新了代码但守护程序依然运行旧版本”或“日常运行目录更新但版本控制未同步”的认知脱节。
 * **热重载无需重启**：更新完成后，主程序无缝调用 `launchctl bootout` 与 `launchctl bootstrap` 重载 `com.user.auto-mount` 服务，新代码在下一次网络事件触发时即刻生效，全程无需重启计算机或重登用户会话。

@@ -10,7 +10,7 @@ AutoMount is a native, lightweight network storage (SMB) automation tool designe
 - **Timeout-Fused Forced Cleanup for Dead Mounts**: Utilizes Darwin kernel `MNT_NOWAIT` non-blocking mount table snapshots. Upon network switching or remote server unavailability, triggers an asynchronous unmount with a strict 3-second timeout fuse (`diskutil unmount force` with POSIX `unmount(MNT_FORCE)` kernel fallback), preventing filesystem I/O locks and system beachball freezes.
 - **Tailscale Handshake Readiness Retry Window**: Provides a lightweight retry window (default 3 attempts with 1.0s intervals) to accommodate the delay required for WireGuard tunnels to establish handshakes upon lid open or network handoff.
 - **Cellular Hotspot & Spotlight Protection**: Automatically executes `mdutil -i off` and writes `.metadata_never_index` upon mounting to suppress remote metadata indexing, conserving mobile data and avoiding unnecessary NAS disk spin-ups; supports `exclude_gateway_ips` to filter metered gateways like iPhone personal hotspots (`172.20.10.1`).
-- **Auto-Update Channel & Safe Self-Update**: Supports a robust self-upgrade system (`--update`) comparing semantic versions against official GitHub releases. Features three distinct channels: `off` (default, zero external requests), `notify` (macOS native banner notifications on new releases), and `auto` (silent background upgrade). Equipped with a 24-hour cooldown throttle and local `swiftc -parse` AST syntax validation to prevent corrupted updates from impacting the running daemon.
+- **Auto-Update Channel & Safe Self-Update**: Supports a robust self-upgrade system (`--update`) comparing semantic versions against official GitHub releases. Features three distinct channels: `off` (default, zero external requests), `notify` (macOS native banner notifications on new releases, single notification per version to prevent alert fatigue), and `auto` (silent background upgrade). Equipped with a 24-hour cooldown throttle and local `swiftc -parse` AST syntax validation to prevent corrupted updates from impacting the running daemon.
 - **Modern Terminal Interactive UI**: Built with native ANSI Raw Mode terminal controls supporting arrow keys, Space to toggle, Enter to submit, and `a` for select all; dynamic discovery scans currently mounted SMB shares and active Tailscale peers with MagicDNS auto-mapping during `--init`.
 - **Daily Configuration Management (`--config`)**: Provides an all-in-one interactive control center displaying real-time daemon status and auto-update channels, allowing you to add/remove mount targets, update router MACs, adjust update policies, and manage LaunchAgent daemon services (deploy, reload, view, uninstall) without re-initializing, automatically syncing updates to the runtime.
 - **Bilingual Terminal Localization (i18n)**: Automatically detects macOS system preferred languages to display English or Simplified Chinese, with override support via `AUTO_MOUNT_LANG=en|zh`.
@@ -225,6 +225,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 | `version` | String | Configuration schema version (`2.1`). |
 | `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
 | `last_update_check_timestamp` | Real | Unix timestamp of the last update check, enforcing the 24-hour cooldown window. |
+| `last_notified_version` | String | Latest remote release tag that was notified, ensuring at most one notification per new version. |
 | `profiles` | Array | Ordered policy list. Evaluated sequentially; the first matching profile executes and terminates subsequent evaluations. |
 | `id` | String | Unique profile identifier (e.g., `home_lan`, `tailscale_remote`). |
 | `description` | String | Human-readable profile description. |
@@ -370,6 +371,12 @@ When updating local repository code via Git or editing scripts in the workspace,
 AutoMount maintains strict data privacy and zero unexpected external traffic:
 - **Default policy is `off`**: By default, the program never reaches out to GitHub or external servers in the background. Update checks are strictly user-initiated via `./auto_mount --update`.
 - **Low-frequency design**: Even when `notify` or `auto` channel is explicitly enabled, checks are throttled by a 24-hour (86,400s) cooldown window, querying only lightweight release metadata after mount tasks complete.
+
+### Q: What is the frequency and notification limit for the `notify` channel?
+
+The `notify` channel features built-in alert throttling and anti-fatigue controls:
+1. **Maximum Frequency**: Enforced by a strict 24-hour (86,400s) cooldown window. Even if you roam across networks or wake your laptop 100 times in a day, at most one lightweight check can occur in 24 hours.
+2. **Single Notification Cap**: Tracked via `last_notified_version` in the configuration. Once a notification banner is displayed for a newly discovered release, AutoMount never presents repeated alerts for that same version, remaining completely quiet until an even newer release is published.
 
 # License
 

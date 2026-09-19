@@ -323,8 +323,10 @@ flowchart TD
     ParseSemVer -- "No / No Release" --> SkipUpdate
     ParseSemVer -- "Yes" --> ChannelBranch{"Channel Type"}
     
-    ChannelBranch -- "notify" --> SendBanner["Invoke osascript for macOS Notification\n(Prompt user to run --update)"]
-    SendBanner --> UpdateTimestamp["Record timestamp & exit cleanly"]
+    ChannelBranch -- "notify" --> CheckNotified{"Already Notified for this Version\n(last_notified == remote)?"}
+    CheckNotified -- "Yes (Already Notified)" --> SkipUpdate
+    CheckNotified -- "No (First Discovery)" --> SendBanner["Invoke osascript for macOS Notification\n(Prompt user to run --update)"]
+    SendBanner --> UpdateTimestamp["Record last_notified_version & timestamp, exit cleanly"]
     
     ChannelBranch -- "auto or Confirmed Manual" --> DownloadSource["Fetch Source to /tmp/automount_check_*.swift"]
     DownloadSource --> SyntaxGate{"Core Safety Gate: Local Swift Syntax Pre-Check\n/usr/bin/swiftc -parse <temp_file>"}
@@ -341,12 +343,17 @@ flowchart TD
 * **Low-Frequency Principle**: Even when configured with `notify` or `auto`, the background daemon checks `last_update_check_timestamp` whenever awakened by network events. If less than 86,400 seconds (24 hours) have elapsed, the update logic short-circuits in nanoseconds, preventing rapid network transitions (such as toggling Wi-Fi or switching interfaces) from flooding GitHub APIs or triggering rate limits.
 * **Mounting Task Priority**: Background update checks always execute after volume mount actions finish, ensuring network storage operations maintain sub-second priority without being impeded by external HTTP latency.
 
-## 2. Local `swiftc -parse` Syntax Pre-Check Circuit Breaker
+## 2. Single-Notification Anti-Fatigue Mechanism
+
+* **Alert Fatigue Prevention**: For the `notify` channel, AutoMount stores `last_notified_version` in the configuration. Once a system banner has been displayed for a newly released build, this version tag is persisted to disk.
+* **Release-Bound Trigger**: Even across network switches after the 24-hour cooldown expires, if the remote release tag remains identical to `last_notified_version`, the notification is suppressed, avoiding repetitive alerts. Only when a newer version is tagged upstream will a new notification be triggered.
+
+## 3. Local `swiftc -parse` Syntax Pre-Check Circuit Breaker
 
 * **Single-File Crash Hazard**: In standalone single-file architectures, corrupt downloads caused by proxy injection or incomplete network transfers can result in continuous launchd crash loops.
 * **Compiler AST Safety Gate**: AutoMount writes downloaded source to a temporary file and executes `/usr/bin/swiftc -parse <tempFile>` to run compiler-level abstract syntax tree analysis. The update proceeds only when the process exits with status code 0; any syntax anomaly immediately triggers the circuit breaker, preserving system stability.
 
-## 3. Dual-Environment Synchronization & Hot Reload
+## 4. Dual-Environment Synchronization & Hot Reload
 
 * **Workspace & Runtime Parity**: `performSelfUpdate` checks whether both the developer workspace script and the `~/Library/Application Support/AutoMount` runtime exist. When both are present, updates are committed atomically to both locations, eliminating discrepancies between active daemons and version-controlled repositories.
 * **Zero-Reboot Hot Reload**: Following file deployment, the engine executes `launchctl bootout` and `launchctl bootstrap` on `com.user.auto-mount`. The updated code becomes immediately active for future network events without requiring system reboots or user session restarts.
