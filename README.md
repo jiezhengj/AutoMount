@@ -1,9 +1,9 @@
 # 语言导航 / Language Navigation
 
-| 语言 / Language | 说明文档 / Documentation | 技能文档 / Skill Specification |
+| 语言 / Language | 说明文档 / Documentation | 架构与技术规范 / Architecture & Standards |
 | :--- | :--- | :--- |
-| 中文 | [README.zh.md](./README.zh.md) | [SKILL.zh.md](./SKILL.zh.md) |
-| English | [README.en.md](./README.en.md) | [SKILL.en.md](./SKILL.en.md) |
+| 中文 | [README.zh.md](./README.zh.md) | [ARCHITECTURE.zh.md](./ARCHITECTURE.zh.md) |
+| English | [README.en.md](./README.en.md) | [ARCHITECTURE.en.md](./ARCHITECTURE.en.md) |
 
 # 简介 / Overview
 

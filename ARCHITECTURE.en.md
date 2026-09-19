@@ -1,22 +1,3 @@
----
-name: macos-silent-smb-mount
-version: 2.0.0
-description: "Standards and best practices for silent SMB mounting and multi-network policy routing on macOS: NetFSMountURLSync Keychain authentication, kernel MNT_NOWAIT non-blocking mount inspection, 3-second timeout circuit breaker, Spotlight indexing protection, and launchd automation."
-metadata:
-  requires:
-    bins:
-      - swift
-      - launchctl
-      - ipconfig
-      - arp
-      - smbutil
-      - diskutil
-    frameworks:
-      - NetFS
-      - SystemConfiguration
-      - CoreFoundation
----
-
 # Core Architecture and Decision Model
 
 When mounting network storage volumes in macOS automation workflows, high-level blocking APIs and permission barriers must be avoided by following a deterministic technical path:

@@ -1,22 +1,3 @@
----
-name: macos-silent-smb-mount
-version: 2.0.0
-description: "macOS 静默挂载与多网络策略路由规范：涵盖 NetFSMountURLSync 免密调用、内核 MNT_NOWAIT 非阻塞查询、失效挂载超时熔断、Spotlight 索引防护及 launchd 自动化驱动。"
-metadata:
-  requires:
-    bins:
-      - swift
-      - launchctl
-      - ipconfig
-      - arp
-      - smbutil
-      - diskutil
-    frameworks:
-      - NetFS
-      - SystemConfiguration
-      - CoreFoundation
----
-
 # 核心架构与决策模型
 
 在 macOS 自动化流程中挂载网络存储卷宗时，必须避开高层阻塞 API 与权限陷阱，遵循确定性技术路线：
