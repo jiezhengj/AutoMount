@@ -57,9 +57,16 @@ Terminal Checkbox Controls:
 - `Enter`: Confirm selection (or press Enter to skip)
 - `Ctrl + C`: Safe exit restoring terminal mode
 
+> [!IMPORTANT]
+> **Important: `--init` performs a full overwrite initialization**
+> - `--init` is designed to construct an entirely new configuration from scratch and **never reads, merges, or preserves existing historical configuration**.
+> - If `auto_mount.plist` already exists on disk, completing the wizard will overwrite the entire file.
+> - In the "Select home LAN mount targets" step, pressing Enter directly to skip means **explicitly configuring the mount targets for that profile to an empty list (acting as an Exclusion Gatekeeper); existing targets will NOT be retained**.
+> - If you already have an existing configuration and only want to add/remove mount points, update router MACs, or refresh Tailscale peers while keeping existing items intact, **do NOT use `--init`; use `./auto_mount --config` instead**.
+
 ## Daily Configuration Management (`--config`)
 
-To add new shares, remove obsolete mount points, or update router hardware MACs without starting from scratch:
+To add new shares, remove obsolete mount points, or update router hardware MACs without starting from scratch (and without accidentally overwriting existing configuration via `--init`), run:
 
 ```bash
 ./auto_mount --config
@@ -312,6 +319,11 @@ Since the physical router MAC address has changed, run:
 ```
 
 Select `[4] Update home gateway MAC`. The program detects the new hardware fingerprint and updates configuration automatically.
+
+### Q: What is the difference between `--init` and `--config`? What happens if I press Enter to skip mount targets in `--init`?
+
+- **`--init` (Full Scratch Initialization)**: Intended for first-time setup or clean rebuilds. The wizard builds an entirely new configuration object from scratch and **never reads, merges, or preserves existing settings**. Pressing Enter directly to skip in the mount target selection step explicitly sets the target list to empty (`targets: []`), treating that network strictly as an "Exclusion Gatekeeper" (performing zero mounts locally while preventing fallback to remote tunnels), and **completely overwrites the existing `auto_mount.plist` configuration file** upon completion.
+- **`--config` (Incremental Daily Management)**: Intended for ongoing configuration maintenance. It loads existing configuration into memory, preserving all unedited settings, and allows adding new targets, removing specific targets, refreshing gateway MACs, or updating remote peers. Changes are safely saved back to disk and hot-synced to the LaunchAgent daemon. Always use `--config` for daily maintenance.
 
 # License
 
