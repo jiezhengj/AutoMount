@@ -357,3 +357,39 @@ flowchart TD
 
 * **Workspace & Runtime Parity**: `performSelfUpdate` checks whether both the developer workspace script and the `~/Library/Application Support/AutoMount` runtime exist. When both are present, updates are committed atomically to both locations, eliminating discrepancies between active daemons and version-controlled repositories.
 * **Zero-Reboot Hot Reload**: Following file deployment, the engine executes `launchctl bootout` and `launchctl bootstrap` on `com.user.auto-mount`. The updated code becomes immediately active for future network events without requiring system reboots or user session restarts.
+
+# Unified Versioning & In-Place Schema Auto-Migration
+
+## 1. Design Philosophy: Eliminating Dual-Track Versioning
+
+Traditional configuration-driven systems often maintain dual-track versions: a software release version (e.g., `2.1.0`) and a configuration format version (e.g., `2.0` / `2.1`). Over ongoing feature iterations, this split introduces substantial engineering and operational overhead:
+* **Developer Cognitive Divergence**: The codebase is forced to sustain legacy parsing forks and branching logic (e.g., maintaining redundant structs such as `ConfigV1` and `ConfigV2`), unnecessarily bloating the compilation unit;
+* **User Uncertainty**: When users observe that their software binary is updated while the configuration file continues to display an outdated format tag, it fosters doubt regarding feature compatibility;
+* **Silent Schema Drift**: Manual alterations to the version string by users risk triggering erroneous legacy fallback logic, resulting in missing properties or decode failures.
+
+To solve this, AutoMount establishes a **Single Global Version Contract**: the root-level `version` tag in the configuration file strictly and permanently mirrors the software binary's semantic version (`autoMountVersion`).
+
+## 2. In-Place Auto-Migration Workflow
+
+Rather than accumulating defensive fallback branches across runtime paths, AutoMount applies the architectural doctrine of **"Latest Spec as Single Source of Truth, Instant In-Place Migration Upon Load"**:
+
+```mermaid
+flowchart TD
+    LoadPlist["Read auto_mount.plist stream"] --> Decode["PropertyListDecoder deserializes into current AutoMountConfig"]
+    Decode --> CheckVersion{"config.version == autoMountVersion\nAND all fields complete?"}
+    
+    CheckVersion -- "Yes (Up to date)" --> FastReturn["Return configuration object; proceed to mount lifecycle"]
+    
+    CheckVersion -- "No (Outdated version or missing keys)" --> SchemaUpgrade["In-Place Lossless Auto-Migration:\n1. Preserve all existing profiles, targets, and gateway fingerprints\n2. Advance config.version to match active autoMountVersion\n3. Populate newly introduced attributes with safe defaults (e.g., update_channel: off)"]
+    
+    SchemaUpgrade --> AtomicSave["Atomically persist via saveConfig(config)"]
+    AtomicSave --> SyncRuntime["Sync updated plist to LaunchAgent directory via syncConfigToInstalledDirIfNeeded"]
+    SyncRuntime --> LogAudit["Log migration audit event and return updated configuration"]
+```
+
+## 3. Data Integrity & Resilience Guarantees
+
+* **Business Payload Immutability**: The migration routine operates strictly on schema evolution (injecting newly supported configuration keys and safe defaults). All existing gateway hardware fingerprints, SMB mount target endpoints, and bypass gateways remain untouched;
+* **Atomic Persistence**: Modified configuration files are written using `Data.write(to:options: .atomic)` with `0o644` POSIX permissions, preventing corrupted states during unexpected system sleep or power loss;
+* **Runtime Synchronization**: Once migration occurs, the newly formatted payload is automatically synchronized to `~/Library/Application Support/AutoMount/auto_mount.plist`, ensuring continuous schema harmony whether executed in background launchd sessions or interactive terminal invocations.
+

@@ -160,12 +160,35 @@ struct AutoMountConfig: Codable {
     }
 }
 
-// 加载 2.0 配置
+// MARK: - 配置文件原地无损自动升舱 (In-Place Schema Auto-Migration)
+
+func migrateConfigIfNeeded(config: inout AutoMountConfig) -> Bool {
+    var modified = false
+    if config.version != autoMountVersion {
+        config.version = autoMountVersion
+        modified = true
+    }
+    if config.updateChannel == nil {
+        config.updateChannel = "off"
+        modified = true
+    }
+    if modified {
+        saveConfig(config)
+        print(tr("✓ 配置文件已自动平滑升级至 v\(autoMountVersion) 格式规范",
+                 "✓ Configuration automatically upgraded to v\(autoMountVersion) schema"))
+        writeLog("Configuration auto-migrated to v\(autoMountVersion)")
+    }
+    return modified
+}
+
+// 加载配置并按需执行原地无损升舱
 func loadConfig() -> AutoMountConfig? {
     let configURL = getConfigURL()
     guard let data = try? Data(contentsOf: configURL) else { return nil }
     let decoder = PropertyListDecoder()
-    return try? decoder.decode(AutoMountConfig.self, from: data)
+    guard var config = try? decoder.decode(AutoMountConfig.self, from: data) else { return nil }
+    _ = migrateConfigIfNeeded(config: &config)
+    return config
 }
 
 // 自动同步配置到 LaunchAgent 运行时目录（若已安装）
@@ -1107,7 +1130,7 @@ func runInitWizard() {
     print(tr("  ✓ 软件更新策略已设置为: \(selectedChannel)", "  ✓ Software update policy set to: \(selectedChannel)"))
 
     // 保存配置
-    let config = AutoMountConfig(version: "2.1", updateChannel: selectedChannel, lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: profiles)
+    let config = AutoMountConfig(version: autoMountVersion, updateChannel: selectedChannel, lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: profiles)
     saveConfig(config)
     print(tr("\n[DONE] 初始化完成！配置已写入 \(getConfigURL().path)",
              "\n[DONE] Setup complete! Configuration written to \(getConfigURL().path)"))

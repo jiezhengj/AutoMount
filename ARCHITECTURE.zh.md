@@ -357,3 +357,39 @@ flowchart TD
 
 * **双环境同步机制**：`performSelfUpdate` 识别当前是否同时存在工作区源码与 `~/Library/Application Support/AutoMount` 部署目录。若两处皆存在，自升级引擎原子同步更新两个副本，消除“开发者更新了代码但守护程序依然运行旧版本”或“日常运行目录更新但版本控制未同步”的认知脱节。
 * **热重载无需重启**：更新完成后，主程序无缝调用 `launchctl bootout` 与 `launchctl bootstrap` 重载 `com.user.auto-mount` 服务，新代码在下一次网络事件触发时即刻生效，全程无需重启计算机或重登用户会话。
+
+# 单一版本体系与原地配置无损升舱 (In-Place Schema Auto-Migration)
+
+## 1. 废弃多轨双重版本体系的设计哲学
+
+在传统的配置驱动工具中，往往存在“软件版本号（如 `2.1.0`）”与“配置文件格式版本号（如 `2.0` / `2.1`）”并存的双轨制。随着业务特性的持续迭代，双轨体系会迅速带来高昂的心智与工程负债：
+* **开发者认知割裂**：代码中必须长期维护兼容旧版本配置的数据解析分流逻辑（例如同时维护多套历史结构体），增加了编译单元与控制流的复杂度；
+* **用户运维困惑**：当用户看到软件已更新至新版本，但配置文件仍标注着老旧版本号时，往往产生兼容性疑虑或误认为升级未完全生效；
+* **升级断层风险**：用户若手动修改了配置文件版本，可能导致向下兼容逻辑误判，进而造成字段缺失或解析异常。
+
+为此，AutoMount 彻底废弃双轨版本制，推行**单一全局版本号契约**：配置文件根层级的 `version` 必须且始终严格对齐主程序二进制的语义化版本号（`autoMountVersion`）。
+
+## 2. 运行时原地自动升舱机制 (In-Place Migration)
+
+为彻底消灭复杂的历史版本向下兼容分流逻辑，AutoMount 确立了**“以当前最新标准为唯一真理，启动即原地升舱”**的架构原则：
+
+```mermaid
+flowchart TD
+    LoadPlist["读取 auto_mount.plist 数据流"] --> Decode["PropertyListDecoder 尝试解析为当前最新 AutoMountConfig 模型"]
+    Decode --> CheckVersion{"config.version == autoMountVersion\n且必选扩展字段完备？"}
+    
+    CheckVersion -- "是 (最新规约)" --> FastReturn["直接返回配置对象，进入业务挂载流"]
+    
+    CheckVersion -- "否 (检测到旧版本或字段缺省)" --> SchemaUpgrade["原地无损升舱补正:\n1. 完整保留所有既有 Profiles / Targets / MAC 指纹\n2. 将 config.version 强行推进至当前 autoMountVersion\n3. 为新增属性补全官方推荐安全默认值 (如 update_channel: off)"]
+    
+    SchemaUpgrade --> AtomicSave["调用 saveConfig(config) 原子写回磁盘"]
+    AtomicSave --> SyncRuntime["syncConfigToInstalledDirIfNeeded 同步更新 LaunchAgent 目录"]
+    SyncRuntime --> LogAudit["控制台输出升舱成功日志，返回新配置进入业务挂载流"]
+```
+
+## 3. 升舱安全性与数据不灭定律
+
+* **业务数据严格不可变**：升舱算法仅针对结构规范的演进（如新增功能开关、默认策略注入），已有的所有网关物理指纹、挂载点映射、排除网关 IP 等用户既有数据受到不可变保护，绝不被丢弃或重写；
+* **原子写回与权限固化**：修改后的配置通过 `Data.write(to:options: .atomic)` 原子写入，配合 `chmod 644` 权限校验，杜绝掉电、宕机引发的配置文件损坏；
+* **双环境无缝协同**：升舱动作触发后，不仅更新当前加载目录的配置文件，还会自动检测并同步刷新 `~/Library/Application Support/AutoMount/auto_mount.plist`，确保无论以后台守护运行还是控制台手动调试，配置结构永远与底层运行程序保持最新的一致性。
+

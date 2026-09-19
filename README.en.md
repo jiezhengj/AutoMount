@@ -136,7 +136,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.1</string>
+    <string>2.1.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -222,7 +222,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `version` | String | Configuration schema version (`2.1`). |
+| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.1.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
 | `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
 | `last_update_check_timestamp` | Real | Unix timestamp of the last update check, enforcing the 24-hour cooldown window. |
 | `last_notified_version` | String | Latest remote release tag that was notified, ensuring at most one notification per new version. |
@@ -377,6 +377,13 @@ AutoMount maintains strict data privacy and zero unexpected external traffic:
 The `notify` channel features built-in alert throttling and anti-fatigue controls:
 1. **Maximum Frequency**: Enforced by a strict 24-hour (86,400s) cooldown window. Even if you roam across networks or wake your laptop 100 times in a day, at most one lightweight check can occur in 24 hours.
 2. **Single Notification Cap**: Tracked via `last_notified_version` in the configuration. Once a notification banner is displayed for a newly discovered release, AutoMount never presents repeated alerts for that same version, remaining completely quiet until an even newer release is published.
+
+### Q: Do I need to manually update configuration files or re-run `--init` after updating the software?
+
+Not at all. AutoMount eliminates dual-version divergence and features **In-Place Schema Auto-Migration**:
+- Upon loading the configuration file, the program checks whether the file `version` or schema structure lags behind the software version.
+- If an outdated version or missing fields are detected, existing business settings (gateway MACs, mount targets, exclusion lists) are preserved intact in memory, missing fields are populated with official safe defaults (such as `update_channel: "off"`), and the configuration file is atomically persisted back to disk and synced to the LaunchAgent directory with the latest `version` tag.
+- You never need to re-initialize your settings or manually trace migration changelogs; the upgrade process is completely automated and seamless.
 
 # License
 
