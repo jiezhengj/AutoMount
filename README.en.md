@@ -10,8 +10,9 @@ AutoMount is a native, lightweight network storage (SMB) automation tool designe
 - **Timeout-Fused Forced Cleanup for Dead Mounts**: Utilizes Darwin kernel `MNT_NOWAIT` non-blocking mount table snapshots. Upon network switching or remote server unavailability, triggers an asynchronous unmount with a strict 3-second timeout fuse (`diskutil unmount force` with POSIX `unmount(MNT_FORCE)` kernel fallback), preventing filesystem I/O locks and system beachball freezes.
 - **Tailscale Handshake Readiness Retry Window**: Provides a lightweight retry window (default 3 attempts with 1.0s intervals) to accommodate the delay required for WireGuard tunnels to establish handshakes upon lid open or network handoff.
 - **Cellular Hotspot & Spotlight Protection**: Automatically executes `mdutil -i off` and writes `.metadata_never_index` upon mounting to suppress remote metadata indexing, conserving mobile data and avoiding unnecessary NAS disk spin-ups; supports `exclude_gateway_ips` to filter metered gateways like iPhone personal hotspots (`172.20.10.1`).
+- **Auto-Update Channel & Safe Self-Update**: Supports a robust self-upgrade system (`--update`) comparing semantic versions against official GitHub releases. Features three distinct channels: `off` (default, zero external requests), `notify` (macOS native banner notifications on new releases), and `auto` (silent background upgrade). Equipped with a 24-hour cooldown throttle and local `swiftc -parse` AST syntax validation to prevent corrupted updates from impacting the running daemon.
 - **Modern Terminal Interactive UI**: Built with native ANSI Raw Mode terminal controls supporting arrow keys, Space to toggle, Enter to submit, and `a` for select all; dynamic discovery scans currently mounted SMB shares and active Tailscale peers with MagicDNS auto-mapping during `--init`.
-- **Daily Configuration Management (`--config`)**: Provides an all-in-one interactive control center displaying real-time daemon status, allowing you to add/remove mount targets, update router MACs, and manage LaunchAgent daemon services (deploy, reload, view, uninstall) without re-initializing, automatically syncing updates to the runtime.
+- **Daily Configuration Management (`--config`)**: Provides an all-in-one interactive control center displaying real-time daemon status and auto-update channels, allowing you to add/remove mount targets, update router MACs, adjust update policies, and manage LaunchAgent daemon services (deploy, reload, view, uninstall) without re-initializing, automatically syncing updates to the runtime.
 - **Bilingual Terminal Localization (i18n)**: Automatically detects macOS system preferred languages to display English or Simplified Chinese, with override support via `AUTO_MOUNT_LANG=en|zh`.
 - **Strict Argument Validation & POSIX Help**: Features standard `--help` / `-h` usage output, strictly validating input arguments and rejecting unknown options to prevent unintended mount triggers.
 - **Zero Sudo & Zero External Dependencies**: Implemented purely in native Swift, executed directly via macOS built-in Swift runtime without compilation, requiring no root/sudo privileges during daily operations.
@@ -44,12 +45,13 @@ Connect to your home network and run the initialization wizard:
 ./auto_mount --init
 ```
 
-The wizard guides you through a 4-step streamlined workflow:
+The wizard guides you through a 5-step streamlined workflow:
 
-1. **[1/4] Automatic Gateway MAC Capture**: Detects and displays the physical router hardware fingerprint, with support for custom MAC overrides (cannot be empty, serving as the network exclusion baseline).
-2. **[2/4] Active SMB Mount Discovery**: Scans currently mounted SMB volumes in the kernel and presents an ANSI checkbox menu for multi-selection via Space and arrow keys; **supports pressing Enter directly to skip** (mounting zero volumes in this LAN, using it solely as an exclusion condition for remote access); for manual entry, local mount points auto-derive from share names and accept default on Enter (e.g., `/Volumes/<share>`).
-3. **[3/4] Tailscale Peer Discovery**: Queries `tailscale status --json` to list active nodes; gracefully skips if no active peers are found; upon device selection, supports auto-mapping from local shares, checkbox selection of active mounts, or entering a share folder name with auto-constructed URL and mount path.
-4. **[4/4] Save Configuration & One-Click Daemon Deployment**: Writes the structured `auto_mount.plist`, and prompts whether to immediately register and activate the system LaunchAgent background daemon (defaults to `Y`, pressing Enter deploys and starts service immediately).
+1. **[1/5] Automatic Gateway MAC Capture**: Detects and displays the physical router hardware fingerprint, with support for custom MAC overrides (cannot be empty, serving as the network exclusion baseline).
+2. **[2/5] Active SMB Mount Discovery**: Scans currently mounted SMB volumes in the kernel and presents an ANSI checkbox menu for multi-selection via Space and arrow keys; **supports pressing Enter directly to skip** (mounting zero volumes in this LAN, using it solely as an exclusion condition for remote access); for manual entry, local mount points auto-derive from share names and accept default on Enter (e.g., `/Volumes/<share>`).
+3. **[3/5] Tailscale Peer Discovery**: Queries `tailscale status --json` to list active nodes; gracefully skips if no active peers are found; upon device selection, supports auto-mapping from local shares, checkbox selection of active mounts, or entering a share folder name with auto-constructed URL and mount path.
+4. **[4/5] Configure Software Update Policy**: Select software update channel (`1. off` default, `2. notify`, `3. auto`), press Enter directly for default `off` with zero external requests.
+5. **[5/5] Save Configuration & One-Click Daemon Deployment**: Writes the structured `auto_mount.plist`, and prompts whether to immediately register and activate the system LaunchAgent background daemon (defaults to `Y`, pressing Enter deploys and starts service immediately).
 
 Terminal Checkbox Controls:
 - `↑` / `k`: Move cursor up
@@ -77,14 +79,16 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 The interactive management menu displays:
 
 ```text
-Auto Mount Tool - Daily Configuration Management (v2.0)
+Auto Mount Tool - Daily Configuration Management (v2.1.0)
 ======================================================
 
 Currently configured profiles:
   [1] home_lan (Home LAN Direct High-Speed) - 0 mount targets (Exclusion Gatekeeper, no local mounts)
-  [2] tailscale_remote (Tailscale Remote Peer) - 1 mount target
-      • /Volumes/personal_folder <- smb://dx4600.xxx.ts.net/personal_folder
+  [2] tailscale_remote (Tailscale Remote Peer (dx4600)) - 2 mount targets
+      • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
+      • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
+Software Version: v2.1.0 | Auto-Update Channel: off (Disabled, manual update)
 Background Daemon Status: Active & running (gui/501/com.user.auto-mount)
 
 Select an action:
@@ -93,6 +97,7 @@ Select an action:
   [3] Re-detect / update home gateway MAC
   [4] Re-detect / update remote Tailscale peer
   [5] Daemon management (deploy/reload, view details, uninstall)
+  [6] Auto-update channel & maintenance (set policy, check & upgrade)
   [0] Save configuration and exit
 ```
 
@@ -108,6 +113,9 @@ If you skipped daemon deployment during `--init` or prefer managing the service 
 
 # Check service status and active mount points
 ./auto_mount --status
+
+# Check and self-update to latest release (with local syntax check)
+./auto_mount --update
 
 # Uninstall service and clean deployment files
 ./auto_mount --uninstall
@@ -128,7 +136,9 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.0</string>
+    <string>2.1</string>
+    <key>update_channel</key>
+    <string>off</string>
     <key>profiles</key>
     <array>
         <!-- Policy 1: Home LAN Direct Connection (High Priority) -->
@@ -212,7 +222,9 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `version` | String | Configuration schema version (`2.0`). |
+| `version` | String | Configuration schema version (`2.1`). |
+| `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
+| `last_update_check_timestamp` | Real | Unix timestamp of the last update check, enforcing the 24-hour cooldown window. |
 | `profiles` | Array | Ordered policy list. Evaluated sequentially; the first matching profile executes and terminates subsequent evaluations. |
 | `id` | String | Unique profile identifier (e.g., `home_lan`, `tailscale_remote`). |
 | `description` | String | Human-readable profile description. |
@@ -240,6 +252,20 @@ The command reports:
 - Current physical interface and detected gateway MAC
 - Active LaunchAgent daemon state
 - Evaluated profile statuses and corresponding kernel mount points
+- Software version and configured auto-update channel
+
+## Software Updates & Self-Upgrade (`--update`)
+
+Check for updates and self-upgrade AutoMount anytime via:
+
+```bash
+./auto_mount --update
+```
+
+The self-update pipeline incorporates three safety guarantees:
+1. **Semantic Version Comparison**: Queries GitHub Releases metadata to compare the current build against remote releases, cleanly skipping updates if already on the latest build.
+2. **Local Syntax Check Circuit Breaker**: Downloaded source code is verified in an isolated temporary location via `/usr/bin/swiftc -parse`. If syntax validation fails, the upgrade halts immediately to protect the running environment.
+3. **Dual Runtime Sync & Hot Reload**: Upon validation, updates are committed to both the workspace script and the `~/Library/Application Support/AutoMount` runtime, followed by an atomic `launchctl bootout / bootstrap` reload for instant effect.
 
 ## Operation Logs
 
@@ -332,6 +358,18 @@ Select `[4] Update home gateway MAC`. The program detects the new hardware finge
 
 - **`--init` (Full Scratch Initialization)**: Intended for first-time setup or clean rebuilds. The wizard builds an entirely new configuration object from scratch and **never reads, merges, or preserves existing settings**. Pressing Enter directly to skip in the mount target selection step explicitly sets the target list to empty (`targets: []`), treating that network strictly as an "Exclusion Gatekeeper" (performing zero mounts locally while preventing fallback to remote tunnels), and **completely overwrites the existing `auto_mount.plist` configuration file** upon completion.
 - **`--config` (Incremental Daily Management)**: Intended for ongoing configuration maintenance. It loads existing configuration into memory, preserving all unedited settings, and allows adding new targets, removing specific targets, refreshing gateway MACs, or updating remote peers. Changes are safely saved back to disk and hot-synced to the LaunchAgent daemon. Always use `--config` for daily maintenance.
+
+### Q: How do I synchronize changes to the running LaunchAgent daemon after modifying local workspace code?
+
+When updating local repository code via Git or editing scripts in the workspace, you can apply updates to the active daemon via:
+1. Run `./auto_mount --install`: Re-deploys latest workspace scripts and configuration to `~/Library/Application Support/AutoMount` and restarts the service.
+2. Self-update: When using `--update` or running under `auto` update channel, the self-update engine automatically commits updates to both locations and issues a hot reload.
+
+### Q: Does software update generate unauthorized background network requests?
+
+AutoMount maintains strict data privacy and zero unexpected external traffic:
+- **Default policy is `off`**: By default, the program never reaches out to GitHub or external servers in the background. Update checks are strictly user-initiated via `./auto_mount --update`.
+- **Low-frequency design**: Even when `notify` or `auto` channel is explicitly enabled, checks are throttled by a 24-hour (86,400s) cooldown window, querying only lightweight release metadata after mount tasks complete.
 
 # License
 

@@ -297,7 +297,7 @@ AutoMount CLI merges the classic UNIX orthogonal philosophy with modern interact
 
 * **Underlying Orthogonal Commands**: `--install`, `--uninstall`, and `--status` serve as dedicated, non-interactive subcommands designed for automated provisioning, scripts, and CI/CD operations.
 * **Aggregated Configuration Center**: `--config` functions as an all-in-one control center displaying the live LaunchAgent status (`gui/<uid>`) while incorporating service deployment, reload, status checks, and uninstallation into a unified menu.
-* **Streamlined Initial Setup**: `--init` pairs profile generation with LaunchAgent daemon deployment into a 4-step workflow, eliminating friction between configuration creation and system daemon activation.
+* **Streamlined Initial Setup**: `--init` pairs hardware detection, target selection, remote fallback, update channel policy, and LaunchAgent daemon deployment into a 5-step seamless workflow.
 * **Defensive Parameter Validation**: Enforces strict CLI argument validation; unrecognized options are immediately rejected with standard usage instructions, preventing unintended execution of unmount or mount sequences.
 
 ## Zero-Dependency Native Localization (i18n)
@@ -305,3 +305,48 @@ AutoMount CLI merges the classic UNIX orthogonal philosophy with modern interact
 * **System Language Adaptation**: Inspects `Locale.preferredLanguages` dynamically, defaulting seamlessly to English on non-Chinese systems.
 * **Environment Variable Override**: Supports `AUTO_MOUNT_LANG=zh|en` for explicit language specification and testing.
 * **Lightweight Embedded Translation Engine**: Dispatches localized strings directly within the standalone Swift file without external `.strings` bundles, preserving portability and zero external dependencies.
+
+# Self-Update & Hot-Reload Engine Architecture
+
+To allow seamless upgrades for both the background daemon and local developer workspaces without risking daemon crashes from network errors or invalid code, AutoMount implements a dual-channel safe self-update lifecycle model:
+
+```mermaid
+flowchart TD
+    Trigger["Trigger Self-Update\n(Manual --update or Daemon Low-Frequency Check)"] --> CheckChannel{"Check Update Channel\n(update_channel)"}
+    CheckChannel -- "off (default)" --> SkipUpdate["Zero network requests, exit immediately"]
+    CheckChannel -- "notify / auto / Manual Invocation" --> CooldownCheck{"24-Hour Cooldown Check\n(current_time - last_timestamp >= 86400s)?"}
+    
+    CooldownCheck -- "Under Cooldown & Not Manual" --> SkipUpdate
+    CooldownCheck -- "Cooldown Passed or Manual" --> FetchRelease["GET api.github.com/repos/.../releases/latest\n(Strict 5.0s Timeout)"]
+    
+    FetchRelease --> ParseSemVer{"Remote Version > Local Version (SemVer)?"}
+    ParseSemVer -- "No / No Release" --> SkipUpdate
+    ParseSemVer -- "Yes" --> ChannelBranch{"Channel Type"}
+    
+    ChannelBranch -- "notify" --> SendBanner["Invoke osascript for macOS Notification\n(Prompt user to run --update)"]
+    SendBanner --> UpdateTimestamp["Record timestamp & exit cleanly"]
+    
+    ChannelBranch -- "auto or Confirmed Manual" --> DownloadSource["Fetch Source to /tmp/automount_check_*.swift"]
+    DownloadSource --> SyntaxGate{"Core Safety Gate: Local Swift Syntax Pre-Check\n/usr/bin/swiftc -parse <temp_file>"}
+    
+    SyntaxGate -- "Validation Failed (exit != 0)" --> AbortRollback["Abort update & log error\n(Send warning notification if manual/notify)"]
+    SyntaxGate -- "Validation Passed (exit == 0)" --> AtomicDeploy["Atomic Overwrite Deployment Targets:\n1. ~/Library/Application Support/AutoMount/auto_mount.swift\n2. Workspace auto_mount.swift (if present)"]
+    
+    AtomicDeploy --> ServiceReload["System Daemon Hot Reload:\nlaunchctl bootout + bootstrap"]
+    ServiceReload --> Complete["Log audit event & dispatch ready notification"]
+```
+
+## 1. 24-Hour Cooldown Window & Debouncing
+
+* **Low-Frequency Principle**: Even when configured with `notify` or `auto`, the background daemon checks `last_update_check_timestamp` whenever awakened by network events. If less than 86,400 seconds (24 hours) have elapsed, the update logic short-circuits in nanoseconds, preventing rapid network transitions (such as toggling Wi-Fi or switching interfaces) from flooding GitHub APIs or triggering rate limits.
+* **Mounting Task Priority**: Background update checks always execute after volume mount actions finish, ensuring network storage operations maintain sub-second priority without being impeded by external HTTP latency.
+
+## 2. Local `swiftc -parse` Syntax Pre-Check Circuit Breaker
+
+* **Single-File Crash Hazard**: In standalone single-file architectures, corrupt downloads caused by proxy injection or incomplete network transfers can result in continuous launchd crash loops.
+* **Compiler AST Safety Gate**: AutoMount writes downloaded source to a temporary file and executes `/usr/bin/swiftc -parse <tempFile>` to run compiler-level abstract syntax tree analysis. The update proceeds only when the process exits with status code 0; any syntax anomaly immediately triggers the circuit breaker, preserving system stability.
+
+## 3. Dual-Environment Synchronization & Hot Reload
+
+* **Workspace & Runtime Parity**: `performSelfUpdate` checks whether both the developer workspace script and the `~/Library/Application Support/AutoMount` runtime exist. When both are present, updates are committed atomically to both locations, eliminating discrepancies between active daemons and version-controlled repositories.
+* **Zero-Reboot Hot Reload**: Following file deployment, the engine executes `launchctl bootout` and `launchctl bootstrap` on `com.user.auto-mount`. The updated code becomes immediately active for future network events without requiring system reboots or user session restarts.

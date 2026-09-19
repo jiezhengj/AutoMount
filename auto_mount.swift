@@ -97,7 +97,10 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
     }
 }
 
-// MARK: - 2.0 数据结构定义
+// MARK: - 版本与数据结构定义
+
+let autoMountVersion = "2.1.0"
+let githubRepo = "jiezhengj/AutoMount"
 
 struct MatchRule: Codable {
     var type: String             // "gateway_mac" 或 "probe_host"
@@ -143,7 +146,16 @@ struct NetworkProfile: Codable {
 
 struct AutoMountConfig: Codable {
     var version: String
+    var updateChannel: String?                 // "off" (默认), "notify", "auto"
+    var lastUpdateCheckTimestamp: Double?     // 24小时冷却时间戳
     var profiles: [NetworkProfile]
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case updateChannel = "update_channel"
+        case lastUpdateCheckTimestamp = "last_update_check_timestamp"
+        case profiles
+    }
 }
 
 // 加载 2.0 配置
@@ -809,10 +821,10 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
 
 func runInitWizard() {
     print(tr("""
-    Auto Mount Tool - 初始化配置向导 (v2.0)
+    Auto Mount Tool - 初始化配置向导 (v\(autoMountVersion))
     ======================================
     """, """
-    Auto Mount Tool - Setup Wizard (v2.0)
+    Auto Mount Tool - Setup Wizard (v\(autoMountVersion))
     ====================================
     """))
 
@@ -822,7 +834,7 @@ func runInitWizard() {
     }
 
     // 1. 物理网关 MAC 探测
-    print(tr("[1/4] 局域网物理网关指纹检测", "[1/4] LAN Gateway Hardware Fingerprint Detection"))
+    print(tr("[1/5] 局域网物理网关指纹检测", "[1/5] LAN Gateway Hardware Fingerprint Detection"))
     var homeMAC = ""
     if let detectedMAC = getCurrentNetworkFingerprint() {
         print(tr("  ✓ 自动探测到物理网关 MAC: \(detectedMAC)", "  ✓ Detected physical gateway MAC: \(detectedMAC)"))
@@ -847,7 +859,7 @@ func runInitWizard() {
     }
 
     // 2. 挂载目标选择 (自动嗅探 + 复选框多选)
-    print(tr("\n[2/4] 选择家庭局域网挂载目标", "\n[2/4] Select Home LAN Mount Targets"))
+    print(tr("\n[2/5] 选择家庭局域网挂载目标", "\n[2/5] Select Home LAN Mount Targets"))
     var homeTargets: [MountTarget] = []
     let activeMounts = discoverActiveSMBMounts()
 
@@ -907,7 +919,7 @@ func runInitWizard() {
     )
 
     // 3. Tailscale 远程降级策略配置
-    print(tr("\n[3/4] 配置 Tailscale 远程互联降级策略", "\n[3/4] Configure Tailscale Remote Fallback Profile"))
+    print(tr("\n[3/5] 配置 Tailscale 远程互联降级策略", "\n[3/5] Configure Tailscale Remote Fallback Profile"))
     var profiles: [NetworkProfile] = [homeProfile]
     let discoveredPeers = discoverTailscalePeers()
 
@@ -1066,14 +1078,40 @@ func runInitWizard() {
         }
     }
 
+    // 4. 软件更新策略配置
+    print(tr("\n[4/5] 软件更新策略配置", "\n[4/5] Configure Software Update Policy"))
+    print(tr("""
+      请选择软件自动更新检查策略：
+        [1] off    - 关闭自动检查 (默认，零网络请求，可纯手动运行 './auto_mount --update')
+        [2] notify - 发现新版本时发送系统通知，由您手动执行更新
+        [3] auto   - 发现新版本时自动静默预检并平滑无缝热升级
+    """, """
+      Select software update policy:
+        [1] off    - Disable auto-checks (Default, zero network requests, manual update via './auto_mount --update')
+        [2] notify - Send system notification on new version, update manually
+        [3] auto   - Automatically download, pre-check, and upgrade in background
+    """))
+    print(tr("  请选择更新策略 [1-3] (直接按回车选择默认 1): ",
+             "  Select update policy [1-3] (Press Enter for default 1): "), terminator: "")
+    let updateChoiceInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    var selectedChannel = "off"
+    if updateChoiceInput == "2" {
+        selectedChannel = "notify"
+    } else if updateChoiceInput == "3" {
+        selectedChannel = "auto"
+    } else {
+        selectedChannel = "off"
+    }
+    print(tr("  ✓ 软件更新策略已设置为: \(selectedChannel)", "  ✓ Software update policy set to: \(selectedChannel)"))
+
     // 保存配置
-    let config = AutoMountConfig(version: "2.0", profiles: profiles)
+    let config = AutoMountConfig(version: "2.1", updateChannel: selectedChannel, lastUpdateCheckTimestamp: nil, profiles: profiles)
     saveConfig(config)
     print(tr("\n[DONE] 初始化完成！配置已写入 \(getConfigURL().path)",
              "\n[DONE] Setup complete! Configuration written to \(getConfigURL().path)"))
 
-    // 4. 部署后台自启动守护服务
-    print(tr("\n[4/4] 部署自启动后台守护服务", "\n[4/4] Deploy Background Auto-Mount Daemon"))
+    // 5. 部署后台自启动守护服务
+    print(tr("\n[5/5] 部署自启动后台守护服务", "\n[5/5] Deploy Background Auto-Mount Daemon"))
     print(tr("  是否立即将 AutoMount 注册为系统的后台自动挂载守护服务？(Y/n) [默认 Y]: ",
              "  Register AutoMount as system LaunchAgent daemon for auto-mounting on login & network change? (Y/n) [Default Y]: "), terminator: "")
     let installChoice = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y")
@@ -1103,12 +1141,23 @@ func getLaunchAgentStatusSummary() -> String {
     }
 }
 
+func getUpdateChannelDisplay(_ channel: String) -> String {
+    switch channel {
+    case "notify":
+        return tr("notify (新版本通知提醒)", "notify (Notification only)")
+    case "auto":
+        return tr("auto (后台静默自动升级)", "auto (Silent background auto-update)")
+    default:
+        return tr("off (关闭自动检查，纯手动)", "off (Disabled, manual update)")
+    }
+}
+
 func manageConfiguration() {
     print(tr("""
-    Auto Mount Tool - 日常配置管理 (v2.0)
+    Auto Mount Tool - 日常配置管理 (v\(autoMountVersion))
     ====================================
     """, """
-    Auto Mount Tool - Daily Configuration Management (v2.0)
+    Auto Mount Tool - Daily Configuration Management (v\(autoMountVersion))
     ======================================================
     """))
 
@@ -1134,6 +1183,8 @@ func manageConfiguration() {
         }
 
         let daemonSummary = getLaunchAgentStatusSummary()
+        let curChannel = config.updateChannel ?? "off"
+        let channelDisplay = getUpdateChannelDisplay(curChannel)
         let hasTailscale = config.profiles.contains(where: { $0.id == "tailscale_remote" })
         let tailscaleActionTitle = hasTailscale ?
             tr("重新检测/更新远程 Tailscale 目标", "Re-detect / update remote Tailscale peer") :
@@ -1141,6 +1192,7 @@ func manageConfiguration() {
 
         print(tr("""
 
+        软件版本: v\(autoMountVersion) | 自动更新信道: \(channelDisplay)
         后台守护服务状态: \(daemonSummary)
 
         请选择操作：
@@ -1149,9 +1201,11 @@ func manageConfiguration() {
           [3] 重新检测/更新家庭网关 MAC
           [4] \(tailscaleActionTitle)
           [5] 守护服务管理 (部署/重载、查看详情、卸载服务)
+          [6] 自动更新信道与版本维护 (设置更新策略、立即检查并升级)
           [0] 保存配置并退出
         """, """
 
+        Software Version: v\(autoMountVersion) | Auto-Update Channel: \(channelDisplay)
         Background Daemon Status: \(daemonSummary)
 
         Select an action:
@@ -1160,9 +1214,10 @@ func manageConfiguration() {
           [3] Re-detect / update home gateway MAC
           [4] \(tailscaleActionTitle)
           [5] Daemon management (deploy/reload, view details, uninstall)
+          [6] Auto-update channel & maintenance (set policy, check & upgrade)
           [0] Save configuration and exit
         """))
-        print(tr("请输入选项 [0-5]: ", "Enter choice [0-5]: "), terminator: "")
+        print(tr("请输入选项 [0-6]: ", "Enter choice [0-6]: "), terminator: "")
         let choice = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
 
         switch choice {
@@ -1388,6 +1443,48 @@ func manageConfiguration() {
                 break
             }
 
+        case "6":
+            // 自动更新信道与版本管理
+            let curChan = config.updateChannel ?? "off"
+            print(tr("""
+
+            自动更新信道与版本维护：
+              当前策略: \(getUpdateChannelDisplay(curChan))
+
+              [1] 设置为 off (关闭自动更新检查，纯手动更新)
+              [2] 设置为 notify (发现新版本时发送系统通知)
+              [3] 设置为 auto (发现新版本时自动静默升级)
+              [4] 立即检查远端最新版本并升级 (执行 --update)
+              [0] 返回上级菜单
+            """, """
+
+            Auto-Update Channel & Maintenance:
+              Current Policy: \(getUpdateChannelDisplay(curChan))
+
+              [1] Set to 'off' (disable auto checks, manual update only)
+              [2] Set to 'notify' (notify via system notification on new version)
+              [3] Set to 'auto' (automatically download and upgrade in background)
+              [4] Check for updates and upgrade now (execute --update)
+              [0] Back to main menu
+            """))
+            print(tr("请输入选项 [0-4]: ", "Enter choice [0-4]: "), terminator: "")
+            let uChoice = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+            switch uChoice {
+            case "1":
+                config.updateChannel = "off"
+                print(tr("✓ 自动更新策略已设置为: off", "✓ Auto-update policy set to: off"))
+            case "2":
+                config.updateChannel = "notify"
+                print(tr("✓ 自动更新策略已设置为: notify", "✓ Auto-update policy set to: notify"))
+            case "3":
+                config.updateChannel = "auto"
+                print(tr("✓ 自动更新策略已设置为: auto", "✓ Auto-update policy set to: auto"))
+            case "4":
+                handleManualUpdateCommand()
+            default:
+                break
+            }
+
         case "0":
             saveConfig(config)
             print(tr("✓ 配置管理已完成，修改已保存并生效。", "✓ Configuration management complete. Changes saved and applied."))
@@ -1587,10 +1684,10 @@ func uninstallLaunchAgent() {
 
 func checkServiceStatus() {
     print(tr("""
-    Auto Mount Tool - 运行状态总览 (v2.0)
+    Auto Mount Tool - 运行状态总览 (v\(autoMountVersion))
     ====================================
     """, """
-    Auto Mount Tool - Service Status Overview (v2.0)
+    Auto Mount Tool - Service Status Overview (v\(autoMountVersion))
     ================================================
     """))
 
@@ -1665,13 +1762,327 @@ func checkServiceStatus() {
         print(tr("    未找到配置文件 (可运行: ./auto_mount --init 初始化)",
                  "    Configuration file not found (Run: ./auto_mount --init to initialize)"))
     }
+
+    if let config = loadConfig() {
+        let channel = config.updateChannel ?? "off"
+        print(tr("\n  • 软件版本: v\(autoMountVersion) (自动更新信道: \(channel))",
+                 "\n  • Software Version: v\(autoMountVersion) (Update Channel: \(channel))"))
+    } else {
+        print(tr("\n  • 软件版本: v\(autoMountVersion)", "\n  • Software Version: v\(autoMountVersion)"))
+    }
+}
+
+// MARK: - 软件生命周期与自升级系统 (Self-Update & Release Probing)
+
+func quoteAppleScript(_ str: String) -> String {
+    let escaped = str.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    return "\"\(escaped)\""
+}
+
+func showMacOSNotification(title: String, subtitle: String, message: String) {
+    let script = "display notification \(quoteAppleScript(message)) with title \(quoteAppleScript(title)) subtitle \(quoteAppleScript(subtitle))"
+    _ = runCommand(executable: "/usr/bin/osascript", arguments: ["-e", script])
+}
+
+func parseSemanticVersion(_ versionStr: String) -> [Int] {
+    var clean = versionStr.trimmingCharacters(in: .whitespacesAndNewlines)
+    if clean.hasPrefix("v") || clean.hasPrefix("V") {
+        clean.removeFirst()
+    }
+    return clean.split(separator: ".").compactMap { Int($0) }
+}
+
+func isNewerVersion(_ remote: String, than current: String) -> Bool {
+    let rParts = parseSemanticVersion(remote)
+    let cParts = parseSemanticVersion(current)
+    let maxLen = max(rParts.count, cParts.count)
+    for i in 0..<maxLen {
+        let r = i < rParts.count ? rParts[i] : 0
+        let c = i < cParts.count ? cParts[i] : 0
+        if r > c { return true }
+        if r < c { return false }
+    }
+    return false
+}
+
+struct GitHubReleaseInfo {
+    let tagName: String
+    let name: String
+    let body: String
+    let publishedAt: String?
+}
+
+enum ReleaseFetchResult {
+    case success(GitHubReleaseInfo)
+    case noReleasesFound
+    case networkError
+}
+
+func fetchLatestReleaseInfo() -> ReleaseFetchResult {
+    let apiURLString = "https://api.github.com/repos/\(githubRepo)/releases/latest"
+    guard let url = URL(string: apiURLString) else { return .networkError }
+
+    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5.0)
+    request.setValue("AutoMount/\(autoMountVersion)", forHTTPHeaderField: "User-Agent")
+    request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var result: ReleaseFetchResult = .networkError
+
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        defer { semaphore.signal() }
+        if error != nil {
+            result = .networkError
+            return
+        }
+        guard let httpRes = response as? HTTPURLResponse else {
+            result = .networkError
+            return
+        }
+        if httpRes.statusCode == 404 {
+            result = .noReleasesFound
+            return
+        }
+        guard httpRes.statusCode == 200, let data = data else {
+            result = .networkError
+            return
+        }
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let tagName = json["tag_name"] as? String else {
+            result = .networkError
+            return
+        }
+        let name = (json["name"] as? String) ?? tagName
+        let body = (json["body"] as? String) ?? ""
+        let publishedAt = json["published_at"] as? String
+        result = .success(GitHubReleaseInfo(tagName: tagName, name: name, body: body, publishedAt: publishedAt))
+    }
+    task.resume()
+    _ = semaphore.wait(timeout: .now() + 6.0)
+    return result
+}
+
+func downloadLatestSource(tag: String) -> String? {
+    let rawURLString = "https://raw.githubusercontent.com/\(githubRepo)/\(tag)/auto_mount.swift"
+    guard let url = URL(string: rawURLString) else { return nil }
+
+    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10.0)
+    request.setValue("AutoMount/\(autoMountVersion)", forHTTPHeaderField: "User-Agent")
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var downloadedContent: String?
+
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        defer { semaphore.signal() }
+        guard error == nil, let data = data,
+              let httpRes = response as? HTTPURLResponse, httpRes.statusCode == 200,
+              let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+            return
+        }
+        downloadedContent = text
+    }
+    task.resume()
+    _ = semaphore.wait(timeout: .now() + 11.0)
+    return downloadedContent
+}
+
+func verifySwiftSyntax(sourceCode: String) -> Bool {
+    let tempDir = FileManager.default.temporaryDirectory
+    let tempFile = tempDir.appendingPathComponent("automount_check_\(UUID().uuidString).swift")
+    do {
+        try sourceCode.write(to: tempFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tempFile) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        process.arguments = ["-parse", tempFile.path]
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        process.standardOutput = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
+func performSelfUpdate(newVersion: String, newContent: String, isSilent: Bool) -> Bool {
+    // 1. 本地语法分析预检
+    if !verifySwiftSyntax(sourceCode: newContent) {
+        let err = tr("✗ 新版本代码本地 Swift 语法预检失败，已自动终止更新，保护当前运行环境安全。",
+                     "✗ Swift syntax check failed for the new version. Aborted update to protect daemon.")
+        fputs("\(err)\n", stderr)
+        writeLog("Self-update aborted: syntax check failed for version \(newVersion)")
+        if !isSilent {
+            showMacOSNotification(
+                title: tr("AutoMount 升级未完成", "AutoMount Update Incomplete"),
+                subtitle: tr("语法校验未通过", "Syntax Validation Failed"),
+                message: tr("下载的代码预检未通过，当前运行未受影响。", "Downloaded code failed syntax check. Current runtime unchanged.")
+            )
+        }
+        return false
+    }
+
+    let installDir = getInstalledDir()
+    let currentAppDir = getAppDir()
+    var updatedPaths: [String] = []
+
+    // 2. 更新运行目录 ~/Library/Application Support/AutoMount/auto_mount.swift
+    let targetInstalledSwift = installDir.appendingPathComponent("auto_mount.swift")
+    if FileManager.default.fileExists(atPath: installDir.path) {
+        do {
+            try newContent.write(to: targetInstalledSwift, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: targetInstalledSwift.path)
+            updatedPaths.append(targetInstalledSwift.path)
+        } catch {
+            fputs("✗ \(error.localizedDescription)\n", stderr)
+        }
+    }
+
+    // 3. 若当前处于工程工作区且存在 auto_mount.swift，一并同步工作区
+    let localSwift = currentAppDir.appendingPathComponent("auto_mount.swift")
+    if FileManager.default.fileExists(atPath: localSwift.path) && localSwift.path != targetInstalledSwift.path {
+        do {
+            try newContent.write(to: localSwift, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localSwift.path)
+            updatedPaths.append(localSwift.path)
+        } catch {
+            // 忽略非工作区权限写入限制
+        }
+    }
+
+    // 4. 重载 LaunchAgent 守护服务
+    let uid = getuid()
+    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
+    let plistURL = getLaunchAgentPlistURL()
+    if FileManager.default.fileExists(atPath: plistURL.path) {
+        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
+        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootstrap", "gui/\(uid)", plistURL.path])
+    }
+
+    writeLog("Self-update succeeded to \(newVersion). Updated files: \(updatedPaths.joined(separator: ", "))")
+
+    if isSilent {
+        showMacOSNotification(
+            title: tr("AutoMount 自动升级成功", "AutoMount Updated Successfully"),
+            subtitle: tr("已自动平滑热升级至 \(newVersion)", "Updated seamlessly to \(newVersion)"),
+            message: tr("网络挂载与守护服务已恢复最新就绪状态。", "Mount engine and daemon are updated and running.")
+        )
+    } else {
+        print(tr("✓ 软件已成功升级至 \(newVersion)！", "✓ Successfully updated to \(newVersion)!"))
+        if !updatedPaths.isEmpty {
+            print(tr("  已同步更新组件:\n    \(updatedPaths.joined(separator: "\n    "))",
+                     "  Synchronized components:\n    \(updatedPaths.joined(separator: "\n    "))"))
+        }
+        print(tr("✓ 后台守护服务已自动完成热重载并就绪。", "✓ Background daemon reloaded and active."))
+    }
+    return true
+}
+
+func triggerBackgroundUpdateCheckIfNeeded(config: inout AutoMountConfig) {
+    let channel = config.updateChannel ?? "off"
+    guard channel == "notify" || channel == "auto" else { return }
+
+    let now = Date().timeIntervalSince1970
+    let cooldown: Double = 86400 // 24 小时冷却窗口
+
+    if let last = config.lastUpdateCheckTimestamp, (now - last) < cooldown {
+        return // 冷却中，跳过
+    }
+
+    // 记录本次检查时间并写回
+    config.lastUpdateCheckTimestamp = now
+    saveConfig(config)
+
+    writeLog("Starting background update check (channel: \(channel))...")
+    guard case .success(let release) = fetchLatestReleaseInfo() else { return }
+    let remoteVersion = release.tagName
+    guard isNewerVersion(remoteVersion, than: autoMountVersion) else { return }
+
+    writeLog("New version discovered: \(remoteVersion) (current: \(autoMountVersion)), channel: \(channel)")
+
+    if channel == "notify" {
+        showMacOSNotification(
+            title: tr("AutoMount 新版本提醒", "AutoMount Update Available"),
+            subtitle: tr("发现新版本 \(remoteVersion) (当前: v\(autoMountVersion))",
+                         "New version \(remoteVersion) available (Current: v\(autoMountVersion))"),
+            message: tr("可运行 './auto_mount --update' 完成升级。",
+                         "Run './auto_mount --update' to upgrade.")
+        )
+    } else if channel == "auto" {
+        if let sourceCode = downloadLatestSource(tag: remoteVersion) {
+            _ = performSelfUpdate(newVersion: remoteVersion, newContent: sourceCode, isSilent: true)
+        }
+    }
+}
+
+func handleManualUpdateCommand() {
+    print(tr("""
+    Auto Mount Tool - 软件版本检测与自升级
+    ======================================
+    """, """
+    Auto Mount Tool - Software Update
+    =================================
+    """))
+
+    print(tr("当前本地版本: v\(autoMountVersion)", "Current local version: v\(autoMountVersion)"))
+    print(tr("正在检索 GitHub 官方最新发布版本 (https://github.com/\(githubRepo))...",
+             "Checking latest release from GitHub (https://github.com/\(githubRepo))..."))
+
+    let fetchResult = fetchLatestReleaseInfo()
+    let release: GitHubReleaseInfo
+    switch fetchResult {
+    case .success(let info):
+        release = info
+    case .noReleasesFound:
+        print(tr("✓ 官方仓库目前尚未发布正式 Release 版本，本地 (v\(autoMountVersion)) 为最新状态。",
+                 "✓ No official release published yet on remote. Current local (v\(autoMountVersion)) is up to date."))
+        return
+    case .networkError:
+        print(tr("✗ 无法连接到 GitHub 检查更新，请检查网络连接或稍后重试。",
+                 "✗ Failed to check for updates. Please check network connection."))
+        return
+    }
+
+    let remoteVersion = release.tagName
+    print(tr("远端最新版本: \(remoteVersion)", "Latest remote release: \(remoteVersion)"))
+
+    if !isNewerVersion(remoteVersion, than: autoMountVersion) {
+        print(tr("✓ 当前已经是最新版本 (v\(autoMountVersion))，无需升级。",
+                 "✓ You are running the latest version (v\(autoMountVersion))."))
+        return
+    }
+
+    print(tr("\n💡 发现新版本: \(remoteVersion)！", "\n💡 New version available: \(remoteVersion)!"))
+    let releaseBody = release.body.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !releaseBody.isEmpty {
+        print(tr("\n更新说明：\n\(releaseBody)\n", "\nRelease Notes:\n\(releaseBody)\n"))
+    }
+
+    print(tr("是否立即下载并升级至 \(remoteVersion)？(Y/n) [默认 Y]: ",
+             "Do you want to download and upgrade to \(remoteVersion) now? (Y/n) [Default Y]: "), terminator: "")
+    let confirm = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y")
+    if confirm != "y" && confirm != "yes" {
+        print(tr("已取消升级。", "Update cancelled."))
+        return
+    }
+
+    print(tr("\n正在下载最新源码...", "\nDownloading latest source code..."))
+    guard let source = downloadLatestSource(tag: remoteVersion) else {
+        print(tr("✗ 下载最新代码失败，请稍后重试。", "✗ Failed to download latest source code."))
+        return
+    }
+
+    print(tr("正在进行本地 Swift 语法预检...", "Performing local Swift syntax validation..."))
+    _ = performSelfUpdate(newVersion: remoteVersion, newContent: source, isSilent: false)
 }
 
 func printUsage() {
     let configPath = getConfigURL().path
     print(tr("""
-    Auto Mount Tool (v2.0)
-    ======================
+    Auto Mount Tool (v\(autoMountVersion))
+    ========================
 
     使用方法:
       ./auto_mount                正常执行 (评估网络策略并挂载匹配目标)
@@ -1680,6 +2091,7 @@ func printUsage() {
       ./auto_mount --install      配置并启用自启动后台守护服务 (LaunchAgent)
       ./auto_mount --uninstall    移除自启动配置与部署文件
       ./auto_mount --status       查看服务运行状态与挂载详情
+      ./auto_mount --update       检查并升级软件至最新版本 (支持本地语法校验)
       ./auto_mount --help         显示帮助说明
 
     环境变量:
@@ -1687,8 +2099,8 @@ func printUsage() {
 
     配置文件: \(configPath)
     """, """
-    Auto Mount Tool (v2.0)
-    ======================
+    Auto Mount Tool (v\(autoMountVersion))
+    ========================
 
     Usage:
       ./auto_mount                Run normal evaluation and mount targets
@@ -1697,6 +2109,7 @@ func printUsage() {
       ./auto_mount --install      Deploy and enable background LaunchAgent daemon
       ./auto_mount --uninstall    Remove LaunchAgent daemon and deployed files
       ./auto_mount --status       Show service status and active mount details
+      ./auto_mount --update       Check and self-update to latest release
       ./auto_mount --help         Show this help message
 
     Environment Variables:
@@ -1729,6 +2142,9 @@ func main() {
         case "--status":
             checkServiceStatus()
             exit(0)
+        case "--update":
+            handleManualUpdateCommand()
+            exit(0)
         case "--help", "-h":
             printUsage()
             exit(0)
@@ -1740,14 +2156,14 @@ func main() {
     }
 
     print(tr("""
-    Auto Mount Tool (v2.0)
+    Auto Mount Tool (v\(autoMountVersion))
     ======================
     """, """
-    Auto Mount Tool (v2.0)
+    Auto Mount Tool (v\(autoMountVersion))
     ======================
     """))
 
-    guard let config = loadConfig(), !config.profiles.isEmpty else {
+    guard var config = loadConfig(), !config.profiles.isEmpty else {
         fputs(tr("✗ 未找到有效配置，请先运行 './auto_mount --init' 初始化。\n",
                  "✗ Configuration not found or empty. Please run './auto_mount --init' first.\n"), stderr)
         writeLog("Config not found or empty, exiting")
@@ -1826,6 +2242,7 @@ func main() {
         print(tr("\n[DONE] 当前网络状态未匹配到任何策略。正常退出。",
                  "\n[DONE] No matching profile for current network state. Exiting cleanly."))
         writeLog("No matching profile for current network, exiting")
+        triggerBackgroundUpdateCheckIfNeeded(config: &config)
         exit(0)
     }
 
@@ -1860,6 +2277,7 @@ func main() {
     print(tr("\n[DONE] 策略 '\(profile.id)' 下已成功挂载 \(mountedCount)/\(profile.targets.count) 个卷宗。",
              "\n[DONE] \(mountedCount)/\(profile.targets.count) volumes mounted under '\(profile.id)'."))
     writeLog("Finished execution of '\(profile.id)': \(mountedCount)/\(profile.targets.count) mounted.")
+    triggerBackgroundUpdateCheckIfNeeded(config: &config)
 }
 
 main()

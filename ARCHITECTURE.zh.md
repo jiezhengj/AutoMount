@@ -297,7 +297,7 @@ AutoMount CLI 在架构设计上融合了经典 UNIX 正交哲学与现代交互
 
 * **底层正交可脚本化**：`--install`、`--uninstall`、`--status` 作为独立顶级子命令存在，具备确定性与免交互特性，便于自动化运维脚本与 CI/CD 流程调用。
 * **高层聚合控制中心**：`--config` 作为一站式交互控制面板，直接展示后台守护进程的运行时状态（`gui/<uid>`），并将服务安装、重载、查看与卸载作为子菜单纳入统一管理，降低日常维护认知成本。
-* **首次配置闭环**：`--init` 将生成配置文件与注册 LaunchAgent 守护服务合为四步一体的完整闭环，消除“配置已完成但后台未部署”的体验断层。
+* **首次配置闭环**：`--init` 将硬件探测、挂载目标、远程策略、更新策略与服务注册合为五步一体的完整闭环，消除“配置已完成但后台未部署”的体验断层。
 * **防御性参数拦截**：采用严格的命令行参数解析，任何未知参数均立即终止并打印标准使用规范，杜绝参数拼写错误导致误触发网络挂载与解挂操作。
 
 ## 零依赖原生国际化 (i18n) 架构
@@ -305,3 +305,48 @@ AutoMount CLI 在架构设计上融合了经典 UNIX 正交哲学与现代交互
 * **系统语言自适应**：优先检测 macOS 系统的 `Locale.preferredLanguages`，在非中文系统下默认自适应为英文界面。
 * **环境变量控制**：支持通过 `AUTO_MOUNT_LANG=zh|en` 环境变量对运行期界面语言进行显式覆写与测试。
 * **轻量双语分发引擎**：在纯 Swift 单文件内通过内置映射函数分发，不引入外部 `.strings` 依赖，保证跨机器运行的自包含性与便携性。
+
+# 自动更新与热重载架构 (Self-Update & Hot-Reload Engine)
+
+为了让后台静默运行的守护进程与用户工作区能够平滑无感知升级，同时彻底杜绝网络波动或代码损坏导致系统级守护服务崩溃，AutoMount 设计了双通道安全自升级生命周期模型：
+
+```mermaid
+flowchart TD
+    Trigger["触发自更新事件\n(手动 --update 或 守护低频检查)"] --> CheckChannel{"检查更新信道配置\n(update_channel)"}
+    CheckChannel -- "off (默认)" --> SkipUpdate["零网络请求，直接终止"]
+    CheckChannel -- "notify / auto / 手动触发" --> CooldownCheck{"24小时冷却窗口校验\n(当前时间 - last_timestamp >= 86400s)?"}
+    
+    CooldownCheck -- "未冷却且非手动" --> SkipUpdate
+    CooldownCheck -- "已冷却或手动触发" --> FetchRelease["GET api.github.com/repos/.../releases/latest\n(带 5.0s 严格超时)"]
+    
+    FetchRelease --> ParseSemVer{"远端版本 > 本地版本 (SemVer)?"}
+    ParseSemVer -- "否/无 Release" --> SkipUpdate
+    ParseSemVer -- "是" --> ChannelBranch{"当前信道类型"}
+    
+    ChannelBranch -- "notify" --> SendBanner["调用 osascript 发送 macOS 系统通知\n(提示用户手动运行 --update)"]
+    SendBanner --> UpdateTimestamp["写回冷却时间戳，安全退出"]
+    
+    ChannelBranch -- "auto 或 手动确认" --> DownloadSource["拉取最新源码至 /tmp/automount_check_*.swift"]
+    DownloadSource --> SyntaxGate{"核心安全门: 本地 Swift 语法预检\n/usr/bin/swiftc -parse <temp_file>"}
+    
+    SyntaxGate -- "校验失败 (exit != 0)" --> AbortRollback["阻断升级并记录错误日志\n(若手动/notify 则发送预检失败警告)"]
+    SyntaxGate -- "校验通过 (exit == 0)" --> AtomicDeploy["原子覆写部署目标:\n1. ~/Library/Application Support/AutoMount/auto_mount.swift\n2. 工作区 auto_mount.swift (若存在)"]
+    
+    AtomicDeploy --> ServiceReload["系统守护热重载:\nlaunchctl bootout + bootstrap"]
+    ServiceReload --> Complete["记录成功审计日志并分发就绪通知"]
+```
+
+## 1. 24 小时冷却时间窗口与防抖机制
+
+* **低频轻量原则**：即便配置了 `notify` 或 `auto` 策略，守护进程每次因网络切换被唤醒时，首先比对 `last_update_check_timestamp`。若距离上次检查不足 86,400 秒（24 小时），更新逻辑在纳秒级直接短路返回，杜绝高频切网（如频繁插拔网线或 Wi-Fi 信号跳动）对 GitHub API 造成滥用或触发速率限制（Rate Limit）。
+* **任务优先级让渡**：后台更新检查始终放置于网络挂载执行完成后触发，确保核心的网络存储挂载任务以毫秒级最高优先级执行，不因远端 HTTP 请求延迟干扰挂载体验。
+
+## 2. 本地 `swiftc -parse` 语法预检断路器
+
+* **单文件自升级的崩溃风险**：对于无外部依赖的单文件脚本，若从远端下载的代码遭遇网络截断、代理劫持注入或语法破坏，直接覆盖运行文件将导致后续 `launchd` 唤醒时进程崩溃死锁。
+* **编译期抽象语法树安全门**：AutoMount 在落地新文件前，必须将下载的源码写入临时文件，并调用系统内置的 `/usr/bin/swiftc -parse <tempFile>` 驱动 Swift 前端完成完整的抽象语法树解析。只有返回码为 0 时才判定为可执行代码，任何解析错误均立即触发断路器阻断部署，保障已部署系统的稳定运行。
+
+## 3. 双端原子同步与平滑热重载
+
+* **双环境同步机制**：`performSelfUpdate` 识别当前是否同时存在工作区源码与 `~/Library/Application Support/AutoMount` 部署目录。若两处皆存在，自升级引擎原子同步更新两个副本，消除“开发者更新了代码但守护程序依然运行旧版本”或“日常运行目录更新但版本控制未同步”的认知脱节。
+* **热重载无需重启**：更新完成后，主程序无缝调用 `launchctl bootout` 与 `launchctl bootstrap` 重载 `com.user.auto-mount` 服务，新代码在下一次网络事件触发时即刻生效，全程无需重启计算机或重登用户会话。
