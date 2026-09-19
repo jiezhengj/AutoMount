@@ -99,7 +99,7 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.4.1"
+let autoMountVersion = "2.4.2"
 let githubRepo = "jiezhengj/AutoMount"
 
 struct MatchRule: Codable {
@@ -171,6 +171,26 @@ func migrateConfigIfNeeded(config: inout AutoMountConfig) -> Bool {
     if config.updateChannel == nil {
         config.updateChannel = "off"
         modified = true
+    }
+    for i in 0..<config.profiles.count {
+        if config.profiles[i].id == "home_lan" {
+            config.profiles[i].id = "local_lan"
+            modified = true
+        }
+        if let desc = config.profiles[i].description, (desc.contains("家庭局域网") || desc.contains("Home LAN")) {
+            config.profiles[i].description = tr("本地局域网高速直连", "Local LAN High-Speed Direct Connection")
+            modified = true
+        }
+        if config.profiles[i].id == "tailscale_remote" {
+            config.profiles[i].id = "remote_network"
+            modified = true
+        }
+        if let desc = config.profiles[i].description, (desc.contains("Tailscale 异地互联") || desc.contains("Tailscale Remote")) {
+            let updated = desc.replacingOccurrences(of: "Tailscale 异地互联", with: "远程互联")
+                              .replacingOccurrences(of: "Tailscale Remote", with: "Remote Network")
+            config.profiles[i].description = updated
+            modified = true
+        }
     }
     if modified {
         saveConfig(config)
@@ -1231,7 +1251,7 @@ func manageConfiguration() {
         let daemonSummary = getLaunchAgentStatusSummary()
         let curChannel = config.updateChannel ?? "off"
         let channelDisplay = getUpdateChannelDisplay(curChannel)
-        let hasRemote = config.profiles.contains(where: { $0.match.type == "probe_host" || $0.id == "remote_network" || $0.id == "tailscale_remote" })
+        let hasRemote = config.profiles.contains(where: { $0.match.type == "probe_host" || $0.id == "remote_network" })
         let remoteActionTitle = hasRemote ?
             tr("重新配置/更新远程互联主机 (Tailscale / 域名 / IP)", "Re-detect / update remote host (Tailscale / Domain / IP)") :
             tr("配置并添加远程互联策略", "Configure & add remote profile")
@@ -1359,7 +1379,7 @@ func manageConfiguration() {
         case "3":
             // 更新本地网关 MAC
             let localIdx = config.profiles.firstIndex(where: { $0.match.type == "gateway_mac" }) ??
-                           config.profiles.firstIndex(where: { $0.id == "local_lan" || $0.id == "home_lan" })
+                           config.profiles.firstIndex(where: { $0.id == "local_lan" })
             if let idx = localIdx {
                 print(tr("\n当前本地网关 MAC: \(config.profiles[idx].match.value)",
                          "\nCurrent local gateway MAC: \(config.profiles[idx].match.value)"))
@@ -1464,7 +1484,7 @@ func manageConfiguration() {
             guard !newHost.isEmpty else { continue }
 
             let existingRemoteIdx = config.profiles.firstIndex(where: { $0.match.type == "probe_host" }) ??
-                                   config.profiles.firstIndex(where: { $0.id == "remote_network" || $0.id == "tailscale_remote" })
+                                   config.profiles.firstIndex(where: { $0.id == "remote_network" })
 
             if let rIdx = existingRemoteIdx {
                 config.profiles[rIdx].match.value = newHost
