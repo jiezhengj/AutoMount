@@ -79,15 +79,15 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 The interactive management menu displays:
 
 ```text
-Auto Mount Tool - Daily Configuration Management (v2.3.0)
+Auto Mount Tool - Daily Configuration Management (v2.4.0)
 ===================================================
 
 Configured Profiles:
-  [1] home_lan (Home LAN Direct - Multi-Gigabit)
+  [1] local_lan (Local LAN Direct)
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-Software Version: v2.3.0 | Auto-Update Channel: off (Disabled, manual update)
+Software Version: v2.4.0 | Auto-Update Channel: off (Disabled, manual update)
 Background Daemon Status: Active & running (gui/501/com.user.auto-mount)
 
 Select an action:
@@ -135,17 +135,17 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.3.0</string>
+    <string>2.4.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
     <array>
-        <!-- Policy 1: Home LAN Direct Connection (High Priority) -->
+        <!-- Policy 1: Local LAN Direct Connection (High Priority) -->
         <dict>
             <key>id</key>
-            <string>home_lan</string>
+            <string>local_lan</string>
             <key>description</key>
-            <string>Home LAN High-Speed Direct Connection</string>
+            <string>Local LAN High-Speed Direct Connection</string>
             <key>match</key>
             <dict>
                 <key>type</key>
@@ -172,12 +172,12 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
             </array>
         </dict>
 
-        <!-- Policy 2: Tailscale Remote Connection (Fallback Policy) -->
+        <!-- Profile 2: Remote Interconnection (Tailscale / WireGuard / DDNS / IP) -->
         <dict>
             <key>id</key>
-            <string>tailscale_remote</string>
+            <string>remote_network</string>
             <key>description</key>
-            <string>Tailscale Remote Interconnection</string>
+            <string>Remote Interconnection Fallback</string>
             <key>match</key>
             <dict>
                 <key>type</key>
@@ -221,12 +221,12 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.3.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
+| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.4.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
 | `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
 | `last_update_check_timestamp` | Real | Unix timestamp of the last update check, enforcing the 24-hour cooldown window. |
 | `last_notified_version` | String | Latest remote release tag that was notified, ensuring at most one notification per new version. |
 | `profiles` | Array | Ordered policy list. Evaluated sequentially; the first matching profile executes and terminates subsequent evaluations. |
-| `id` | String | Unique profile identifier (e.g., `home_lan`, `tailscale_remote`). |
+| `id` | String | Unique profile identifier (e.g., `local_lan`, `remote_network`, compatible with legacy `home_lan`, `tailscale_remote`). |
 | `description` | String | Human-readable profile description. |
 | `match.type` | String | Match strategy: `gateway_mac` (hardware ARP BSSID matching) or `probe_host` (host reachability probe). |
 | `match.value` | String | Target match value: MAC address (case-insensitive) or target hostname/MagicDNS domain/IP. |

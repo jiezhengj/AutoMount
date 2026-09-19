@@ -79,16 +79,16 @@ swift auto_mount.swift
 终端将弹出交互式一站式控制中心：
 
 ```text
-Auto Mount Tool - 日常配置管理 (v2.3.0)
+Auto Mount Tool - 日常配置管理 (v2.4.0)
 ====================================
 
 当前已配置策略：
-  [1] home_lan (家庭局域网直连 (千兆/2.5G 高速)) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)
-  [2] tailscale_remote (Tailscale 异地互联 (dx4600)) - 2 个挂载目标
+  [1] local_lan (本地局域网高速直连) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)
+  [2] remote_network (远程互联 (dx4600)) - 2 个挂载目标
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-软件版本: v2.3.0 | 自动更新信道: off (关闭自动检查，纯手动)
+软件版本: v2.4.0 | 自动更新信道: off (关闭自动检查，纯手动)
 后台守护服务状态: 已注册运行 (gui/501/com.user.auto-mount)
 
 请选择操作：
@@ -136,17 +136,17 @@ Auto Mount Tool - 日常配置管理 (v2.3.0)
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.3.0</string>
+    <string>2.4.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
     <array>
-        <!-- 策略 1: 家庭局域网直连 (高优先级) -->
+        <!-- 策略 1: 本地局域网直连 (基于物理网关 MAC 指纹) -->
         <dict>
             <key>id</key>
-            <string>home_lan</string>
+            <string>local_lan</string>
             <key>description</key>
-            <string>家庭局域网高速直连</string>
+            <string>本地局域网高速直连</string>
             <key>match</key>
             <dict>
                 <key>type</key>
@@ -173,12 +173,12 @@ Auto Mount Tool - 日常配置管理 (v2.3.0)
             </array>
         </dict>
 
-        <!-- 策略 2: Tailscale 异地互联 (外出降级策略) -->
+        <!-- 策略 2: 远程异地互联 (Tailscale / WireGuard / 动态域名 / IP) -->
         <dict>
             <key>id</key>
-            <string>tailscale_remote</string>
+            <string>remote_network</string>
             <key>description</key>
-            <string>Tailscale 异地互联通道</string>
+            <string>远程异地互联通道</string>
             <key>match</key>
             <dict>
                 <key>type</key>
@@ -222,12 +222,12 @@ Auto Mount Tool - 日常配置管理 (v2.3.0)
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.3.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
+| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.4.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
 | `update_channel` | String | 软件自动更新策略，可选值为 `off`（关闭，默认）、`notify`（通知提醒）、`auto`（自动静默热升级）。 |
 | `last_update_check_timestamp` | Real | 上次执行更新检查的 Unix 时间戳，用于 24 小时冷却时间窗口管理。 |
 | `last_notified_version` | String | 已发送通知的最新远端版本号，确保同一版本最多仅提醒 1 次防打扰。 |
 | `profiles` | Array | 策略规则列表。按数组先后顺序从上至下进行优先级匹配，一旦首个策略命中并执行，立即终止后续检查。 |
-| `id` | String | 策略唯一标识（如 `home_lan`, `tailscale_remote`）。 |
+| `id` | String | 策略唯一标识（如 `local_lan`, `remote_network`，兼容老配置 `home_lan`, `tailscale_remote`）。 |
 | `description` | String | 策略的人类可读描述信息。 |
 | `match.type` | String | 匹配类型：`gateway_mac`（物理网关 MAC 匹配）或 `probe_host`（主机连通性探测）。 |
 | `match.value` | String | 匹配目标：网关 MAC 地址（不区分大小写）或探测的主机名/MagicDNS 域名/IP。 |

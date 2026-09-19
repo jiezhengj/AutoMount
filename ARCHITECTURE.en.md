@@ -28,7 +28,7 @@ flowchart TD
 
 ## Network Exclusion Gatekeeper Mechanism
 
-* **Zero-Target Profile Truncation**: When a higher-priority network profile (such as `home_lan`) configures its `targets` array as empty `[]`, it functions as an exclusion gatekeeper.
+* **Zero-Target Profile Truncation**: When a higher-priority network profile (such as `local_lan`) configures its `targets` array as empty `[]`, it functions as an exclusion gatekeeper.
 * **Deterministic Route Interception**: When the physical gateway MAC matches this profile, the engine finishes processing 0 mount actions and immediately truncates the evaluation chain. This cleanly prevents lower-priority remote profiles (e.g., Tailscale) from triggering while physically located in that network. Once the device leaves the physical network, the MAC fingerprint mismatches and evaluation gracefully falls back to the remote policy.
 
 ## Mount API Selection
@@ -362,7 +362,7 @@ flowchart TD
 
 ## 1. Design Philosophy: Eliminating Dual-Track Versioning
 
-Traditional configuration-driven systems often maintain dual-track versions: a software release version (e.g., `2.3.0`) and a configuration format version (e.g., `2.0` / `2.1`). Over ongoing feature iterations, this split introduces substantial engineering and operational overhead:
+Traditional configuration-driven systems often maintain dual-track versions: a software release version (e.g., `2.4.0`) and a configuration format version (e.g., `2.0` / `2.1`). Over ongoing feature iterations, this split introduces substantial engineering and operational overhead:
 * **Developer Cognitive Divergence**: The codebase is forced to sustain legacy parsing forks and branching logic (e.g., maintaining redundant structs such as `ConfigV1` and `ConfigV2`), unnecessarily bloating the compilation unit;
 * **User Uncertainty**: When users observe that their software binary is updated while the configuration file continues to display an outdated format tag, it fosters doubt regarding feature compatibility;
 * **Silent Schema Drift**: Manual alterations to the version string by users risk triggering erroneous legacy fallback logic, resulting in missing properties or decode failures.

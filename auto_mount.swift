@@ -3,7 +3,7 @@
 // 自动挂载 NAS 工具 (macOS 27 多网络策略路由与现代化交互版 - 2.0)
 //
 // 核心架构与特性：
-// 1. 多策略优先级路由 (Profiles)：家庭局域网 (home_lan) 优先直连；离开家庭网自动降级至 Tailscale 异地互联 (tailscale_remote)。
+// 1. 多策略优先级路由 (Profiles)：本地局域网 (local_lan) 优先直连；离开局域网自动降级至远程互联 (remote_network / Tailscale / WireGuard / 域名 / IP)。
 // 2. 失效挂载与源切换的超时强制清理 (Strategy B)：
 //    - Darwin 原生 MNT_NOWAIT 内核挂载表非阻塞查询，杜绝 stat() 阻塞与系统彩虹球假死。
 //    - 自动比对挂载源同源性，带 3 秒严格超时熔断机制 (diskutil unmount force + POSIX MNT_FORCE)。
@@ -99,7 +99,7 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.3.0"
+let autoMountVersion = "2.4.0"
 let githubRepo = "jiezhengj/AutoMount"
 
 struct MatchRule: Codable {
@@ -933,9 +933,9 @@ func runInitWizard() {
                  "  ✓ No shares configured for LAN. This network acts solely as an exclusion gatekeeper."))
     }
 
-    let homeProfileDesc = tr("家庭局域网直连 (千兆/2.5G 高速)", "Home LAN Direct (Gigabit/2.5G)")
+    let homeProfileDesc = tr("本地局域网高速直连", "Local LAN Direct")
     let homeProfile = NetworkProfile(
-        id: "home_lan",
+        id: "local_lan",
         description: homeProfileDesc,
         match: MatchRule(type: "gateway_mac", value: homeMAC, retryCount: nil, retryInterval: nil),
         excludeGatewayIPs: nil,
@@ -943,35 +943,63 @@ func runInitWizard() {
         targets: homeTargets
     )
 
-    // 3. Tailscale 远程降级策略配置
-    print(tr("\n[3/5] 配置 Tailscale 远程互联降级策略", "\n[3/5] Configure Tailscale Remote Fallback Profile"))
+    // 3. 远程互联降级策略配置 (Tailscale / WireGuard / 域名 / IP)
+    print(tr("\n[3/5] 配置远程互联降级策略 (Tailscale / WireGuard / 域名 / IP)",
+             "\n[3/5] Configure Remote Fallback Profile (Tailscale / WireGuard / Domain / IP)"))
     var profiles: [NetworkProfile] = [homeProfile]
     let discoveredPeers = discoverTailscalePeers()
 
-    if discoveredPeers.isEmpty {
-        print(tr("  未检测到 Tailscale 正在运行或在线节点，已跳过远程策略配置。",
-                 "  Tailscale is not running or no active peers found. Remote profile setup skipped."))
-        print(tr("  （提示：后续连接 Tailscale 后，可运行 './auto_mount --config' 随时补齐远程策略）",
-                 "  (Tip: Run './auto_mount --config' anytime later to configure Tailscale remote profile)"))
-    } else {
-        var peerOptions = discoveredPeers.map {
-            SelectionOption(title: $0.name, subtitle: tr("MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)",
-                                                         "MagicDNS: \($0.magicDNS ?? "None"), IP: \($0.ip), OS: \($0.os)"))
+    var remoteOptions: [SelectionOption] = []
+    if !discoveredPeers.isEmpty {
+        for peer in discoveredPeers {
+            remoteOptions.append(SelectionOption(
+                title: tr("Tailscale 设备: \(peer.name)", "Tailscale Device: \(peer.name)"),
+                subtitle: tr("MagicDNS: \(peer.magicDNS ?? "无"), IP: \(peer.ip), OS: \(peer.os)",
+                             "MagicDNS: \(peer.magicDNS ?? "None"), IP: \(peer.ip), OS: \(peer.os)")
+            ))
         }
-        peerOptions.append(SelectionOption(title: tr("跳过配置远程策略", "Skip remote profile setup"), subtitle: nil))
+    }
+    remoteOptions.append(SelectionOption(
+        title: tr("手动输入远程主机名 / DDNS 域名 / IP", "Manual Hostname / DDNS Domain / IP"),
+        subtitle: tr("适用于 WireGuard、ZeroTier、公网 DDNS 动态域名或固定公网 IP",
+                     "For WireGuard, ZeroTier, DDNS dynamic domain, or public IP")
+    ))
+    remoteOptions.append(SelectionOption(
+        title: tr("跳过配置远程策略", "Skip remote profile setup"),
+        subtitle: nil
+    ))
 
-        let selected = promptInteractiveRadio(
-            title: tr("检测到 Tailscale 正在运行，请选择对端访问设备：", "Tailscale detected. Select target remote peer:"),
-            options: peerOptions,
-            defaultIndex: 0
-        )
+    let selected = promptInteractiveRadio(
+        title: tr("请选择远程对端接入方式：", "Select remote peer connection mode:"),
+        options: remoteOptions,
+        defaultIndex: 0
+    )
 
-        if selected < discoveredPeers.count {
+    let skipIndex = remoteOptions.count - 1
+    let manualIndex = remoteOptions.count - 2
+
+    if selected == skipIndex {
+        print(tr("  ✓ 已跳过配置远程策略。", "  ✓ Skipped remote profile configuration."))
+    } else {
+        var selectedPeerName = ""
+        var selectedHost = ""
+
+        if selected == manualIndex {
+            // 手动输入模式
+            print(tr("\n  请输入远程目标主机名、DDNS 动态域名或 IP (例如 nas.example.com): ",
+                     "\n  Enter remote target hostname, DDNS domain, or IP (e.g. nas.example.com): "), terminator: "")
+            let manualInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if manualInput.isEmpty {
+                print(tr("  ✓ 未输入有效主机，已跳过远程策略。", "  ✓ No valid host entered. Skipped remote profile."))
+            } else {
+                selectedHost = manualInput
+                selectedPeerName = manualInput
+            }
+        } else if selected < discoveredPeers.count {
+            // Tailscale 快捷选择
             let peer = discoveredPeers[selected]
-            let selectedPeerName = peer.name
-            var selectedHost = ""
+            selectedPeerName = peer.name
 
-            // 选择连接地址格式：MagicDNS 域名 或 虚拟 IP
             var addrOptions: [SelectionOption] = []
             if let dns = peer.magicDNS {
                 addrOptions.append(SelectionOption(
@@ -992,21 +1020,19 @@ func runInitWizard() {
                     options: addrOptions,
                     defaultIndex: 0
                 )
-                if addrOptions[chosenAddr].title.contains("MagicDNS") {
-                    selectedHost = peer.magicDNS ?? peer.ip
-                } else {
-                    selectedHost = peer.ip
-                }
+                selectedHost = addrOptions[chosenAddr].title.contains("MagicDNS") ? (peer.magicDNS ?? peer.ip) : peer.ip
             } else {
                 selectedHost = peer.ip
             }
+        }
 
+        if !selectedHost.isEmpty {
             var remoteTargets: [MountTarget] = []
 
-            // 路径 1：若已配置家庭局域网目标，询问是否自动映射
+            // 路径 1：若已配置局域网目标，询问是否自动映射
             var didAutoMap = false
             if !homeTargets.isEmpty {
-                print(tr("\n  是否自动将已选的家庭局域网共享目录映射为该远程主机目标？(Y/n) [默认 Y]: ",
+                print(tr("\n  是否自动将已选的本地局域网共享目录映射为该远程主机目标？(Y/n) [默认 Y]: ",
                          "\n  Auto-map selected LAN shares to this remote host? (Y/n) [Default Y]: "), terminator: "")
                 let autoMap = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y") != "n"
                 if autoMap {
@@ -1031,10 +1057,7 @@ func runInitWizard() {
             if !didAutoMap {
                 let curActive = discoverActiveSMBMounts()
                 let matchingMounts = curActive.filter { mount in
-                    if !selectedHost.isEmpty && mount.url.contains(selectedHost) { return true }
-                    if let dns = peer.magicDNS, mount.url.contains(dns) { return true }
-                    if !peer.ip.isEmpty && mount.url.contains(peer.ip) { return true }
-                    return false
+                    mount.url.contains(selectedHost)
                 }
 
                 if !matchingMounts.isEmpty {
@@ -1051,7 +1074,7 @@ func runInitWizard() {
                     }
                 }
 
-                // 路径 3：若仍未选定，半自动录入共享名（或直接跳过）
+                // 路径 3：录入共享名
                 if remoteTargets.isEmpty {
                     print(tr("  请输入远程主机上的共享文件夹名称 (直接按回车可跳过)：",
                              "  Enter share folder name on remote host (Enter to skip):"))
@@ -1083,11 +1106,9 @@ func runInitWizard() {
             }
 
             if !remoteTargets.isEmpty {
-                let desc = selectedPeerName.isEmpty ?
-                    tr("Tailscale 异地互联 (外出降级通道)", "Tailscale Remote Fallback") :
-                    tr("Tailscale 异地互联 (\(selectedPeerName))", "Tailscale Remote (\(selectedPeerName))")
+                let desc = tr("远程互联 (\(selectedPeerName))", "Remote Network (\(selectedPeerName))")
                 let remoteProfile = NetworkProfile(
-                    id: "tailscale_remote",
+                    id: "remote_network",
                     description: desc,
                     match: MatchRule(type: "probe_host", value: selectedHost, retryCount: 3, retryInterval: 1.0),
                     excludeGatewayIPs: ["172.20.10.1"],
@@ -1098,8 +1119,6 @@ func runInitWizard() {
             } else {
                 print(tr("  ✓ 未配置远程挂载目标，跳过远程策略。", "  ✓ No remote targets configured. Skipped remote profile."))
             }
-        } else {
-            print(tr("  ✓ 已跳过配置远程策略。", "  ✓ Skipped remote profile configuration."))
         }
     }
 
@@ -1210,10 +1229,10 @@ func manageConfiguration() {
         let daemonSummary = getLaunchAgentStatusSummary()
         let curChannel = config.updateChannel ?? "off"
         let channelDisplay = getUpdateChannelDisplay(curChannel)
-        let hasTailscale = config.profiles.contains(where: { $0.id == "tailscale_remote" })
-        let tailscaleActionTitle = hasTailscale ?
-            tr("重新检测/更新远程 Tailscale 目标", "Re-detect / update remote Tailscale peer") :
-            tr("配置并添加远程 Tailscale 策略", "Configure & add remote Tailscale profile")
+        let hasRemote = config.profiles.contains(where: { $0.match.type == "probe_host" || $0.id == "remote_network" || $0.id == "tailscale_remote" })
+        let remoteActionTitle = hasRemote ?
+            tr("重新配置/更新远程互联主机 (Tailscale / 域名 / IP)", "Re-detect / update remote host (Tailscale / Domain / IP)") :
+            tr("配置并添加远程互联策略", "Configure & add remote profile")
 
         print(tr("""
 
@@ -1223,8 +1242,8 @@ func manageConfiguration() {
         请选择操作：
           [1] 添加挂载目标 (支持从当前已挂载项中导入或手动输入)
           [2] 删除已有挂载目标
-          [3] 重新检测/更新家庭网关 MAC
-          [4] \(tailscaleActionTitle)
+          [3] 重新检测/更新本地网关 MAC
+          [4] \(remoteActionTitle)
           [5] 守护服务管理 (部署/重载、查看详情、卸载服务)
           [6] 自动更新信道与版本维护 (设置更新策略、立即检查并升级)
           [0] 保存配置并退出
@@ -1236,77 +1255,95 @@ func manageConfiguration() {
         Select an action:
           [1] Add mount target (import from active mounts or manual entry)
           [2] Remove existing mount target
-          [3] Re-detect / update home gateway MAC
-          [4] \(tailscaleActionTitle)
+          [3] Re-detect / update local gateway MAC
+          [4] \(remoteActionTitle)
           [5] Daemon management (deploy/reload, view details, uninstall)
-          [6] Auto-update channel & maintenance (set policy, check & upgrade)
+          [6] Auto-update channel & version maintenance
           [0] Save configuration and exit
         """))
+
         print(tr("请输入选项 [0-6]: ", "Enter choice [0-6]: "), terminator: "")
-        let choice = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+        guard let choice = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            break
+        }
 
         switch choice {
         case "1":
             // 添加挂载目标
-            print(tr("\n选择要添加到的策略：", "\nSelect profile to add target to:"))
+            print(tr("\n请选择要添加目标的策略：", "\nSelect profile to add target to:"))
             for (i, p) in config.profiles.enumerated() {
-                print("  [\(i + 1)] \(p.id)")
+                print("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述"))")
             }
-            print(tr("请选择策略序号: ", "Select profile index: "), terminator: "")
+            print(tr("请输入策略编号 (按回车取消): ", "Enter profile number (Enter to cancel): "), terminator: "")
             guard let pStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines),
                   let pIdx = Int(pStr), pIdx >= 1 && pIdx <= config.profiles.count else {
-                print(tr("✗ 无效选择。", "✗ Invalid selection."))
                 continue
             }
 
-            let activeMounts = discoverActiveSMBMounts()
-            var added = false
-            if !activeMounts.isEmpty {
-                let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
-                let selected = promptInteractiveCheckbox(
-                    title: tr("发现当前系统中已挂载的 SMB 卷宗，请选择添加项 (直接回车跳过)：",
-                              "Discovered active SMB mounts. Select items to add (Enter to skip):"),
-                    options: options
-                )
-                for idx in selected {
-                    let item = activeMounts[idx]
-                    config.profiles[pIdx - 1].targets.append(MountTarget(url: item.url, mountPath: item.path))
-                    print(tr("  ✓ 已添加: \(item.path) (\(item.url))", "  ✓ Added: \(item.path) (\(item.url))"))
-                    added = true
-                }
+            let profileIndex = pIdx - 1
+            var defaultHost = ""
+            if config.profiles[profileIndex].match.type == "probe_host" {
+                defaultHost = config.profiles[profileIndex].match.value
             }
-            if !added {
-                print(tr("请输入 SMB 地址 (例如 smb://server.local/share): ",
-                         "Enter SMB URL (e.g. smb://server.local/share): "), terminator: "")
-                let urlStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !urlStr.isEmpty {
-                    let defaultPath = deriveDefaultMountPath(from: urlStr)
-                    print(tr("请输入本地挂载路径 [默认: \(defaultPath)]: ",
-                             "Enter local mount path [Default: \(defaultPath)]: "), terminator: "")
-                    let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    let pathStr = pathInput.isEmpty ? defaultPath : pathInput
-                    config.profiles[pIdx - 1].targets.append(MountTarget(url: urlStr, mountPath: pathStr))
-                    print(tr("  ✓ 已添加: \(pathStr) (\(urlStr))", "  ✓ Added: \(pathStr) (\(urlStr))"))
+
+            // 导入活动挂载或手动输入
+            let activeMounts = discoverActiveSMBMounts()
+            var options: [SelectionOption] = []
+            for m in activeMounts {
+                let name = URL(fileURLWithPath: m.path).lastPathComponent
+                options.append(SelectionOption(title: name, subtitle: "\(m.path) <- \(m.url)"))
+            }
+            options.append(SelectionOption(title: tr("手动输入挂载目标 URL 和挂载点", "Manual entry of URL and mount path"), subtitle: nil))
+
+            let sel = promptInteractiveRadio(
+                title: tr("请选择添加方式：", "Select addition method:"),
+                options: options,
+                defaultIndex: options.count - 1
+            )
+
+            if sel < activeMounts.count {
+                let m = activeMounts[sel]
+                config.profiles[profileIndex].targets.append(MountTarget(url: m.url, mountPath: m.path))
+                print(tr("✓ 已添加: \(m.path) <- \(m.url)", "✓ Added: \(m.path) <- \(m.url)"))
+            } else {
+                // 手动输入
+                let sampleURL = defaultHost.isEmpty ? "smb://server.local/share" : "smb://\(defaultHost)/share"
+                print(tr("请输入完整 SMB 地址 (例如 \(sampleURL)): ",
+                         "Enter full SMB URL (e.g. \(sampleURL)): "), terminator: "")
+                guard let url = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else {
+                    continue
                 }
+                var defaultPath = "/Volumes/share"
+                if let lastPart = url.split(separator: "/").last {
+                    defaultPath = "/Volumes/\(lastPart)"
+                }
+                print(tr("请输入本地挂载点绝对路径 [默认: \(defaultPath)]: ",
+                         "Enter local mount point path [Default: \(defaultPath)]: "), terminator: "")
+                let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let path = pathInput.isEmpty ? defaultPath : pathInput
+                config.profiles[profileIndex].targets.append(MountTarget(url: url, mountPath: path))
+                print(tr("✓ 已添加: \(path) <- \(url)", "✓ Added: \(path) <- \(url)"))
             }
 
         case "2":
-            // 删除已有挂载目标
+            // 删除挂载目标
             var flatTargets: [(profileIndex: Int, targetIndex: Int, display: String)] = []
-            for (pi, p) in config.profiles.enumerated() {
-                for (ti, t) in p.targets.enumerated() {
-                    flatTargets.append((pi, ti, "[\(p.id)] \(t.mountPath) (\(t.url))"))
+            for (pI, p) in config.profiles.enumerated() {
+                for (tI, t) in p.targets.enumerated() {
+                    flatTargets.append((pI, tI, "[\(p.id)] \(t.mountPath) <- \(t.url)"))
                 }
             }
+
             if flatTargets.isEmpty {
-                print(tr("当前无挂载目标可删除。", "No mount targets available to remove."))
+                print(tr("当前没有任何已配置的挂载目标。", "No mount targets configured."))
                 continue
             }
-            print(tr("\n现有挂载目标列表：", "\nExisting mount targets:"))
+
+            print(tr("\n当前所有挂载目标列表：", "\nCurrent mount targets:"))
             for (idx, item) in flatTargets.enumerated() {
                 print("  [\(idx + 1)] \(item.display)")
             }
-            print(tr("请输入要删除的项目序号: ", "Enter target index to remove: "), terminator: "")
+            print(tr("请输入要删除的编号 (按回车取消): ", "Enter target number to delete (Enter to cancel): "), terminator: "")
             if let delStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines),
                let delIdx = Int(delStr), delIdx >= 1 && delIdx <= flatTargets.count {
                 let item = flatTargets[delIdx - 1]
@@ -1315,90 +1352,120 @@ func manageConfiguration() {
             }
 
         case "3":
-            // 更新家庭网关 MAC
-            if let homeIdx = config.profiles.firstIndex(where: { $0.id == "home_lan" }) {
-                print(tr("\n当前家庭网关 MAC: \(config.profiles[homeIdx].match.value)",
-                         "\nCurrent home gateway MAC: \(config.profiles[homeIdx].match.value)"))
+            // 更新本地网关 MAC
+            let localIdx = config.profiles.firstIndex(where: { $0.match.type == "gateway_mac" }) ??
+                           config.profiles.firstIndex(where: { $0.id == "local_lan" || $0.id == "home_lan" })
+            if let idx = localIdx {
+                print(tr("\n当前本地网关 MAC: \(config.profiles[idx].match.value)",
+                         "\nCurrent local gateway MAC: \(config.profiles[idx].match.value)"))
                 if let curMAC = getCurrentNetworkFingerprint() {
                     print(tr("自动探测到当前网络物理网关 MAC: \(curMAC)",
                              "Detected current physical gateway MAC: \(curMAC)"))
                     print(tr("按回车采纳，或输入自定义 MAC 覆盖 [默认: \(curMAC)]: ",
                              "Press Enter to accept, or enter custom MAC [Default: \(curMAC)]: "), terminator: "")
                     let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    config.profiles[homeIdx].match.value = input.isEmpty ? curMAC : input
-                    print(tr("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)",
-                             "✓ Home gateway MAC updated to: \(config.profiles[homeIdx].match.value)"))
+                    config.profiles[idx].match.value = input.isEmpty ? curMAC : input
+                    print(tr("✓ 本地网关 MAC 已更新为: \(config.profiles[idx].match.value)",
+                             "✓ Local gateway MAC updated to: \(config.profiles[idx].match.value)"))
                 } else {
                     print(tr("未能自动获取当前物理网关 MAC，请输入自定义 MAC: ",
                              "Failed to auto-detect gateway MAC. Enter custom MAC: "), terminator: "")
                     let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     if !input.isEmpty {
-                        config.profiles[homeIdx].match.value = input
-                        print(tr("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)",
-                                 "✓ Home gateway MAC updated to: \(config.profiles[homeIdx].match.value)"))
+                        config.profiles[idx].match.value = input
+                        print(tr("✓ 本地网关 MAC 已更新为: \(config.profiles[idx].match.value)",
+                                 "✓ Local gateway MAC updated to: \(config.profiles[idx].match.value)"))
                     }
                 }
             } else {
-                print(tr("未找到 home_lan 策略。", "home_lan profile not found."))
+                print(tr("未找到基于网关 MAC 的本地网络策略。", "No gateway MAC local profile found."))
             }
 
         case "4":
-            // 更新或新建远程 Tailscale 目标
+            // 更新或新建远程互联主机 (Tailscale / 域名 / IP)
             let peers = discoverTailscalePeers()
-            if peers.isEmpty {
-                print(tr("未检测到 Tailscale 在线设备。请确认 Tailscale 已启动并登录。",
-                         "No Tailscale peers detected. Ensure Tailscale is running and signed in."))
-                continue
+            var modeOptions: [SelectionOption] = []
+            if !peers.isEmpty {
+                for p in peers {
+                    modeOptions.append(SelectionOption(
+                        title: tr("Tailscale 设备: \(p.name)", "Tailscale Device: \(p.name)"),
+                        subtitle: tr("MagicDNS: \(p.magicDNS ?? "无"), IP: \(p.ip)", "MagicDNS: \(p.magicDNS ?? "None"), IP: \(p.ip)")
+                    ))
+                }
             }
-            var peerOptions = peers.map {
-                SelectionOption(title: $0.name, subtitle: tr("MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)",
-                                                             "MagicDNS: \($0.magicDNS ?? "None"), IP: \($0.ip), OS: \($0.os)"))
-            }
-            peerOptions.append(SelectionOption(title: tr("取消", "Cancel"), subtitle: nil))
+            modeOptions.append(SelectionOption(
+                title: tr("手动输入远程主机名 / DDNS 域名 / IP", "Manual Hostname / DDNS Domain / IP"),
+                subtitle: tr("支持 WireGuard、ZeroTier、公网动态域名或固定 IP", "Supports WireGuard, ZeroTier, DDNS, or public IP")
+            ))
+            modeOptions.append(SelectionOption(title: tr("取消", "Cancel"), subtitle: nil))
+
             let sel = promptInteractiveRadio(
-                title: tr("发现可用 Tailscale 设备，请选择：", "Select available Tailscale peer:"),
-                options: peerOptions,
+                title: tr("请选择远程主机接入方式：", "Select remote host connection mode:"),
+                options: modeOptions,
                 defaultIndex: 0
             )
-            guard sel < peers.count else {
+
+            let cancelIdx = modeOptions.count - 1
+            let manualModeIdx = modeOptions.count - 2
+
+            guard sel != cancelIdx else {
                 print(tr("已取消操作。", "Operation cancelled."))
                 continue
             }
 
-            let peer = peers[sel]
-            let selectedPeerName = peer.name
             var newHost = ""
+            var selectedDisplayName = ""
 
-            var addrOptions: [SelectionOption] = []
-            if let dns = peer.magicDNS {
-                addrOptions.append(SelectionOption(
-                    title: tr("MagicDNS 域名: \(dns)", "MagicDNS Domain: \(dns)"),
-                    subtitle: tr("推荐：IP 变动不失效，钥匙串凭据稳定", "Recommended: stable credentials across IP changes")
-                ))
-            }
-            if !peer.ip.isEmpty {
-                addrOptions.append(SelectionOption(
-                    title: tr("Tailscale IP: \(peer.ip)", "Tailscale IP: \(peer.ip)"),
-                    subtitle: tr("直连无 DNS 解析依赖", "Direct connection without DNS dependency")
-                ))
-            }
-            if !addrOptions.isEmpty {
-                let chosen = promptInteractiveRadio(
-                    title: tr("请选择连接方式：", "Select connection address:"),
-                    options: addrOptions,
-                    defaultIndex: 0
-                )
-                newHost = addrOptions[chosen].title.contains("MagicDNS") ? (peer.magicDNS ?? peer.ip) : peer.ip
-            } else {
-                newHost = peer.ip
+            if sel == manualModeIdx {
+                print(tr("\n请输入远程主机名、DDNS 动态域名或 IP (例如 nas.example.com): ",
+                         "\nEnter remote hostname, DDNS domain, or IP (e.g. nas.example.com): "), terminator: "")
+                let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if input.isEmpty {
+                    print(tr("未输入有效地址，已取消。", "No valid address entered. Cancelled."))
+                    continue
+                }
+                newHost = input
+                selectedDisplayName = input
+            } else if sel < peers.count {
+                let peer = peers[sel]
+                selectedDisplayName = peer.name
+                var addrOptions: [SelectionOption] = []
+                if let dns = peer.magicDNS {
+                    addrOptions.append(SelectionOption(
+                        title: tr("MagicDNS 域名: \(dns)", "MagicDNS Domain: \(dns)"),
+                        subtitle: tr("推荐：IP 变动不失效，钥匙串凭据稳定", "Recommended: stable credentials across IP changes")
+                    ))
+                }
+                if !peer.ip.isEmpty {
+                    addrOptions.append(SelectionOption(
+                        title: tr("Tailscale IP: \(peer.ip)", "Tailscale IP: \(peer.ip)"),
+                        subtitle: tr("直连无 DNS 解析依赖", "Direct connection without DNS dependency")
+                    ))
+                }
+                if !addrOptions.isEmpty {
+                    let chosen = promptInteractiveRadio(
+                        title: tr("请选择连接方式：", "Select connection address:"),
+                        options: addrOptions,
+                        defaultIndex: 0
+                    )
+                    newHost = addrOptions[chosen].title.contains("MagicDNS") ? (peer.magicDNS ?? peer.ip) : peer.ip
+                } else {
+                    newHost = peer.ip
+                }
             }
 
-            if let rIdx = config.profiles.firstIndex(where: { $0.id == "tailscale_remote" }) {
+            guard !newHost.isEmpty else { continue }
+
+            let existingRemoteIdx = config.profiles.firstIndex(where: { $0.match.type == "probe_host" }) ??
+                                   config.profiles.firstIndex(where: { $0.id == "remote_network" || $0.id == "tailscale_remote" })
+
+            if let rIdx = existingRemoteIdx {
                 config.profiles[rIdx].match.value = newHost
-                print(tr("✓ 远程探测目标已更新为: \(newHost)", "✓ Remote probe target updated to: \(newHost)"))
+                config.profiles[rIdx].description = tr("远程互联 (\(selectedDisplayName))", "Remote Network (\(selectedDisplayName))")
+                print(tr("✓ 远程探测目标已更新为: \(newHost) (\(selectedDisplayName))",
+                         "✓ Remote probe target updated to: \(newHost) (\(selectedDisplayName))"))
             } else {
-                // 动态新建 tailscale_remote 策略
-                print(tr("\n正在为新策略配置挂载目标：", "\nConfiguring mount targets for new remote profile:"))
+                print(tr("\n正在为新远程策略配置挂载目标：", "\nConfiguring mount targets for new remote profile:"))
                 var newTargets: [MountTarget] = []
                 while true {
                     print(tr("请输入该主机上的共享文件夹名称 (例如 data，按回车结束): ",
@@ -1423,19 +1490,16 @@ func manageConfiguration() {
                     if c != "y" && c != "yes" { break }
                 }
 
-                let desc = selectedPeerName.isEmpty ?
-                    tr("Tailscale 异地互联 (外出降级通道)", "Tailscale Remote Fallback") :
-                    tr("Tailscale 异地互联 (\(selectedPeerName))", "Tailscale Remote (\(selectedPeerName))")
                 let newProfile = NetworkProfile(
-                    id: "tailscale_remote",
-                    description: desc,
+                    id: "remote_network",
+                    description: tr("远程互联 (\(selectedDisplayName))", "Remote Network (\(selectedDisplayName))"),
                     match: MatchRule(type: "probe_host", value: newHost, retryCount: 3, retryInterval: 1.0),
                     excludeGatewayIPs: ["172.20.10.1"],
                     preventSpotlightIndex: true,
                     targets: newTargets
                 )
                 config.profiles.append(newProfile)
-                print(tr("✓ 远程 Tailscale 策略已成功创建并加入配置。", "✓ Remote Tailscale profile created and added to configuration."))
+                print(tr("✓ 远程策略已成功创建并加入配置。", "✓ Remote profile created and added to configuration."))
             }
 
         case "5":
