@@ -378,6 +378,19 @@ func discoverActiveSMBMounts() -> [(url: String, path: String, host: String)] {
     return results
 }
 
+// 动态根据 SMB URL 推导默认本地挂载路径
+func deriveDefaultMountPath(from string: String) -> String {
+    var clean = string.trimmingCharacters(in: .whitespacesAndNewlines)
+    while clean.hasSuffix("/") { clean.removeLast() }
+    if let lastSlash = clean.lastIndex(of: "/") {
+        let name = String(clean[clean.index(after: lastSlash)...])
+        if !name.isEmpty {
+            return "/Volumes/\(name)"
+        }
+    }
+    return "/Volumes/share"
+}
+
 // 动态发现在线的 Tailscale 节点信息
 struct DiscoveredTailscalePeer {
     let name: String
@@ -386,9 +399,22 @@ struct DiscoveredTailscalePeer {
     let os: String
 }
 
+func findTailscaleBinary() -> String? {
+    let candidatePaths = [
+        "/usr/local/bin/tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    ]
+    for path in candidatePaths {
+        if FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+    }
+    return nil
+}
+
 func discoverTailscalePeers() -> [DiscoveredTailscalePeer] {
-    let binPath = "/usr/local/bin/tailscale"
-    guard FileManager.default.isExecutableFile(atPath: binPath) else { return [] }
+    guard let binPath = findTailscaleBinary() else { return [] }
 
     let task = Process()
     task.executableURL = URL(fileURLWithPath: binPath)
@@ -771,13 +797,21 @@ func runInitWizard() {
     var homeMAC = ""
     if let detectedMAC = getCurrentNetworkFingerprint() {
         print("  ✓ 自动探测到物理网关 MAC: \(detectedMAC)")
-        print("  按回车直接使用此指纹，或输入自定义 MAC 覆盖 [默认: \(detectedMAC)]: ", terminator: "")
-        let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        homeMAC = input.isEmpty ? detectedMAC : input
+        while homeMAC.isEmpty {
+            print("  按回车直接使用此指纹，或输入自定义 MAC 覆盖 [默认: \(detectedMAC)]: ", terminator: "")
+            let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            homeMAC = input.isEmpty ? detectedMAC : input
+            if homeMAC.isEmpty {
+                print("  ✗ 网关 MAC 不能为空，请重新输入。")
+            }
+        }
     } else {
         while homeMAC.isEmpty {
             print("  未能自动获取物理网关 MAC，请输入网关 MAC 地址: ", terminator: "")
             homeMAC = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if homeMAC.isEmpty {
+                print("  ✗ 网关 MAC 不能为空，请重新输入。")
+            }
         }
     }
 
@@ -789,7 +823,7 @@ func runInitWizard() {
     if !activeMounts.isEmpty {
         let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
         let selectedIndices = promptInteractiveCheckbox(
-            title: "发现当前系统中已挂载的 SMB 卷宗，请选择需要纳入自动挂载的目标：",
+            title: "发现当前系统中已挂载的 SMB 卷宗，请选择需要纳入自动挂载的目标 (直接按回车跳过)：",
             options: options
         )
         for idx in selectedIndices {
@@ -799,19 +833,18 @@ func runInitWizard() {
         }
     }
 
-    // 若未勾选任何已挂载项或系统当前未挂载 SMB，引导手动录入
+    // 若未勾选任何已挂载项，引导手动录入或直接跳过
     if homeTargets.isEmpty {
-        print("  当前未选择已挂载卷宗，转入手动输入：")
+        print("  当前未选择已挂载卷宗，可手动录入 (直接按回车可跳过此步骤)：")
         while true {
-            print("  请输入 SMB 地址 (例如 smb://server.local/share，按回车结束): ", terminator: "")
+            print("  请输入 SMB 地址 (例如 smb://server.local/share，按回车跳过): ", terminator: "")
             guard let urlStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !urlStr.isEmpty else {
                 break
             }
-            print("  请输入本地挂载路径 (例如 /Volumes/share): ", terminator: "")
-            guard let pathStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !pathStr.isEmpty else {
-                print("  ✗ 挂载路径不能为空。")
-                continue
-            }
+            let defaultPath = deriveDefaultMountPath(from: urlStr)
+            print("  请输入本地挂载路径 [默认: \(defaultPath)]: ", terminator: "")
+            let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let pathStr = pathInput.isEmpty ? defaultPath : pathInput
             homeTargets.append(MountTarget(url: urlStr, mountPath: pathStr))
             print("  ✓ 已添加: \(pathStr) (\(urlStr))")
             print("  继续添加另一个挂载目标？(y/n) [默认 n]: ", terminator: "")
@@ -822,9 +855,8 @@ func runInitWizard() {
         }
     }
 
-    guard !homeTargets.isEmpty else {
-        fputs("✗ 未配置任何挂载目标，初始化终止。\n", stderr)
-        exit(1)
+    if homeTargets.isEmpty {
+        print("  ✓ 局域网内不挂载任何共享，该网络仅作为外出判定排他基准。")
     }
 
     let homeProfile = NetworkProfile(
@@ -841,15 +873,13 @@ func runInitWizard() {
     var profiles: [NetworkProfile] = [homeProfile]
     let discoveredPeers = discoverTailscalePeers()
 
-    var addRemote = false
-    var selectedHost = ""
-    var selectedPeerName = ""
-
-    if !discoveredPeers.isEmpty {
+    if discoveredPeers.isEmpty {
+        print("  未检测到 Tailscale 正在运行或在线节点，已跳过远程策略配置。")
+        print("  （提示：后续连接 Tailscale 后，可运行 './auto_mount --config' 随时补齐远程策略）")
+    } else {
         var peerOptions = discoveredPeers.map {
             SelectionOption(title: $0.name, subtitle: "MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)")
         }
-        peerOptions.append(SelectionOption(title: "手动输入其他主机或 IP", subtitle: nil))
         peerOptions.append(SelectionOption(title: "跳过配置远程策略", subtitle: nil))
 
         let selected = promptInteractiveRadio(
@@ -860,8 +890,8 @@ func runInitWizard() {
 
         if selected < discoveredPeers.count {
             let peer = discoveredPeers[selected]
-            selectedPeerName = peer.name
-            addRemote = true
+            let selectedPeerName = peer.name
+            var selectedHost = ""
 
             // 选择连接地址格式：MagicDNS 域名 或 虚拟 IP
             var addrOptions: [SelectionOption] = []
@@ -882,66 +912,94 @@ func runInitWizard() {
             } else {
                 selectedHost = peer.ip
             }
-        } else if selected == discoveredPeers.count {
-            // 手动输入
-            addRemote = true
-            while selectedHost.isEmpty {
-                print("  请输入远程主机 IP 或 MagicDNS 域名 (例如 100.x.x.x 或 node.ts.net): ", terminator: "")
-                selectedHost = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            }
-        }
-    } else {
-        print("  是否需要配置远程策略（如 Tailscale / 虚拟局域网）？(y/n) [默认 n]: ", terminator: "")
-        let ans = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
-        if ans == "y" || ans == "yes" {
-            addRemote = true
-            while selectedHost.isEmpty {
-                print("  请输入远程主机 IP 或 MagicDNS 域名 (例如 100.x.x.x 或 node.ts.net): ", terminator: "")
-                selectedHost = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            }
-        }
-    }
 
-    if addRemote && !selectedHost.isEmpty {
-        print("\n  是否自动将已选的家庭局域网共享目录映射为该远程主机目标？(Y/n) [默认 Y]: ", terminator: "")
-        let autoMap = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y") != "n"
-        var remoteTargets: [MountTarget] = []
+            var remoteTargets: [MountTarget] = []
 
-        if autoMap {
-            for target in homeTargets {
-                // 提取共享目录路径 (如 /personal_folder)
-                var pathPart = target.url
-                if pathPart.hasPrefix("smb://") { pathPart = String(pathPart.dropFirst(6)) }
-                if let slashIdx = pathPart.firstIndex(of: "/") {
-                    pathPart = String(pathPart[slashIdx...])
-                } else {
-                    pathPart = "/" + pathPart
+            // 路径 1：若已配置家庭局域网目标，询问是否自动映射
+            var didAutoMap = false
+            if !homeTargets.isEmpty {
+                print("\n  是否自动将已选的家庭局域网共享目录映射为该远程主机目标？(Y/n) [默认 Y]: ", terminator: "")
+                let autoMap = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y") != "n"
+                if autoMap {
+                    didAutoMap = true
+                    for target in homeTargets {
+                        var pathPart = target.url
+                        if pathPart.hasPrefix("smb://") { pathPart = String(pathPart.dropFirst(6)) }
+                        if let slashIdx = pathPart.firstIndex(of: "/") {
+                            pathPart = String(pathPart[slashIdx...])
+                        } else {
+                            pathPart = "/" + pathPart
+                        }
+                        let remoteURL = "smb://\(selectedHost)\(pathPart)"
+                        remoteTargets.append(MountTarget(url: remoteURL, mountPath: target.mountPath))
+                        print("  ✓ 自动映射: \(remoteURL) -> \(target.mountPath)")
+                    }
                 }
-                let remoteURL = "smb://\(selectedHost)\(pathPart)"
-                remoteTargets.append(MountTarget(url: remoteURL, mountPath: target.mountPath))
-                print("  ✓ 自动映射: \(remoteURL) -> \(target.mountPath)")
+            }
+
+            // 路径 2：若未自动映射，检查当前系统是否有挂载属于该主机的 SMB 卷
+            if !didAutoMap {
+                let curActive = discoverActiveSMBMounts()
+                let matchingMounts = curActive.filter { mount in
+                    if !selectedHost.isEmpty && mount.url.contains(selectedHost) { return true }
+                    if let dns = peer.magicDNS, mount.url.contains(dns) { return true }
+                    if !peer.ip.isEmpty && mount.url.contains(peer.ip) { return true }
+                    return false
+                }
+
+                if !matchingMounts.isEmpty {
+                    let mOptions = matchingMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
+                    let picked = promptInteractiveCheckbox(title: "检测到当前已挂载该设备的共享卷宗，请勾选需要自动挂载的项 (直接回车跳过)：", options: mOptions)
+                    for pIdx in picked {
+                        let item = matchingMounts[pIdx]
+                        remoteTargets.append(MountTarget(url: item.url, mountPath: item.path))
+                        print("  ✓ 已添加: \(item.path) (\(item.url))")
+                    }
+                }
+
+                // 路径 3：若仍未选定，半自动录入共享名（或直接跳过）
+                if remoteTargets.isEmpty {
+                    print("  请输入远程主机上的共享文件夹名称 (直接按回车可跳过)：")
+                    while true {
+                        print("  请输入共享文件夹名称 (例如 data，按回车跳过): ", terminator: "")
+                        guard let shareName = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !shareName.isEmpty else {
+                            break
+                        }
+                        var cleanShare = shareName
+                        while cleanShare.hasPrefix("/") { cleanShare.removeFirst() }
+                        while cleanShare.hasSuffix("/") { cleanShare.removeLast() }
+                        let remoteURL = "smb://\(selectedHost)/\(cleanShare)"
+                        let defaultPath = "/Volumes/\(cleanShare)"
+                        print("  请输入本地挂载路径 [默认: \(defaultPath)]: ", terminator: "")
+                        let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        let pathStr = pathInput.isEmpty ? defaultPath : pathInput
+                        remoteTargets.append(MountTarget(url: remoteURL, mountPath: pathStr))
+                        print("  ✓ 已添加: \(pathStr) (\(remoteURL))")
+                        print("  继续添加另一个远程挂载目标？(y/n) [默认 n]: ", terminator: "")
+                        let cont = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
+                        if cont != "y" && cont != "yes" {
+                            break
+                        }
+                    }
+                }
+            }
+
+            if !remoteTargets.isEmpty {
+                let desc = selectedPeerName.isEmpty ? "Tailscale 异地互联 (外出降级通道)" : "Tailscale 异地互联 (\(selectedPeerName))"
+                let remoteProfile = NetworkProfile(
+                    id: "tailscale_remote",
+                    description: desc,
+                    match: MatchRule(type: "probe_host", value: selectedHost, retryCount: 3, retryInterval: 1.0),
+                    excludeGatewayIPs: ["172.20.10.1"],
+                    preventSpotlightIndex: true,
+                    targets: remoteTargets
+                )
+                profiles.append(remoteProfile)
+            } else {
+                print("  ✓ 未配置远程挂载目标，跳过远程策略。")
             }
         } else {
-            for target in homeTargets {
-                print("  请输入挂载点 \(target.mountPath) 对应的远程 SMB 地址: ", terminator: "")
-                let urlStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !urlStr.isEmpty {
-                    remoteTargets.append(MountTarget(url: urlStr, mountPath: target.mountPath))
-                }
-            }
-        }
-
-        if !remoteTargets.isEmpty {
-            let desc = selectedPeerName.isEmpty ? "Tailscale 异地互联 (外出降级通道)" : "Tailscale 异地互联 (\(selectedPeerName))"
-            let remoteProfile = NetworkProfile(
-                id: "tailscale_remote",
-                description: desc,
-                match: MatchRule(type: "probe_host", value: selectedHost, retryCount: 3, retryInterval: 1.0),
-                excludeGatewayIPs: ["172.20.10.1"],
-                preventSpotlightIndex: true,
-                targets: remoteTargets
-            )
-            profiles.append(remoteProfile)
+            print("  ✓ 已跳过配置远程策略。")
         }
     }
 
@@ -967,11 +1025,18 @@ func manageConfiguration() {
     while true {
         print("\n当前已配置策略：")
         for (i, p) in config.profiles.enumerated() {
-            print("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述")) - \(p.targets.count) 个挂载目标")
-            for t in p.targets {
-                print("      • \(t.mountPath) <- \(t.url)")
+            if p.targets.isEmpty {
+                print("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述")) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)")
+            } else {
+                print("  [\(i + 1)] \(p.id) (\(p.description ?? "无描述")) - \(p.targets.count) 个挂载目标")
+                for t in p.targets {
+                    print("      • \(t.mountPath) <- \(t.url)")
+                }
             }
         }
+
+        let hasTailscale = config.profiles.contains(where: { $0.id == "tailscale_remote" })
+        let tailscaleActionTitle = hasTailscale ? "重新检测/更新远程 Tailscale 目标" : "配置并添加远程 Tailscale 策略"
 
         print("""
 
@@ -979,7 +1044,7 @@ func manageConfiguration() {
           [1] 添加挂载目标 (支持从当前已挂载项中导入或手动输入)
           [2] 删除已有挂载目标
           [3] 重新检测/更新家庭网关 MAC
-          [4] 重新检测/更新远程 Tailscale 目标
+          [4] \(tailscaleActionTitle)
           [0] 保存配置并退出
         """)
         print("请输入选项 [0-4]: ", terminator: "")
@@ -1003,7 +1068,7 @@ func manageConfiguration() {
             var added = false
             if !activeMounts.isEmpty {
                 let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
-                let selected = promptInteractiveCheckbox(title: "发现当前系统中已挂载的 SMB 卷宗，请选择添加项：", options: options)
+                let selected = promptInteractiveCheckbox(title: "发现当前系统中已挂载的 SMB 卷宗，请选择添加项 (直接回车跳过)：", options: options)
                 for idx in selected {
                     let item = activeMounts[idx]
                     config.profiles[pIdx - 1].targets.append(MountTarget(url: item.url, mountPath: item.path))
@@ -1014,9 +1079,11 @@ func manageConfiguration() {
             if !added {
                 print("请输入 SMB 地址 (例如 smb://server.local/share): ", terminator: "")
                 let urlStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                print("请输入本地挂载路径 (例如 /Volumes/share): ", terminator: "")
-                let pathStr = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !urlStr.isEmpty && !pathStr.isEmpty {
+                if !urlStr.isEmpty {
+                    let defaultPath = deriveDefaultMountPath(from: urlStr)
+                    print("请输入本地挂载路径 [默认: \(defaultPath)]: ", terminator: "")
+                    let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let pathStr = pathInput.isEmpty ? defaultPath : pathInput
                     config.profiles[pIdx - 1].targets.append(MountTarget(url: urlStr, mountPath: pathStr))
                     print("  ✓ 已添加: \(pathStr) (\(urlStr))")
                 }
@@ -1056,34 +1123,91 @@ func manageConfiguration() {
                     let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     config.profiles[homeIdx].match.value = input.isEmpty ? curMAC : input
                     print("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)")
+                } else {
+                    print("未能自动获取当前物理网关 MAC，请输入自定义 MAC: ", terminator: "")
+                    let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !input.isEmpty {
+                        config.profiles[homeIdx].match.value = input
+                        print("✓ 家庭网关 MAC 已更新为: \(config.profiles[homeIdx].match.value)")
+                    }
                 }
             } else {
                 print("未找到 home_lan 策略。")
             }
 
         case "4":
-            // 更新远程 Tailscale 目标
+            // 更新或新建远程 Tailscale 目标
             let peers = discoverTailscalePeers()
-            if !peers.isEmpty {
-                var peerOptions = peers.map {
-                    SelectionOption(title: $0.name, subtitle: "MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)")
-                }
-                peerOptions.append(SelectionOption(title: "手动输入其他主机或 IP", subtitle: nil))
-                let sel = promptInteractiveRadio(title: "发现可用 Tailscale 设备，请选择：", options: peerOptions, defaultIndex: 0)
-                var newHost = ""
-                if sel < peers.count {
-                    let peer = peers[sel]
-                    newHost = peer.magicDNS ?? peer.ip
-                } else {
-                    print("请输入新的主机 IP 或域名: ", terminator: "")
-                    newHost = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                }
-                if !newHost.isEmpty {
-                    if let rIdx = config.profiles.firstIndex(where: { $0.id == "tailscale_remote" }) {
-                        config.profiles[rIdx].match.value = newHost
-                        print("✓ 远程探测目标已更新为: \(newHost)")
+            if peers.isEmpty {
+                print("未检测到 Tailscale 在线设备。请确认 Tailscale 已启动并登录。")
+                continue
+            }
+            var peerOptions = peers.map {
+                SelectionOption(title: $0.name, subtitle: "MagicDNS: \($0.magicDNS ?? "无"), IP: \($0.ip), OS: \($0.os)")
+            }
+            peerOptions.append(SelectionOption(title: "取消", subtitle: nil))
+            let sel = promptInteractiveRadio(title: "发现可用 Tailscale 设备，请选择：", options: peerOptions, defaultIndex: 0)
+            guard sel < peers.count else {
+                print("已取消操作。")
+                continue
+            }
+
+            let peer = peers[sel]
+            let selectedPeerName = peer.name
+            var newHost = ""
+
+            var addrOptions: [SelectionOption] = []
+            if let dns = peer.magicDNS {
+                addrOptions.append(SelectionOption(title: "MagicDNS 域名: \(dns)", subtitle: "推荐：IP 变动不失效，钥匙串凭据稳定"))
+            }
+            if !peer.ip.isEmpty {
+                addrOptions.append(SelectionOption(title: "Tailscale IP: \(peer.ip)", subtitle: "直连无 DNS 解析依赖"))
+            }
+            if !addrOptions.isEmpty {
+                let chosen = promptInteractiveRadio(title: "请选择连接方式：", options: addrOptions, defaultIndex: 0)
+                newHost = addrOptions[chosen].title.starts(with: "MagicDNS") ? (peer.magicDNS ?? peer.ip) : peer.ip
+            } else {
+                newHost = peer.ip
+            }
+
+            if let rIdx = config.profiles.firstIndex(where: { $0.id == "tailscale_remote" }) {
+                config.profiles[rIdx].match.value = newHost
+                print("✓ 远程探测目标已更新为: \(newHost)")
+            } else {
+                // 动态新建 tailscale_remote 策略
+                print("\n正在为新策略配置挂载目标：")
+                var newTargets: [MountTarget] = []
+                while true {
+                    print("请输入该主机上的共享文件夹名称 (例如 data，按回车结束): ", terminator: "")
+                    guard let sName = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !sName.isEmpty else {
+                        break
                     }
+                    var clean = sName
+                    while clean.hasPrefix("/") { clean.removeFirst() }
+                    while clean.hasSuffix("/") { clean.removeLast() }
+                    let rURL = "smb://\(newHost)/\(clean)"
+                    let dPath = "/Volumes/\(clean)"
+                    print("请输入本地挂载路径 [默认: \(dPath)]: ", terminator: "")
+                    let pIn = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let pStr = pIn.isEmpty ? dPath : pIn
+                    newTargets.append(MountTarget(url: rURL, mountPath: pStr))
+                    print("  ✓ 已添加: \(pStr) (\(rURL))")
+                    print("继续添加另一个目标？(y/n) [默认 n]: ", terminator: "")
+                    let c = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
+                    if c != "y" && c != "yes" { break }
                 }
+
+                let desc = selectedPeerName.isEmpty ? "Tailscale 异地互联 (外出降级通道)" : "Tailscale 异地互联 (\(selectedPeerName))"
+                let newProfile = NetworkProfile(
+                    id: "tailscale_remote",
+                    description: desc,
+                    match: MatchRule(type: "probe_host", value: newHost, retryCount: 3, retryInterval: 1.0),
+                    excludeGatewayIPs: ["172.20.10.1"],
+                    preventSpotlightIndex: true,
+                    targets: newTargets
+                )
+                config.profiles.append(newProfile)
+                print("✓ 远程 Tailscale 策略已成功创建并加入配置。")
             }
 
         case "0":

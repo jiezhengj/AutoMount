@@ -44,17 +44,17 @@ Connect to your home network and run the initialization wizard:
 
 The wizard guides you through:
 
-1. **Automatic Gateway MAC Capture**: Detects and displays the physical router hardware fingerprint.
-2. **Active SMB Mount Discovery**: Scans currently mounted SMB volumes in the kernel and presents an ANSI checkbox menu for multi-selection via Space and arrow keys; if no active mounts are detected, prompts for manual entry.
-3. **Tailscale Peer Discovery**: Queries `tailscale status --json` to list active nodes; upon selection, prompts to automatically map local share paths to the remote node (recommending stable MagicDNS domains over raw IPs).
-4. **Configuration Generation**: Writes the structured `auto_mount.plist` with zero manual configuration syntax required.
+1. **Automatic Gateway MAC Capture**: Detects and displays the physical router hardware fingerprint, with support for custom MAC overrides (cannot be empty, serving as the network exclusion baseline).
+2. **Active SMB Mount Discovery**: Scans currently mounted SMB volumes in the kernel and presents an ANSI checkbox menu for multi-selection via Space and arrow keys; **supports pressing Enter directly to skip** (mounting zero volumes in this LAN, using it solely as an exclusion condition for remote access); for manual entry, local mount points auto-derive from share names and accept default on Enter (e.g., `/Volumes/<share>`).
+3. **Tailscale Peer Discovery**: Queries `tailscale status --json` to list active nodes; gracefully skips if no active peers are found; upon device selection, supports auto-mapping from local shares, checkbox selection of active mounts, or entering a share folder name with auto-constructed URL and mount path.
+4. **Configuration Generation**: Writes the structured `auto_mount.plist` with zero manual syntax required.
 
 Terminal Checkbox Controls:
 - `↑` / `k`: Move cursor up
 - `↓` / `j`: Move cursor down
 - `Space`: Toggle item selection (`[●]` / `[ ]`)
 - `a`: Toggle select all / unselect all
-- `Enter`: Confirm selection
+- `Enter`: Confirm selection (or press Enter to skip)
 - `Ctrl + C`: Safe exit restoring terminal mode
 
 ## Daily Configuration Management (`--config`)
@@ -68,14 +68,20 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 The interactive management menu displays:
 
 ```
-Auto Mount - Configuration Management
-=====================================
-  [1] View current profiles and targets
-  [2] Add mount target (dynamic scan or manual entry)
-  [3] Remove mount target
-  [4] Update home gateway MAC
-  [5] Update remote Tailscale target
-  [0] Save and exit
+Auto Mount Tool - Daily Configuration Management (v2.0)
+======================================================
+
+Currently configured profiles:
+  [1] home_lan (Home LAN Direct High-Speed) - 0 mount targets (Exclusion Gatekeeper, no local mounts)
+  [2] tailscale_remote (Tailscale Remote Peer) - 1 mount target
+      • /Volumes/personal_folder <- smb://dx4600.xxx.ts.net/personal_folder
+
+Please select an action:
+  [1] Add mount target (Dynamic kernel scan or manual entry with auto-derived path)
+  [2] Remove mount target
+  [3] Re-detect/Update home gateway MAC
+  [4] Re-detect/Update remote Tailscale target (or Configure and Add if not present)
+  [0] Save configuration and exit
 ```
 
 Upon saving, changes are committed to the local `auto_mount.plist` and automatically synced to the LaunchAgent deployment directory for immediate effect.

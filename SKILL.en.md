@@ -28,7 +28,9 @@ flowchart TD
     HotspotFilter -- Yes --> ExitSilence["Silent Exit (Preserve Cellular Data)"]
     HotspotFilter -- No --> RouteMatch{"Evaluate Network Profiles"}
     
-    RouteMatch -- "LAN Gateway MAC Matched" --> CheckMount["MNT_NOWAIT Kernel Mount Table Scan"]
+    RouteMatch -- "LAN Gateway MAC Matched" --> HasTargets{"Has Mount Targets?"}
+    HasTargets -- "No (Gatekeeper)" --> Done["Block Remaining Profiles, Silent Exit"]
+    HasTargets -- "Yes" --> CheckMount["MNT_NOWAIT Kernel Mount Table Scan"]
     RouteMatch -- "Remote Node Reachable" --> ProbeRetry["Tailscale Handshake Retry Window"]
     ProbeRetry --> CheckMount
     RouteMatch -- "No Rule Matched" --> ExitSilence
@@ -42,6 +44,11 @@ flowchart TD
     NetFSMount --> IndexProtect["Inject .metadata_never_index\nRun mdutil -i off"]
     IndexProtect --> Done
 ```
+
+## Network Exclusion Gatekeeper Mechanism
+
+* **Zero-Target Profile Truncation**: When a higher-priority network profile (such as `home_lan`) configures its `targets` array as empty `[]`, it functions as an exclusion gatekeeper.
+* **Deterministic Route Interception**: When the physical gateway MAC matches this profile, the engine finishes processing 0 mount actions and immediately truncates the evaluation chain. This cleanly prevents lower-priority remote profiles (e.g., Tailscale) from triggering while physically located in that network. Once the device leaves the physical network, the MAC fingerprint mismatches and evaluation gracefully falls back to the remote policy.
 
 ## Mount API Selection
 

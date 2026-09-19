@@ -28,7 +28,9 @@ flowchart TD
     HotspotFilter -- 是 --> ExitSilence["静默退出 (保护蜂窝流量)"]
     HotspotFilter -- 否 --> RouteMatch{"匹配网络策略 (Profiles)"}
     
-    RouteMatch -- "局域网 MAC 吻合" --> CheckMount["MNT_NOWAIT 内核挂载表检查"]
+    RouteMatch -- "局域网 MAC 吻合" --> HasTargets{"是否包含挂载目标?"}
+    HasTargets -- "否 (排他门牌)" --> Done["阻断后续策略，静默退出"]
+    HasTargets -- "是" --> CheckMount["MNT_NOWAIT 内核挂载表检查"]
     RouteMatch -- "异地节点可达" --> ProbeRetry["Tailscale 握手重试窗口"]
     ProbeRetry --> CheckMount
     RouteMatch -- "无规则匹配" --> ExitSilence
@@ -42,6 +44,11 @@ flowchart TD
     NetFSMount --> IndexProtect["注入 .metadata_never_index\n执行 mdutil -i off"]
     IndexProtect --> Done
 ```
+
+## 网络排他门牌机制 (Exclusion Gatekeeper)
+
+* **空目标截断设计**：当策略路由配置中某个高优先级策略（如 `home_lan`）的 `targets` 声明为空数组 `[]` 时，该策略即作为网络排他门牌运作。
+* **确定性路由截断**：一旦物理网关 MAC 命中该策略，引擎完成 0 个挂载任务后立即终止后续策略评估，从架构上彻底阻断低优先级异地策略（如 Tailscale）被误触发；当设备物理离开该网络时，网关 MAC 指纹失效，流量与挂载逻辑自然降级流转至后续异地策略。
 
 ## 挂载 API 的确定性选型
 
