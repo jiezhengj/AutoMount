@@ -75,9 +75,27 @@ int main() {
 - ✅ 不需要密码配置文件
 - ✅ 适合自动化场景
 
-**编译：**
+**Swift 语言原生调用范式：**
+```swift
+import Foundation
+import NetFS
+
+func silentMount(urlString: String) -> Bool {
+    guard let url = CFURLCreateWithString(kCFAllocatorDefault, urlString as CFString, nil) else { return false }
+    var mountPoints: Unmanaged<CFArray>?
+    let status = NetFSMountURLSync(url, nil, nil, nil, nil, nil, &mountPoints)
+    if let mp = mountPoints { mp.release() }
+    return status == noErr
+}
+```
+
+**编译方式（C 或 Swift 均可，Swift 无需编译直接通过 `swift` 命令运行）：**
 ```bash
+# C 编译
 clang mount_nas.c -framework CoreFoundation -framework NetFS -o mount_nas
+
+# Swift 原生运行（推荐）
+swift auto_mount.swift
 ```
 
 ## 自动化挂载需求清单
@@ -231,7 +249,7 @@ if [ -n "$SERVER_IP" ]; then
 fi
 ```
 
-**在 auto_mount.m 中的改进方案：**
+**在 AutoMount 工具中的改进方案：**
 ```objc
 // 原始：直接 ping 主机名（mDNS 失败则整体失败）
 ping -c 1 -t 2 NAS_HOSTNAME._smb._tcp.local
@@ -297,11 +315,11 @@ void saveConfig(NSString *fingerprint) {
 - 支持多个挂载目标
 - LaunchAgent 开机自启 + 网络变化触发
 
-## 编译
+## 运行与编译
 
-重新 clone 后需要重新编译：
+可以直接使用原生 Swift 运行（免编译开箱即用）：
 
 ```bash
 cd ~/Documents/Project/projects/AutoMount
-clang auto_mount.m -framework SystemConfiguration -framework Foundation -framework NetFS -fobjc-arc -o auto_mount
+./auto_mount
 ```

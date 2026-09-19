@@ -1,14 +1,12 @@
-# Auto Mount Tool
+# 语言导航 / Language Navigation
 
-**Select your language / 选择语言**
-
-| Language | README | Agent Skill Docs |
-|----------|--------|------------------|
-| English | [README.en.md](./README.en.md) | [SKILL.en.md](./SKILL.en.md) |
+| 语言 / Language | 说明文档 / Documentation | 技能文档 / Skill Specification |
+| :--- | :--- | :--- |
 | 中文 | [README.zh.md](./README.zh.md) | [SKILL.zh.md](./SKILL.zh.md) |
+| English | [README.en.md](./README.en.md) | [SKILL.en.md](./SKILL.en.md) |
 
----
+# 简介 / Overview
 
-Silent auto-mount SMB shares on macOS when connected to designated WiFi. Zero dependencies, no Finder popups, LaunchAgent ready.
+macOS 原生轻量级网络存储（SMB）自动化挂载工具。基于物理网关 MAC 指纹识别与 Tailscale 异地互联，提供完全静默、免密码、断网自动超时熔断清理的稳定挂载体验。
 
-macOS 自动挂载 NAS 工具。连接指定 WiFi 时静默挂载 SMB 共享，无弹窗，零依赖，支持开机自启。
+A native, lightweight network storage (SMB) automation tool for macOS. Powered by physical gateway MAC fingerprinting and Tailscale remote interconnection, providing silent, password-free, and timeout-fused volume mounting.

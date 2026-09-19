@@ -75,9 +75,27 @@ int main() {
 - ✅ No password config file needed
 - ✅ Suitable for automation scenarios
 
-**Compilation:**
+**Swift Native Calling Paradigm:**
+```swift
+import Foundation
+import NetFS
+
+func silentMount(urlString: String) -> Bool {
+    guard let url = CFURLCreateWithString(kCFAllocatorDefault, urlString as CFString, nil) else { return false }
+    var mountPoints: Unmanaged<CFArray>?
+    let status = NetFSMountURLSync(url, nil, nil, nil, nil, nil, &mountPoints)
+    if let mp = mountPoints { mp.release() }
+    return status == noErr
+}
+```
+
+**Execution / Compilation (Supports C and native Swift):**
 ```bash
+# C Compilation
 clang mount_nas.c -framework CoreFoundation -framework NetFS -o mount_nas
+
+# Swift Native Run (Recommended)
+swift auto_mount.swift
 ```
 
 ## Automation Mount Requirements Checklist
@@ -231,7 +249,7 @@ if [ -n "$SERVER_IP" ]; then
 fi
 ```
 
-**Improved approach in auto_mount.m:**
+**Improved approach in AutoMount:**
 ```objc
 // Original: Direct ping hostname (fails entirely if mDNS fails)
 ping -c 1 -t 2 NAS_HOSTNAME._smb._tcp.local
@@ -297,11 +315,11 @@ Core features:
 - Supports multiple mount targets
 - LaunchAgent boot auto-start + network change trigger
 
-## Compilation
+## Running & Compilation
 
-After re-cloning, recompile is required:
+Can be run directly via native Swift (no compilation required):
 
 ```bash
 cd ~/Documents/Project/projects/AutoMount
-clang auto_mount.m -framework SystemConfiguration -framework Foundation -framework NetFS -fobjc-arc -o auto_mount
+./auto_mount
 ```
