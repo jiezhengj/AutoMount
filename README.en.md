@@ -79,25 +79,25 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 The interactive management menu displays:
 
 ```text
-Auto Mount Tool - Daily Configuration Management (v2.4.2)
-===================================================
+Auto Mount Tool - Daily Configuration Management (v2.5.0)
+======================================================
 
-Configured Profiles:
-  [1] local_lan (Local LAN Direct)
+Currently configured profile pipeline (Evaluated top-to-bottom, first match wins):
+  [1] [LAN] local_lan (Local LAN Direct) - 0 mount targets (Exclusion Gatekeeper, no local mounts)
+  [2] [Remote] remote_network (Remote Network (dx4600)) - 2 mount targets
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-Software Version: v2.4.2 | Auto-Update Channel: off (Disabled, manual update)
+Software Version: v2.5.0 | Auto-Update Channel: auto (Silent background auto-update)
 Background Daemon Status: Active & running (gui/501/com.user.auto-mount)
 
-Select an action:
-  [1] Add mount target (import from active mounts or manual entry)
-  [2] Remove existing mount target
-  [3] Re-detect / update local gateway MAC
-  [4] Re-detect / update remote host (Tailscale / Domain / IP)
-  [5] Daemon management (deploy/reload, view details, uninstall)
-  [6] Auto-update channel & maintenance (set policy, check & upgrade)
-  [0] Exit configuration management
+Select module:
+  [●] 📁 Mount Target Management (Batch import active mounts, manual add, batch delete)
+  [ ] 🚦 Network Profile Pipeline (Adjust priority pipeline, create profile, edit rules, delete)
+  [ ] ⚙️ Background Daemon Management (Deploy LaunchAgent, view runtime status, uninstall)
+  [ ] 🔄 Auto-Update Settings (Switch update channel, check & upgrade now)
+  [ ] 🚪 Exit Configuration Management
+(↑/↓ Move cursor, Enter confirm selection, Esc cancel)
 ```
 
 All configuration changes are immediately committed atomically to `auto_mount.plist` and synchronized to the LaunchAgent runtime directory upon each action for immediate effect without requiring explicit saving.
@@ -135,7 +135,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.4.2</string>
+    <string>2.5.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -221,7 +221,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.4.2`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
+| `version` | String | Schema specification version, strictly aligned with software version (e.g., `2.5.0`). AutoMount employs in-place schema auto-migration upon loading; outdated config files are seamlessly upgraded and persisted to match the current release without user intervention. |
 | `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
 | `last_update_check_timestamp` | Real | Unix timestamp of the last update check, enforcing the 24-hour cooldown window. |
 | `last_notified_version` | String | Latest remote release tag that was notified, ensuring at most one notification per new version. |
