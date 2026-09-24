@@ -362,7 +362,7 @@ flowchart TD
 
 ## 1. Design Philosophy: Eliminating Dual-Track Versioning
 
-Traditional configuration-driven systems often maintain dual-track versions: a software release version (e.g., `2.5.0`) and a configuration format version (e.g., `2.0` / `2.1`). Over ongoing feature iterations, this split introduces substantial engineering and operational overhead:
+Traditional configuration-driven systems often maintain dual-track versions: a software release version (e.g., `2.6.0`) and a configuration format version (e.g., `2.0` / `2.1`). Over ongoing feature iterations, this split introduces substantial engineering and operational overhead:
 * **Developer Cognitive Divergence**: The codebase is forced to sustain legacy parsing forks and branching logic (e.g., maintaining redundant structs such as `ConfigV1` and `ConfigV2`), unnecessarily bloating the compilation unit;
 * **User Uncertainty**: When users observe that their software binary is updated while the configuration file continues to display an outdated format tag, it fosters doubt regarding feature compatibility;
 * **Silent Schema Drift**: Manual alterations to the version string by users risk triggering erroneous legacy fallback logic, resulting in missing properties or decode failures.
@@ -392,4 +392,31 @@ flowchart TD
 * **Business Payload Immutability**: The migration routine operates strictly on schema evolution (injecting newly supported configuration keys and safe defaults). All existing gateway hardware fingerprints, SMB mount target endpoints, and bypass gateways remain untouched;
 * **Atomic Persistence**: Modified configuration files are written using `Data.write(to:options: .atomic)` with `0o644` POSIX permissions, preventing corrupted states during unexpected system sleep or power loss;
 * **Runtime Synchronization**: Once migration occurs, the newly formatted payload is automatically synchronized to `~/Library/Application Support/AutoMount/auto_mount.plist`, ensuring continuous schema harmony whether executed in background launchd sessions or interactive terminal invocations.
+
+## 4. Bidirectional Automatic Alignment & Eager Migration Architecture
+
+Under macOS LaunchAgent architecture, two copies typically coexist on user systems: the working repository directory (Directory A) and the system daemon deployment runtime (Directory B: `~/Library/Application Support/AutoMount`).
+
+To prevent cross-instance code drift and delayed schema migration, AutoMount implements a fully closed-loop bidirectional self-healing pipeline:
+
+```mermaid
+flowchart TD
+    subgraph UpdateFlow["Forward Self-Update (--update / Background Silent Channel)"]
+        Download["Download latest source & run AST syntax pre-check"] --> WriteSwift["Write auto_mount.swift source"]
+        WriteSwift --> Recompile["Automatically recompile binary via swiftc -O (if present)"]
+        Recompile --> EagerMigrate["Spawn new process with --migrate-only\nEagerly migrate and persist auto_mount.plist"]
+        EagerMigrate --> ReloadDaemon["launchctl bootout / bootstrap hot daemon reload"]
+    end
+
+    subgraph ReverseFlow["Reverse Workspace Self-Healing (Workspace Entry Point)"]
+        WorkspaceLaunch["User invokes command in workspace (./auto_mount ...)"] --> Sniff["Sniff daemon version installedVersion vs autoMountVersion"]
+        Sniff -- "installedVersion > currentVersion" --> GitSafe{"git status --porcelain clean?"}
+        GitSafe -- "Uncommitted modifications" --> PromptUser["Prompt user confirmation; default to N to protect code"]
+        GitSafe -- "Clean repo / Confirmed" --> PullCode["Sync auto_mount.swift & config from daemon runtime"]
+        PullCode --> RecompileLocal["Automatically recompile workspace auto_mount binary"]
+        PullCode --> MigrateLocal["Eagerly migrate workspace auto_mount.plist"]
+        MigrateLocal --> ExecvRestart["POSIX execv process image hot-replacement\nSeamlessly resumes original arguments under latest build"]
+        Sniff -- "In sync or workspace ahead" --> NormalExec["Proceed to standard command dispatch & policy evaluation"]
+    end
+```
 

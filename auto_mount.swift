@@ -99,7 +99,7 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.5.0"
+let autoMountVersion = "2.6.0"
 let githubRepo = "jiezhengj/AutoMount"
 
 struct MatchRule: Codable {
@@ -2407,8 +2407,19 @@ func performSelfUpdate(newVersion: String, newContent: String, isSilent: Bool) -
         }
     }
 
+    // 2.1 若守护服务运行目录存在编译后的二进制 auto_mount，立即重新编译
+    let installedBinary = installDir.appendingPathComponent("auto_mount")
+    if FileManager.default.fileExists(atPath: installedBinary.path) {
+        let compileRes = runCommand(executable: "/usr/bin/swiftc", arguments: ["-O", targetInstalledSwift.path, "-o", installedBinary.path])
+        if compileRes.status == 0 {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedBinary.path)
+            updatedPaths.append(installedBinary.path)
+        }
+    }
+
     // 3. 若当前处于工程工作区且存在 auto_mount.swift，一并同步工作区
     let localSwift = currentAppDir.appendingPathComponent("auto_mount.swift")
+    let localBinary = currentAppDir.appendingPathComponent("auto_mount")
     if FileManager.default.fileExists(atPath: localSwift.path) && localSwift.path != targetInstalledSwift.path {
         do {
             try newContent.write(to: localSwift, atomically: true, encoding: .utf8)
@@ -2417,9 +2428,39 @@ func performSelfUpdate(newVersion: String, newContent: String, isSilent: Bool) -
         } catch {
             // 忽略非工作区权限写入限制
         }
+
+        // 3.1 若工作区存在编译后的二进制 auto_mount，立即重新编译
+        if FileManager.default.fileExists(atPath: localBinary.path) {
+            let compileRes = runCommand(executable: "/usr/bin/swiftc", arguments: ["-O", localSwift.path, "-o", localBinary.path])
+            if compileRes.status == 0 {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localBinary.path)
+                updatedPaths.append(localBinary.path)
+            }
+        }
     }
 
-    // 4. 重载 LaunchAgent 守护服务
+    // 4. 即时联动执行配置文件升舱 (Eager Config Migration)
+    let runnerInstalled = FileManager.default.fileExists(atPath: installedBinary.path) ? installedBinary.path : targetInstalledSwift.path
+    if FileManager.default.fileExists(atPath: runnerInstalled) {
+        _ = runCommand(executable: runnerInstalled, arguments: ["--migrate-only"])
+        let installedPlist = installDir.appendingPathComponent("auto_mount.plist")
+        if FileManager.default.fileExists(atPath: installedPlist.path) {
+            updatedPaths.append(installedPlist.path + tr(" (已即时升舱)", " (Eagerly migrated)"))
+        }
+    }
+
+    if localSwift.path != targetInstalledSwift.path {
+        let runnerLocal = FileManager.default.fileExists(atPath: localBinary.path) ? localBinary.path : localSwift.path
+        if FileManager.default.fileExists(atPath: runnerLocal) {
+            _ = runCommand(executable: runnerLocal, arguments: ["--migrate-only"])
+            let localPlist = currentAppDir.appendingPathComponent("auto_mount.plist")
+            if FileManager.default.fileExists(atPath: localPlist.path) {
+                updatedPaths.append(localPlist.path + tr(" (已即时升舱)", " (Eagerly migrated)"))
+            }
+        }
+    }
+
+    // 5. 重载 LaunchAgent 守护服务
     let uid = getuid()
     let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
     let plistURL = getLaunchAgentPlistURL()
@@ -2576,6 +2617,85 @@ func checkAndSyncInstalledIfOutdated(currentVersion: String, installedVersion: S
     }
 }
 
+func restartCurrentProcess() -> Never {
+    let args = CommandLine.arguments
+    let exeURL = URL(fileURLWithPath: args[0]).resolvingSymlinksInPath()
+    var cArgs: [UnsafeMutablePointer<CChar>?] = args.map { str in
+        str.withCString { strdup($0) }
+    }
+    cArgs.append(nil)
+    _ = exeURL.path.withCString { exePathCStr in
+        execv(exePathCStr, cArgs)
+    }
+    exit(1)
+}
+
+func checkAndSyncWorkspaceFromInstalledDaemonIfNeeded() {
+    let currentAppDir = getAppDir()
+    let installDir = getInstalledDir()
+    guard currentAppDir.path != installDir.path else { return }
+
+    guard let installedVersion = getInstalledAppVersion() else { return }
+    guard isNewerVersion(installedVersion, than: autoMountVersion) else { return }
+
+    // Check git cleanliness of auto_mount.swift if inside a git repository
+    let swiftPath = currentAppDir.appendingPathComponent("auto_mount.swift").path
+    if FileManager.default.fileExists(atPath: swiftPath) {
+        let gitCheck = runCommand(executable: "/usr/bin/git", arguments: ["-C", currentAppDir.path, "status", "--porcelain", "auto_mount.swift"])
+        if gitCheck.status == 0 && !gitCheck.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Local modifications exist! Prompt user for safety
+            print(tr("\n💡 检测到后台守护服务版本 (v\(installedVersion)) 高于当前工作区 (v\(autoMountVersion))，但本地 auto_mount.swift 存在未提交的代码修改。",
+                     "\n💡 Daemon service version (v\(installedVersion)) is newer than workspace (v\(autoMountVersion)), but local auto_mount.swift has uncommitted modifications."))
+            print(tr("是否确认放弃本地修改并同步至最新版本？(y/N) [默认 N]: ",
+                     "Discard local changes and sync to latest version? (y/N) [Default N]: "), terminator: "")
+            let answer = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n")
+            if answer != "y" && answer != "yes" {
+                print(tr("已跳过工作区更新，继续使用当前版本执行。\n", "Skipped workspace update, continuing with current version.\n"))
+                return
+            }
+        }
+    }
+
+    let installedSwiftURL = installDir.appendingPathComponent("auto_mount.swift")
+    let localSwiftURL = currentAppDir.appendingPathComponent("auto_mount.swift")
+    guard FileManager.default.fileExists(atPath: installedSwiftURL.path) else { return }
+
+    do {
+        if FileManager.default.fileExists(atPath: localSwiftURL.path) {
+            try? FileManager.default.removeItem(at: localSwiftURL)
+        }
+        try FileManager.default.copyItem(at: installedSwiftURL, to: localSwiftURL)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localSwiftURL.path)
+    } catch {
+        fputs("✗ Failed to sync auto_mount.swift from daemon: \(error.localizedDescription)\n", stderr)
+        return
+    }
+
+    // If local binary exists, recompile it
+    let localBinaryURL = currentAppDir.appendingPathComponent("auto_mount")
+    if FileManager.default.fileExists(atPath: localBinaryURL.path) {
+        let compileRes = runCommand(executable: "/usr/bin/swiftc", arguments: ["-O", localSwiftURL.path, "-o", localBinaryURL.path])
+        if compileRes.status == 0 {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localBinaryURL.path)
+        }
+    }
+
+    // Sync or migrate config for workspace
+    let installedPlistURL = installDir.appendingPathComponent("auto_mount.plist")
+    let localPlistURL = currentAppDir.appendingPathComponent("auto_mount.plist")
+    if !FileManager.default.fileExists(atPath: localPlistURL.path) && FileManager.default.fileExists(atPath: installedPlistURL.path) {
+        try? FileManager.default.copyItem(at: installedPlistURL, to: localPlistURL)
+    }
+
+    let runner = FileManager.default.fileExists(atPath: localBinaryURL.path) ? localBinaryURL.path : localSwiftURL.path
+    _ = runCommand(executable: runner, arguments: ["--migrate-only"])
+
+    print(tr("✓ 检测到后台守护服务已先一步升级至 v\(installedVersion)，已自动同步工作区，正在热重启...\n",
+             "✓ Daemon service was upgraded to v\(installedVersion), workspace synchronized, restarting...\n"))
+
+    restartCurrentProcess()
+}
+
 func handleManualUpdateCommand() {
     print(tr("""
     Auto Mount Tool - 软件版本检测与自升级
@@ -2708,6 +2828,31 @@ func printUsage() {
 func main() {
     let args = CommandLine.arguments
 
+    // 内部参数：执行即时配置升舱与落盘
+    if args.count > 1 && args[1] == "--migrate-only" {
+        if let config = loadConfig() {
+            saveConfig(config)
+            writeLog("Eager migration executed for version \(autoMountVersion)")
+        }
+        exit(0)
+    }
+
+    // 信息类指令跳过自检
+    if args.count > 1 {
+        let first = args[1]
+        if first == "--version" || first == "-v" {
+            print(autoMountVersion)
+            exit(0)
+        }
+        if first == "--help" || first == "-h" {
+            printUsage()
+            exit(0)
+        }
+    }
+
+    // 工作区自愈嗅探：若发现后台守护服务先一步升级，自动反哺工作区并热重启
+    checkAndSyncWorkspaceFromInstalledDaemonIfNeeded()
+
     if args.count > 1 {
         let arg = args[1]
         switch arg {
@@ -2728,12 +2873,6 @@ func main() {
             exit(0)
         case "--update":
             handleManualUpdateCommand()
-            exit(0)
-        case "--version", "-v":
-            print(autoMountVersion)
-            exit(0)
-        case "--help", "-h":
-            printUsage()
             exit(0)
         default:
             fputs(tr("✗ 未知参数: '\(arg)'\n\n", "✗ Unknown option: '\(arg)'\n\n"), stderr)

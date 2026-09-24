@@ -79,7 +79,7 @@ swift auto_mount.swift
 终端将弹出交互式一站式控制中心：
 
 ```text
-Auto Mount Tool - 日常配置管理 (v2.5.0)
+Auto Mount Tool - 日常配置管理 (v2.6.0)
 ====================================
 
 当前已配置策略流水线 (自顶向下顺序评估，首次命中即执行)：
@@ -88,7 +88,7 @@ Auto Mount Tool - 日常配置管理 (v2.5.0)
       • /Volumes/finalhome <- smb://dx4600.tail5efc91.ts.net/finalhome
       • /Volumes/personal_folder <- smb://dx4600.tail5efc91.ts.net/personal_folder
 
-软件版本: v2.5.0 | 自动更新信道: auto (后台静默自动升级)
+软件版本: v2.6.0 | 自动更新信道: auto (后台静默自动升级)
 后台守护服务状态: 已注册运行 (gui/501/com.user.auto-mount)
 
 请选择操作模块：
@@ -135,7 +135,7 @@ Auto Mount Tool - 日常配置管理 (v2.5.0)
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.5.0</string>
+    <string>2.6.0</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -221,7 +221,7 @@ Auto Mount Tool - 日常配置管理 (v2.5.0)
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.5.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
+| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.6.0`）。程序读取配置时具备原地无损自动升舱能力，若旧版本落后会自动平滑升级为当前版本并写回，无需人工维护。 |
 | `update_channel` | String | 软件自动更新策略，可选值为 `off`（关闭，默认）、`notify`（通知提醒）、`auto`（自动静默热升级）。 |
 | `last_update_check_timestamp` | Real | 上次执行更新检查的 Unix 时间戳，用于 24 小时冷却时间窗口管理。 |
 | `last_notified_version` | String | 已发送通知的最新远端版本号，确保同一版本最多仅提醒 1 次防打扰。 |
@@ -262,11 +262,14 @@ Auto Mount Tool - 日常配置管理 (v2.5.0)
 ./auto_mount --update
 ```
 
-升级流程具备四层安全保障机制：
+升级流程具备五层闭环安全保障机制：
 1. **语义化版本比对**：从 GitHub 官方 Release 元数据解析最新版本并进行 SemVer 对比。若远端无新版本或尚未发布正式 Release，友好提示无需更新。
-2. **多路径副本感知与后台一键同步**：`--update` 运行时同时检查当前运行程序与 `~/Library/Application Support/AutoMount` 后台守护服务的版本。如果工作区已升级但后台服务滞后，程序会主动识别并提示一键将后台守护服务同步更新至最新版本，杜绝版本脱节。
-3. **本地语法分析断路器**：下载的最新源码会在系统临时目录中调用 `/usr/bin/swiftc -parse` 进行完整的抽象语法树预检。若语法校验未通过，更新立即自动终止，绝不损坏当前正常工作的守护服务。
-4. **双重运行环境同步与热重载**：升级成功后，不仅同步更新工作区源码，同时更新 `~/Library/Application Support/AutoMount` 部署目录下的核心程序，并自动执行 `launchctl bootout / bootstrap` 完成服务热重载，即刻无缝生效。
+2. **双向全自动版本对齐与工作区自愈**：
+   - **正向同步**：工作区执行 `--update` 时，不仅更新当前源码与二进制，同时无缝推送到后台守护服务目录并重载；
+   - **反向自愈**：当后台守护服务先一步通过自动更新信道升级后，工作区运行任何指令（如 `--config`、`--status`）时会自动嗅探到后台版本领先，自动反哺工作区源码、重新编译二进制、即时升舱配置，并通过 POSIX `execv` 无缝热重启当前命令（同时带 Git 脏工作区防覆盖安全保护）。
+3. **即时联动升舱与自动重编译**：升级完成后，自动检测并重编译二进制 `auto_mount`，并立即拉起新进程对工作区与后台两处 `auto_mount.plist` 执行即时无损升舱落盘，彻底消除配置文件延迟升舱状态。
+4. **本地语法分析断路器**：下载的最新源码会在系统临时目录中调用 `/usr/bin/swiftc -parse` 进行完整的抽象语法树预检。若语法校验未通过，更新立即自动终止，绝不损坏当前正常工作的守护服务。
+5. **守护服务自动热重载**：升级成功后，自动执行 `launchctl bootout / bootstrap` 完成后台服务热重载，即刻无缝生效。
 
 ## 查看软件版本 (`--version`, `-v`)
 

@@ -362,7 +362,7 @@ flowchart TD
 
 ## 1. 废弃多轨双重版本体系的设计哲学
 
-在传统的配置驱动工具中，往往存在“软件版本号（如 `2.5.0`）”与“配置文件格式版本号（如 `2.0` / `2.1`）”并存的双轨制。随着业务特性的持续迭代，双轨体系会迅速带来高昂的心智与工程负债：
+在传统的配置驱动工具中，往往存在“软件版本号（如 `2.6.0`）”与“配置文件格式版本号（如 `2.0` / `2.1`）”并存的双轨制。随着业务特性的持续迭代，双轨体系会迅速带来高昂的心智与工程负债：
 * **开发者认知割裂**：代码中必须长期维护兼容旧版本配置的数据解析分流逻辑（例如同时维护多套历史结构体），增加了编译单元与控制流的复杂度；
 * **用户运维困惑**：当用户看到软件已更新至新版本，但配置文件仍标注着老旧版本号时，往往产生兼容性疑虑或误认为升级未完全生效；
 * **升级断层风险**：用户若手动修改了配置文件版本，可能导致向下兼容逻辑误判，进而造成字段缺失或解析异常。
@@ -392,4 +392,31 @@ flowchart TD
 * **业务数据严格不可变**：升舱算法仅针对结构规范的演进（如新增功能开关、默认策略注入），已有的所有网关物理指纹、挂载点映射、排除网关 IP 等用户既有数据受到不可变保护，绝不被丢弃或重写；
 * **原子写回与权限固化**：修改后的配置通过 `Data.write(to:options: .atomic)` 原子写入，配合 `chmod 644` 权限校验，杜绝掉电、宕机引发的配置文件损坏；
 * **双环境无缝协同**：升舱动作触发后，不仅更新当前加载目录的配置文件，还会自动检测并同步刷新 `~/Library/Application Support/AutoMount/auto_mount.plist`，确保无论以后台守护运行还是控制台手动调试，配置结构永远与底层运行程序保持最新的一致性。
+
+## 4. 双向全自动版本对齐与即时联动升舱架构
+
+在 macOS LaunchAgent 架构下，用户电脑中通常并存两套副本：工作区开发/运行目录（目录 A）与后台守护服务标准部署目录（目录 B：`~/Library/Application Support/AutoMount`）。
+
+为杜绝任何形式的跨目录代码脱节与配置延迟升舱，AutoMount 构建了全自动双向自愈流水线：
+
+```mermaid
+flowchart TD
+    subgraph UpdateFlow["正向升级流水线 (--update / 后台静默自升级)"]
+        Download["下载最新源码并执行 AST 语法分析预检"] --> WriteSwift["写入 auto_mount.swift 源码"]
+        WriteSwift --> Recompile["自动调用 swiftc -O 重新编译二进制 (若存在)"]
+        Recompile --> EagerMigrate["即时拉起新进程执行 --migrate-only\n无损升舱 auto_mount.plist 并落盘"]
+        EagerMigrate --> ReloadDaemon["launchctl bootout / bootstrap 热重载守护服务"]
+    end
+
+    subgraph ReverseFlow["反向工作区自愈流水线 (工作区启动入口)"]
+        WorkspaceLaunch["用户在工作区执行任意命令 (./auto_mount ...)"] --> Sniff["嗅探守护服务版本 installedVersion vs autoMountVersion"]
+        Sniff -- "installedVersion > currentVersion" --> GitSafe{"git status --porcelain 检查工作区代码安全？"}
+        GitSafe -- "存在未提交改动" --> PromptUser["交互提示确认，默认拒绝以保护源码"]
+        GitSafe -- "干净仓库 / 用户确认" --> PullCode["从守护目录同步 auto_mount.swift 与配置"]
+        PullCode --> RecompileLocal["自动重新编译工作区 auto_mount 二进制"]
+        PullCode --> MigrateLocal["即时无损升舱工作区 auto_mount.plist"]
+        MigrateLocal --> ExecvRestart["POSIX execv 原生热替换进程\n无缝继承原参数直接执行新版本"]
+        Sniff -- "版本一致或工作区领先" --> NormalExec["进入常规参数分发与策略执行"]
+    end
+```
 
