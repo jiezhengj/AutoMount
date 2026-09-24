@@ -1265,9 +1265,11 @@ func manageMountTargets(config: inout AutoMountConfig) {
             var profileOptions: [SelectionOption] = []
             for p in config.profiles {
                 let typeLabel = p.match.type == "gateway_mac" ? tr("局域网", "LAN") : tr("远程", "Remote")
+                let noDesc = tr("无描述", "No description")
+                let countStr = tr("当前 \(p.targets.count) 个挂载目标", "Current \(p.targets.count) targets")
                 profileOptions.append(SelectionOption(
                     title: "[\(typeLabel)] \(p.id)",
-                    subtitle: "\(p.description ?? "无描述") (当前 \(p.targets.count) 个挂载目标)"
+                    subtitle: "\(p.description ?? noDesc) (\(countStr))"
                 ))
             }
             profileOptions.append(SelectionOption(title: tr("↩ 取消并返回", "↩ Cancel and return"), subtitle: nil))
@@ -1458,7 +1460,7 @@ func manageNetworkProfiles(config: inout AutoMountConfig) {
                 continue
             }
             let pOptions = config.profiles.enumerated().map {
-                SelectionOption(title: "[\($0 + 1)] \($1.id)", subtitle: "\($1.description ?? "无描述")")
+                SelectionOption(title: "[\($0 + 1)] \($1.id)", subtitle: "\($1.description ?? tr("无描述", "No description"))")
             }
             guard let chosen = promptInteractiveRadio(
                 title: tr("\n请选择要调整优先级的策略：", "\nSelect profile to reorder:"),
@@ -1625,7 +1627,7 @@ func manageNetworkProfiles(config: inout AutoMountConfig) {
         case 2:
             // 编辑策略触发条件与属性 (Task 3: 连带迁移 targets)
             let editProfiles = config.profiles.enumerated().map {
-                SelectionOption(title: "[\($0 + 1)] \($1.id) (\($1.description ?? "无描述"))",
+                SelectionOption(title: "[\($0 + 1)] \($1.id) (\($1.description ?? tr("无描述", "No description")))",
                                 subtitle: "\($1.match.type) = \($1.match.value)")
             }
             guard let eIdx = promptInteractiveRadio(
@@ -1637,10 +1639,12 @@ func manageNetworkProfiles(config: inout AutoMountConfig) {
             }
 
             let curP = config.profiles[eIdx]
+            let curPrevent = curP.preventSpotlightIndex ?? true
+            let preventSub = curPrevent ? tr("当前: 开启防索引", "Current: Indexing Prevented") : tr("当前: 允许索引", "Current: Indexing Allowed")
             let attrOptions = [
-                SelectionOption(title: tr("修改策略描述名称", "Edit Profile Description"), subtitle: curP.description ?? "无描述"),
+                SelectionOption(title: tr("修改策略描述名称", "Edit Profile Description"), subtitle: curP.description ?? tr("无描述", "No description")),
                 SelectionOption(title: tr("更新匹配规则值 (网关 MAC / 探测主机)", "Update Match Value (Gateway MAC / Probe Host)"), subtitle: "\(curP.match.type) = \(curP.match.value)"),
-                SelectionOption(title: tr("切换 Spotlight 防索引开关", "Toggle Prevent Spotlight Index"), subtitle: (curP.preventSpotlightIndex ?? true) ? "当前: 开启防索引" : "当前: 允许索引"),
+                SelectionOption(title: tr("切换 Spotlight 防索引开关", "Toggle Prevent Spotlight Index"), subtitle: preventSub),
                 SelectionOption(title: tr("↩ 返回", "↩ Back"), subtitle: nil)
             ]
             guard let aSel = promptInteractiveRadio(
@@ -1741,7 +1745,7 @@ func manageNetworkProfiles(config: inout AutoMountConfig) {
                 continue
             }
             let delOptions = config.profiles.enumerated().map {
-                SelectionOption(title: "[\($0 + 1)] \($1.id) (\($1.description ?? "无描述"))",
+                SelectionOption(title: "[\($0 + 1)] \($1.id) (\($1.description ?? tr("无描述", "No description")))",
                                 subtitle: tr("含 \($1.targets.count) 个挂载目标", "Contains \($1.targets.count) targets"))
             }
             guard let picked = promptInteractiveCheckbox(
@@ -1894,12 +1898,13 @@ func manageConfiguration() {
                  "\nCurrently configured profile pipeline (Evaluated top-to-bottom, first match wins):"))
         for (i, p) in config.profiles.enumerated() {
             let typeLabel = p.match.type == "gateway_mac" ? tr("局域网", "LAN") : tr("远程", "Remote")
+            let descStr = p.description ?? tr("无描述", "No description")
             if p.targets.isEmpty {
-                print(tr("  [\(i + 1)] [\(typeLabel)] \(p.id) (\(p.description ?? "无描述")) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)",
-                         "  [\(i + 1)] [\(typeLabel)] \(p.id) (\(p.description ?? "No description")) - 0 mount targets (Exclusion Gatekeeper, no local mounts)"))
+                print(tr("  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)",
+                         "  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - 0 mount targets (Exclusion Gatekeeper, no local mounts)"))
             } else {
-                print(tr("  [\(i + 1)] [\(typeLabel)] \(p.id) (\(p.description ?? "无描述")) - \(p.targets.count) 个挂载目标",
-                         "  [\(i + 1)] [\(typeLabel)] \(p.id) (\(p.description ?? "No description")) - \(p.targets.count) mount targets"))
+                print(tr("  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - \(p.targets.count) 个挂载目标",
+                         "  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - \(p.targets.count) mount targets"))
                 for t in p.targets {
                     print("      • \(t.mountPath) <- \(t.url)")
                 }
