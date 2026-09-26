@@ -399,7 +399,7 @@ The `notify` channel features built-in alert throttling and anti-fatigue control
 
 ### Q: Do I need to manually update configuration files or re-run `--init` after updating the software?
 
-An existing valid config does not need to be recreated after a software update. The program updates its schema version, adds defined defaults, migrates supported profile IDs and descriptions, and preserves unrecognized config fields. Workspace and runtime configs migrate independently. When a LaunchAgent is installed, `--config` reads and edits the runtime config in Application Support.
+An existing valid config does not need to be recreated after a software update. On startup, the program eagerly scans and independently upgrades all visible configuration copies (both workspace and daemon runtime configs), updating schema versions, adding defined defaults, migrating supported profile IDs and descriptions, while preserving unrecognized config fields and existing individual settings. Workspace and runtime configs migrate independently. When a LaunchAgent is installed, `--config` reads and edits the runtime config in Application Support.
 
 # License
 

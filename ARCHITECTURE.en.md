@@ -260,22 +260,29 @@ flowchart TD
 
 AutoMount uses one version value: the config's root-level `version` is updated to match the software semantic version in `autoMountVersion` when a defined migration runs.
 
-## 2. Defined Config Migrations
+## 2. Startup Visible Config Scanning and In-Place Migration
 
-When loading config, AutoMount applies its defined migrations for version changes, missing defaults, and supported legacy profile names:
+After platform checks and version self-healing, and prior to command dispatch, AutoMount performs an eager scan and migration of all visible configuration copies (`--help`, `--version`, and `--self-test` retain read-only / test semantics and never trigger configuration writes):
+* **Installed Runtime Isolation**: When launched as a daemon from its Application Support directory, the program only inspects and migrates its own runtime configuration, never touching any external workspace;
+* **Workspace Multi-Copy Migration**: When launched from a workspace, the program independently inspects both the workspace configuration and the Application Support runtime configuration, deduplicating them if paths coincide. Even if LaunchAgent is not installed, any recognizable legacy configuration in Application Support is independently migrated;
+* **Independent Migration & Overwrite Prevention**: Each configuration is independently evaluated to determine whether migration is needed, using the existing schema upgrade logic and atomic writes with `0600` permissions. Neither configuration is copied over the other, preserving unknown fields and individual settings;
+* **Error Tolerance & Future-Version Protection**: Inaccessible, corrupted, or future-version configuration files remain unmodified while diagnostic logs are recorded, without blocking other compatible configurations from migrating.
 
 ```mermaid
 flowchart TD
-    LoadPlist["Read auto_mount.plist stream"] --> Decode["PropertyListDecoder deserializes into current AutoMountConfig"]
-    Decode --> CheckVersion{"Does a defined migration apply?"}
+    Scan["Startup Phase: Discover Visible Config Files\nWorkspace scans workspace and daemon directories; daemon only scans its own"] --> Loop["Iterate candidate configuration URLs"]
+    Loop --> Inspect["inspectConfigFile: Check file state"]
     
-    CheckVersion -- "No" --> FastReturn["Return config and evaluate network profiles"]
+    Inspect -- "Missing / Corrupted / Inaccessible / Future Version" --> Skip["Log diagnostic and protect/skip file"]
+    Inspect -- "Usable Config" --> CheckMigrate{"configNeedsMigration: Does migration apply?"}
     
-    CheckVersion -- "Yes" --> SchemaUpgrade["Migrate supported fields and defined defaults"]
+    CheckMigrate -- "No (Already current schema)" --> Noop["Keep unchanged without disk writes"]
+    CheckMigrate -- "Yes" --> SchemaUpgrade["Upgrade managed fields and defaults; preserve unknown fields"]
     
-    SchemaUpgrade --> Preserve["Preserve unrecognized fields and update managed fields"]
-    Preserve --> AtomicSave["Atomically replace the config file being migrated"]
-    AtomicSave --> LogAudit["Record the write result and return config"]
+    SchemaUpgrade --> AtomicSave["Atomically save configuration with 0600 permissions (syncInstalled: false)"]
+    AtomicSave --> LogAudit["Record migration audit log, proceed to next config"]
+    Skip --> Next["Proceed to next config"]
+    Noop --> Next
 ```
 
 ## 3. Config Compatibility and Persistence

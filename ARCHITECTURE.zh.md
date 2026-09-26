@@ -258,22 +258,29 @@ flowchart TD
 
 程序以 `autoMountVersion` 作为版本号来源。定义的配置迁移会将配置根层级的 `version` 更新为该值。
 
-## 2. 运行时配置迁移
+## 2. 启动期可见配置扫描与原地迁移
 
-读取配置时，程序只执行代码中定义的迁移：更新版本号、补充默认的更新信道，并迁移支持的策略 ID 与描述。
+在平台支持检查与版本自愈之后、业务命令分发之前，程序执行启动期可见配置扫描与迁移阶段（`--help`、`--version` 与 `--self-test` 保持只读/测试语义，不触发任何配置写入）：
+* **运行目录隔离**：守护进程从其安装运行目录启动时，仅处理该目录内的配置文件，不触碰任何外部工作区；
+* **工作区独立多副本迁移**：从工作区启动时，程序独立扫描工作区配置与 Application Support 中的守护运行配置，路径重合时自动去重；即使尚未安装 LaunchAgent，若 Application Support 存在旧配置亦会独立迁移；
+* **独立迁移与防覆盖**：每份配置独立检查是否需要执行迁移，使用原有 schema 升级逻辑原子写回，保留未知字段、各自设置与 `0600` 权限，严禁跨目录相互覆盖；
+* **错误容忍与未来版本保护**：不可访问、内容损坏或未来更高版本的文件保持原样并记录诊断日志，不阻止其他兼容配置的正常升级。
 
 ```mermaid
 flowchart TD
-    LoadPlist["读取 auto_mount.plist 数据流"] --> Decode["PropertyListDecoder 尝试解析为当前最新 AutoMountConfig 模型"]
-    Decode --> CheckVersion{"是否需要执行已定义的迁移？"}
+    Scan["启动阶段发现可见配置文件\n工作区扫描工作区与守护目录；守护进程仅限自身目录"] --> Loop["遍历各候选配置文件"]
+    Loop --> Inspect["inspectConfigFile: 检查文件状态"]
     
-    CheckVersion -- "否" --> FastReturn["返回配置对象，进入策略评估"]
+    Inspect -- "缺失/损坏/访问受限/未来版本" --> Skip["记录诊断日志，跳过并保护该文件"]
+    Inspect -- "可用配置" --> CheckMigrate{"configNeedsMigration: 是否需要迁移？"}
     
-    CheckVersion -- "是" --> SchemaUpgrade["迁移已知字段和定义的默认值"]
+    CheckMigrate -- "否 (已是当前最新规范)" --> Noop["保持原样，不写盘"]
+    CheckMigrate -- "是" --> SchemaUpgrade["迁移受管字段与默认值，保留未知扩展字段"]
     
-    SchemaUpgrade --> Preserve["保留未识别字段并更新受管字段"]
-    Preserve --> AtomicSave["原子写回本次读取的配置文件"]
-    AtomicSave --> LogAudit["记录写入结果，返回配置对象"]
+    SchemaUpgrade --> AtomicSave["以 0600 权限原子写回该独立配置文件 (syncInstalled: false)"]
+    AtomicSave --> LogAudit["记录迁移日志，继续处理下一份配置"]
+    Skip --> Next["继续处理下一份配置"]
+    Noop --> Next
 ```
 
 ## 3. 配置写入与兼容范围

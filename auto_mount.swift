@@ -195,7 +195,7 @@ func runCommandDiscardingOutputWithTimeout(
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.7.2"
+let autoMountVersion = "2.7.3"
 let minimumSupportedMacOSMajorVersion = 27
 let minimumSupportedMacOSVersion = "\(minimumSupportedMacOSMajorVersion).0"
 let githubRepo = "jiezhengj/AutoMount"
@@ -446,6 +446,23 @@ func configVersionCanBeMigrated(_ configVersion: String) -> Bool {
     !isNewerVersion(configVersion, than: autoMountVersion)
 }
 
+func configNeedsMigration(_ config: AutoMountConfig) -> Bool {
+    if config.version != autoMountVersion { return true }
+    if config.updateChannel == nil { return true }
+    for profile in config.profiles {
+        if profile.id == "home_lan" || profile.id == "tailscale_remote" {
+            return true
+        }
+        if let desc = profile.description {
+            if desc.contains("家庭局域网") || desc.contains("Home LAN") ||
+               desc.contains("Tailscale 异地互联") || desc.contains("Tailscale Remote") {
+                return true
+            }
+        }
+    }
+    return false
+}
+
 func migrateConfigIfNeeded(config: inout AutoMountConfig, at configURL: URL) -> Bool {
     guard configVersionCanBeMigrated(config.version) else {
         fputs(tr("✗ 配置版本 v\(config.version) 高于当前程序 v\(autoMountVersion)，为避免降级破坏配置，已停止运行。\n",
@@ -453,6 +470,8 @@ func migrateConfigIfNeeded(config: inout AutoMountConfig, at configURL: URL) -> 
         writeLog("Refused to migrate newer config version \(config.version) with program \(autoMountVersion)")
         return false
     }
+
+    guard configNeedsMigration(config) else { return true }
 
     var modified = false
     if config.version != autoMountVersion {
@@ -494,6 +513,96 @@ func migrateConfigIfNeeded(config: inout AutoMountConfig, at configURL: URL) -> 
              "✓ Configuration automatically upgraded to v\(autoMountVersion) schema"))
     writeLog("Configuration auto-migrated to v\(autoMountVersion)")
     return true
+}
+
+enum ConfigMigrationStartupResult: Equatable {
+    case migrated
+    case unchanged
+    case skippedMissing
+    case skippedInaccessible(String?)
+    case skippedMalformed(String?)
+    case skippedFutureVersion(String)
+    case migrationFailed
+}
+
+func discoverVisibleConfigURLs(
+    appDirectory: URL = getAppDir(),
+    installedDirectory: URL = getInstalledDir(),
+    overrideURL: URL? = configURLOverride
+) -> [URL] {
+    var candidateURLs: [URL] = []
+    if let overrideURL {
+        candidateURLs.append(overrideURL)
+    }
+
+    let standardizedAppDir = appDirectory.standardizedFileURL.path
+    let standardizedInstalledDir = installedDirectory.standardizedFileURL.path
+
+    if standardizedAppDir == standardizedInstalledDir {
+        candidateURLs.append(installedDirectory.appendingPathComponent("auto_mount.plist"))
+    } else {
+        candidateURLs.append(appDirectory.appendingPathComponent("auto_mount.plist"))
+        candidateURLs.append(installedDirectory.appendingPathComponent("auto_mount.plist"))
+    }
+
+    var seenPaths = Set<String>()
+    var uniqueURLs: [URL] = []
+    for url in candidateURLs {
+        let path = url.standardizedFileURL.path
+        if !seenPaths.contains(path) {
+            seenPaths.insert(path)
+            uniqueURLs.append(url)
+        }
+    }
+    return uniqueURLs
+}
+
+@discardableResult
+func eagerMigrateVisibleConfigs(
+    candidateURLs: [URL] = discoverVisibleConfigURLs()
+) -> [URL: ConfigMigrationStartupResult] {
+    var results: [URL: ConfigMigrationStartupResult] = [:]
+
+    for url in candidateURLs {
+        let inspection = inspectConfigFile(at: url)
+        switch inspection.state {
+        case .missing:
+            results[url] = .skippedMissing
+
+        case .inaccessible:
+            let reason = inspection.diagnostic ?? "access denied"
+            writeLog("Startup config migration skipped inaccessible file at \(url.path): \(reason)")
+            results[url] = .skippedInaccessible(inspection.diagnostic)
+
+        case .invalid:
+            let reason = inspection.diagnostic ?? "malformed content"
+            writeLog("Startup config migration skipped malformed file at \(url.path): \(reason)")
+            results[url] = .skippedMalformed(inspection.diagnostic)
+
+        case .futureVersion(let version):
+            writeLog("Startup config migration skipped future version v\(version) at \(url.path)")
+            results[url] = .skippedFutureVersion(version)
+
+        case .usable:
+            guard var config = inspection.config else {
+                results[url] = .skippedMalformed("Missing config object")
+                continue
+            }
+            guard configNeedsMigration(config) else {
+                results[url] = .unchanged
+                continue
+            }
+            let success = migrateConfigIfNeeded(config: &config, at: url)
+            if success {
+                results[url] = .migrated
+            } else {
+                writeLog("Startup config migration failed for \(url.path)")
+                results[url] = .migrationFailed
+            }
+        }
+    }
+
+    return results
 }
 
 // 加载配置并执行已定义的迁移
@@ -3820,8 +3929,8 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
           "older macOS SDK versions are below the supported target")
     check(macOSSDKMajorVersion("unknown") == nil,
           "unrecognized SDK versions are rejected")
-    check(!configVersionCanBeMigrated("2.7.3"), "newer config versions are not downgraded")
-    check(configVersionCanBeMigrated("2.6.1"), "older config versions remain eligible for migration")
+    check(!configVersionCanBeMigrated("2.7.4"), "newer config versions are not downgraded")
+    check(configVersionCanBeMigrated("2.7.2"), "older config versions remain eligible for migration")
 
     let updateNow: TimeInterval = 10_000
     var updateState = AutoMountConfig(version: "2.7.0", updateChannel: "auto", lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: [])
@@ -3914,7 +4023,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     let missingConfigState = ConfigFileState.missing
     let usableConfigState = ConfigFileState.usable
     let invalidConfigState = ConfigFileState.invalid
-    let futureConfigState = ConfigFileState.futureVersion("2.7.3")
+    let futureConfigState = ConfigFileState.futureVersion("2.7.4")
     let inaccessibleConfigState = ConfigFileState.inaccessible
     check(resolveInstallConfigLocation(
         requested: nil, workspaceState: usableConfigState, runtimeState: missingConfigState,
@@ -3951,7 +4060,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(resolveInstallConfigLocation(
         requested: nil, workspaceState: usableConfigState, runtimeState: futureConfigState,
         documentsEquivalent: false
-    ) == .futureVersion(.runtime, "2.7.3"), "newer runtime config prevents an implicit downgrade")
+    ) == .futureVersion(.runtime, "2.7.4"), "newer runtime config prevents an implicit downgrade")
     check(resolveInstallConfigLocation(
         requested: nil, workspaceState: usableConfigState, runtimeState: inaccessibleConfigState,
         documentsEquivalent: false
@@ -3971,34 +4080,34 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(resolveInstallConfigLocation(
         requested: .runtime, workspaceState: usableConfigState, runtimeState: futureConfigState,
         documentsEquivalent: false
-    ) == .futureVersion(.runtime, "2.7.3"), "explicit runtime selection still rejects a config the current program cannot migrate")
+    ) == .futureVersion(.runtime, "2.7.4"), "explicit runtime selection still rejects a config the current program cannot migrate")
 
     let installStateMatrix: [(ConfigFileState, ConfigFileState, Bool, InstallConfigResolution)] = [
         (.missing, .missing, false, .initialize),
         (.missing, .usable, false, .selected(.runtime)),
         (.missing, .invalid, false, .initialize),
-        (.missing, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.missing, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
         (.missing, .inaccessible, false, .inaccessible(.runtime)),
         (.usable, .missing, false, .selected(.workspace)),
         (.usable, .usable, true, .selected(.runtime)),
         (.usable, .usable, false, .diverged),
         (.usable, .invalid, false, .repairRuntimeFromWorkspace),
-        (.usable, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.usable, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
         (.usable, .inaccessible, false, .inaccessible(.runtime)),
         (.invalid, .missing, false, .initialize),
         (.invalid, .usable, false, .selected(.runtime)),
         (.invalid, .invalid, false, .initialize),
-        (.invalid, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.invalid, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
         (.invalid, .inaccessible, false, .inaccessible(.runtime)),
-        (.futureVersion("2.7.3"), .missing, false, .futureVersion(.workspace, "2.7.3")),
-        (.futureVersion("2.7.3"), .usable, false, .selected(.runtime)),
-        (.futureVersion("2.7.3"), .invalid, false, .futureVersion(.workspace, "2.7.3")),
-        (.futureVersion("2.7.3"), .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
-        (.futureVersion("2.7.3"), .inaccessible, false, .inaccessible(.runtime)),
+        (.futureVersion("2.7.4"), .missing, false, .futureVersion(.workspace, "2.7.4")),
+        (.futureVersion("2.7.4"), .usable, false, .selected(.runtime)),
+        (.futureVersion("2.7.4"), .invalid, false, .futureVersion(.workspace, "2.7.4")),
+        (.futureVersion("2.7.4"), .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
+        (.futureVersion("2.7.4"), .inaccessible, false, .inaccessible(.runtime)),
         (.inaccessible, .missing, false, .inaccessible(.workspace)),
         (.inaccessible, .usable, false, .selected(.runtime)),
         (.inaccessible, .invalid, false, .inaccessible(.workspace)),
-        (.inaccessible, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.inaccessible, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
         (.inaccessible, .inaccessible, false, .inaccessible(.runtime))
     ]
     for (index, scenario) in installStateMatrix.enumerated() {
@@ -4069,7 +4178,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     ) == .recover(target: .workspace, source: .runtime), "config management restores an invalid workspace from the only usable config")
     check(resolveManagementConfigLocation(
         launchAgentInstalled: true, workspaceState: usableConfigState, runtimeState: futureConfigState
-    ) == .futureVersion(.runtime, "2.7.3"), "config management does not rewrite a newer active runtime config")
+    ) == .futureVersion(.runtime, "2.7.4"), "config management does not rewrite a newer active runtime config")
     func expectedManagementResolution(
         launchAgentInstalled: Bool,
         workspaceState: ConfigFileState,
@@ -4132,7 +4241,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(resolveInitConfigState(
         resetExistingConfig: false, workspaceState: futureConfigState, runtimeState: missingConfigState,
         documentsEquivalent: false
-    ) == .futureVersion(.workspace, "2.7.3"), "init protects a config written by a newer program")
+    ) == .futureVersion(.workspace, "2.7.4"), "init protects a config written by a newer program")
     check(resolveInitConfigState(
         resetExistingConfig: true, workspaceState: usableConfigState, runtimeState: usableConfigState,
         documentsEquivalent: false
@@ -4390,6 +4499,198 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     """
     check(firstRegexCapture(#"(?m)^\s*last exit code = (-?\d+)\s*$"#, in: launchdSample) == "1",
           "launchd last exit code is parsed")
+
+    // Visible config discovery tests
+    let mockAppDir = URL(fileURLWithPath: "/tmp/mock_app")
+    let mockInstalledDir = URL(fileURLWithPath: "/tmp/mock_installed")
+    let daemonDiscovered = discoverVisibleConfigURLs(appDirectory: mockInstalledDir, installedDirectory: mockInstalledDir)
+    check(daemonDiscovered.count == 1 && daemonDiscovered.first?.path == mockInstalledDir.appendingPathComponent("auto_mount.plist").path,
+          "daemon discovery only inspects its own installed directory")
+
+    let workspaceDiscovered = discoverVisibleConfigURLs(appDirectory: mockAppDir, installedDirectory: mockInstalledDir)
+    check(workspaceDiscovered.count == 2
+          && workspaceDiscovered[0].path == mockAppDir.appendingPathComponent("auto_mount.plist").path
+          && workspaceDiscovered[1].path == mockInstalledDir.appendingPathComponent("auto_mount.plist").path,
+          "workspace discovery scans both workspace and runtime configs")
+
+    let deduplicatedDiscovered = discoverVisibleConfigURLs(appDirectory: mockInstalledDir, installedDirectory: mockInstalledDir)
+    check(deduplicatedDiscovered.count == 1,
+          "coinciding workspace and runtime directories are deduplicated")
+
+    let overrideConfigURL = URL(fileURLWithPath: "/tmp/mock_override.plist")
+    let overrideDiscovered = discoverVisibleConfigURLs(appDirectory: mockAppDir, installedDirectory: mockInstalledDir, overrideURL: overrideConfigURL)
+    check(overrideDiscovered.count == 3 && overrideDiscovered[0].path == overrideConfigURL.path,
+          "override config URL is prioritized and included in visible configs")
+
+    // configNeedsMigration tests
+    let modernConfig = AutoMountConfig(version: autoMountVersion, updateChannel: "auto", lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: [
+        NetworkProfile(id: "local_lan", description: "Local LAN High-Speed Direct Connection", match: MatchRule(type: "gateway_mac", value: "00:11:22:33:44:55"), excludeGatewayIPs: nil, preventSpotlightIndex: true, targets: [])
+    ])
+    check(!configNeedsMigration(modernConfig), "modern config does not need migration")
+
+    var olderConfig = modernConfig
+    olderConfig.version = "2.7.1"
+    check(configNeedsMigration(olderConfig), "older version config needs migration")
+
+    var legacyIdConfig = modernConfig
+    legacyIdConfig.profiles[0].id = "home_lan"
+    check(configNeedsMigration(legacyIdConfig), "legacy profile ID needs migration")
+
+    var nilChannelConfig = modernConfig
+    nilChannelConfig.updateChannel = nil
+    check(configNeedsMigration(nilChannelConfig), "missing updateChannel needs migration")
+
+    // eagerMigrateVisibleConfigs sandbox tests
+    let eagerSandbox = FileManager.default.temporaryDirectory.appendingPathComponent("eager-migration-test-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: eagerSandbox, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: eagerSandbox) }
+
+    let wsConfigURL = eagerSandbox.appendingPathComponent("workspace_auto_mount.plist")
+    let rtConfigURL = eagerSandbox.appendingPathComponent("runtime_auto_mount.plist")
+    let malformedURL = eagerSandbox.appendingPathComponent("malformed_auto_mount.plist")
+    let futureURL = eagerSandbox.appendingPathComponent("future_auto_mount.plist")
+    let missingURL = eagerSandbox.appendingPathComponent("missing_auto_mount.plist")
+
+    let wsXML = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+    \t<key>version</key>
+    \t<string>2.7.1</string>
+    \t<key>update_channel</key>
+    \t<string>auto</string>
+    \t<key>custom_field</key>
+    \t<string>preserved_value</string>
+    \t<key>profiles</key>
+    \t<array>
+    \t\t<dict>
+    \t\t\t<key>id</key>
+    \t\t\t<string>home_lan</string>
+    \t\t\t<key>description</key>
+    \t\t\t<string>家庭局域网直连</string>
+    \t\t\t<key>match</key>
+    \t\t\t<dict>
+    \t\t\t\t<key>type</key>
+    \t\t\t\t<string>gateway_mac</string>
+    \t\t\t\t<key>value</key>
+    \t\t\t\t<string>aa:bb:cc:dd:ee:ff</string>
+    \t\t\t</dict>
+    \t\t\t<key>targets</key>
+    \t\t\t<array>
+    \t\t\t\t<dict>
+    \t\t\t\t\t<key>mount_path</key>
+    \t\t\t\t\t<string>/Volumes/ws_share</string>
+    \t\t\t\t\t<key>url</key>
+    \t\t\t\t\t<string>smb://nas.local/ws_share</string>
+    \t\t\t\t</dict>
+    \t\t\t</array>
+    \t\t</dict>
+    \t</array>
+    </dict>
+    </plist>
+    """
+    try? wsXML.data(using: .utf8)?.write(to: wsConfigURL)
+
+    let rtXML = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+    \t<key>version</key>
+    \t<string>\(autoMountVersion)</string>
+    \t<key>update_channel</key>
+    \t<string>off</string>
+    \t<key>profiles</key>
+    \t<array>
+    \t\t<dict>
+    \t\t\t<key>id</key>
+    \t\t\t<string>local_lan</string>
+    \t\t\t<key>description</key>
+    \t\t\t<string>本地局域网高速直连</string>
+    \t\t\t<key>match</key>
+    \t\t\t<dict>
+    \t\t\t\t<key>type</key>
+    \t\t\t\t<string>gateway_mac</string>
+    \t\t\t\t<key>value</key>
+    \t\t\t\t<string>11:22:33:44:55:66</string>
+    \t\t\t</dict>
+    \t\t\t<key>targets</key>
+    \t\t\t<array>
+    \t\t\t\t<dict>
+    \t\t\t\t\t<key>mount_path</key>
+    \t\t\t\t\t<string>/Volumes/rt_share</string>
+    \t\t\t\t\t<key>url</key>
+    \t\t\t\t\t<string>smb://nas.local/rt_share</string>
+    \t\t\t\t</dict>
+    \t\t\t</array>
+    \t\t</dict>
+    \t</array>
+    </dict>
+    </plist>
+    """
+    try? rtXML.data(using: .utf8)?.write(to: rtConfigURL)
+
+    try? "this is not a valid plist xml".data(using: .utf8)?.write(to: malformedURL)
+
+    let futureXML = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+    \t<key>version</key>
+    \t<string>99.0.0</string>
+    \t<key>update_channel</key>
+    \t<string>auto</string>
+    \t<key>profiles</key>
+    \t<array>
+    \t\t<dict>
+    \t\t\t<key>id</key>
+    \t\t\t<string>future_profile</string>
+    \t\t\t<key>match</key>
+    \t\t\t<dict>
+    \t\t\t\t<key>type</key>
+    \t\t\t\t<string>gateway_mac</string>
+    \t\t\t\t<key>value</key>
+    \t\t\t\t<string>ff:ee:dd:cc:bb:aa</string>
+    \t\t\t</dict>
+    \t\t\t<key>targets</key>
+    \t\t\t<array/>
+    \t\t</dict>
+    \t</array>
+    </dict>
+    </plist>
+    """
+    try? futureXML.data(using: .utf8)?.write(to: futureURL)
+
+    let migrationRun1 = eagerMigrateVisibleConfigs(candidateURLs: [wsConfigURL, rtConfigURL, malformedURL, futureURL, missingURL])
+    check(migrationRun1[wsConfigURL] == .migrated, "workspace config is migrated to current schema")
+    check(migrationRun1[rtConfigURL] == .unchanged, "already-up-to-date runtime config is unchanged")
+    check(migrationRun1[malformedURL] == .skippedMalformed("Configuration is malformed or has no profiles"), "malformed config is skipped without error")
+    check(migrationRun1[futureURL] == .skippedFutureVersion("99.0.0"), "future version config is skipped without downgrade")
+    check(migrationRun1[missingURL] == .skippedMissing, "missing config is skipped")
+
+    let migratedWSInspection = inspectConfigFile(at: wsConfigURL)
+    check(migratedWSInspection.state == .usable, "migrated workspace config is usable")
+    check(migratedWSInspection.config?.version == autoMountVersion, "migrated workspace config version matches current program")
+    check(migratedWSInspection.config?.profiles.first?.id == "local_lan", "migrated workspace config profile ID updated to local_lan")
+    let rawWSData = try? Data(contentsOf: wsConfigURL)
+    let rawWSString = rawWSData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    check(rawWSString.contains("custom_field") && rawWSString.contains("preserved_value"), "migrated workspace config preserves unknown fields")
+    check(rawWSString.contains("/Volumes/ws_share"), "migrated workspace config preserves its own targets without overwrite")
+    check(!rawWSString.contains("/Volumes/rt_share"), "migrated workspace config is not overwritten by runtime config")
+
+    let wsPermissions = (try? FileManager.default.attributesOfItem(atPath: wsConfigURL.path)[.posixPermissions] as? NSNumber)?.intValue
+    check(wsPermissions == 0o600, "migrated config preserves 0600 permissions")
+
+    let malformedContent = (try? String(contentsOf: malformedURL, encoding: .utf8)) ?? ""
+    check(malformedContent == "this is not a valid plist xml", "malformed file was not overwritten")
+    let futureInspection = inspectConfigFile(at: futureURL)
+    check(futureInspection.state == .futureVersion("99.0.0"), "future config version was not downgraded")
+
+    let migrationRun2 = eagerMigrateVisibleConfigs(candidateURLs: [wsConfigURL, rtConfigURL])
+    check(migrationRun2[wsConfigURL] == .unchanged, "repeat migration leaves up-to-date workspace config unchanged")
+    check(migrationRun2[rtConfigURL] == .unchanged, "repeat migration leaves up-to-date runtime config unchanged")
 
     if includeNetworkChecks {
         if let gateway = getPhysicalGatewayInfo() {
@@ -5169,6 +5470,9 @@ func main() {
 
     // 工作区自愈嗅探：若发现后台守护服务先一步升级，自动反哺工作区并热重启
     checkAndSyncWorkspaceFromInstalledDaemonIfNeeded()
+
+    // 启动阶段统一扫描并迁移所有可见配置副本
+    eagerMigrateVisibleConfigs()
 
     if args.count > 1 {
         let arg = args[1]
