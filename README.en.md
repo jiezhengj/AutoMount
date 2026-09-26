@@ -39,7 +39,7 @@ swift auto_mount.swift
 
 Before initializing, ensure you have connected to your NAS share at least once in Finder via "Connect to Server (`Cmd + K`)" and checked "Remember this password in my keychain".
 
-Connect to your home network and run the initialization wizard:
+Connect to your home network and run initialization. The wizard opens only when neither the workspace nor daemon store has a usable config; existing usable configs are preserved:
 
 ```bash
 ./auto_mount --init
@@ -62,15 +62,15 @@ Terminal Checkbox Controls:
 - `Ctrl + C`: Safe exit restoring terminal mode
 
 > [!IMPORTANT]
-> **Important: `--init` performs a full overwrite initialization**
-> - `--init` is designed to construct an entirely new configuration from scratch and **never reads, merges, or preserves existing historical configuration**.
-> - If `auto_mount.plist` already exists on disk, completing the wizard will overwrite the entire file.
+> **Important: `--init` protects existing configuration by default**
+> - If either the workspace or daemon directory already has a usable config, `--init` preserves it and directs you to `--config` or `--install` instead of silently starting a fresh wizard.
+> - Run `./auto_mount --init --reset` to rebuild the workspace config from scratch. The existing file is backed up beside it with mode `0600` before the new config is written.
 > - In the "Select home LAN mount targets" step, pressing Enter to skip **sets that profile's target list to empty; a matching profile ends evaluation without mounting, and existing targets will NOT be retained**.
-> - If you already have an existing configuration and only want to add/remove mount points, update router MACs, or refresh Tailscale peers while keeping existing items intact, **do NOT use `--init`; use `./auto_mount --config` instead**.
+> - Use `./auto_mount --config` to add/remove mount points, update router MACs, or refresh remote peers while keeping existing settings.
 
 ## Daily Configuration Management (`--config`)
 
-To add new shares, remove obsolete mount points, or update router hardware MACs without starting from scratch (and without accidentally overwriting existing configuration via `--init`), run:
+For day-to-day changes to mount targets, network rules, or update settings, run:
 
 ```bash
 ./auto_mount --config
@@ -78,10 +78,10 @@ To add new shares, remove obsolete mount points, or update router hardware MACs 
 
 The interactive management menu displays:
 
-Normal workspace commands read the config beside the executable. When an installed daemon config exists, `--config` reads and edits `~/Library/Application Support/AutoMount/auto_mount.plist`, which is also used by the daemon status page; without a runtime config it falls back to the workspace config. A first `--install` seeds the runtime config from the workspace. On reinstall, if both valid configs differ, an interactive run asks which one to use; a non-interactive run keeps the daemon config. Use `--install --config-source workspace` to explicitly replace it from the workspace, or `--config-source runtime` to explicitly keep it. An invalid or newer daemon config is never silently overwritten.
+Normal workspace commands read the config beside the executable. When a LaunchAgent is installed, `--config` manages the config it uses at `~/Library/Application Support/AutoMount/auto_mount.plist`, even if the service is not currently running. If that config is missing or damaged and the workspace config is usable, the program backs up the unusable file before restoring it; if neither is usable, it opens the interactive setup wizard. When both configs are usable but differ, `--config` keeps and manages the daemon config while reporting the difference. A first `--install` seeds the runtime config from the workspace. On reinstall, if both valid configs differ, an interactive run asks which one to use; a non-interactive run keeps the daemon config. Explicitly selecting `--config-source workspace` backs up the daemon config before replacing it. Config recovery rechecks both file snapshots before writing so a concurrent change is not silently overwritten. A config from a newer program version is not automatically overwritten, and installation stops if a config cannot be read or backed up.
 
 ```text
-Auto Mount Tool - Daily Configuration Management (v2.7.0)
+Auto Mount Tool - Daily Configuration Management (v2.7.2)
 ======================================================
 
 Currently configured profile pipeline (Evaluated top-to-bottom, first match wins):
@@ -90,7 +90,7 @@ Currently configured profile pipeline (Evaluated top-to-bottom, first match wins
       • /Volumes/documents <- smb://nas.example.ts.net/documents
       • /Volumes/media <- smb://nas.example.ts.net/media
 
-Software Version: v2.7.0 | Auto-Update Channel: auto (Silent background auto-update)
+Software Version: v2.7.2 | Auto-Update Channel: auto (Silent background auto-update)
 Background Daemon Status: Loaded and idle, waiting for a trigger; runtime config present (gui/<uid>)
 
 Select module:
@@ -125,7 +125,7 @@ If you skipped daemon deployment during `--init` or prefer managing the service 
 ./auto_mount --help
 ```
 
-`--install` compiles the CLI and deploys the executable and source into `~/Library/Application Support/AutoMount`. On first install, it seeds the runtime config from the workspace. On reinstall, it compares user settings while ignoring the version and daemon update-check state. If configs differ, an interactive run asks which one to use; a non-interactive run keeps the daemon config. Use `--install --config-source workspace` to explicitly replace the runtime config, or `--install --config-source runtime` to keep it. An invalid or newer daemon config is never silently overwritten. The LaunchAgent runs the deployed source through the system Swift runtime so it can read interface-scoped network state in the logged-in session; the compiled executable remains available for interactive commands. Login, network configuration changes, daemon config changes, and a 60-second interval trigger policy evaluation so the service retries if the network becomes ready later.
+`--install` compiles the CLI and deploys the executable and source into `~/Library/Application Support/AutoMount`. On first install, it seeds the runtime config from the workspace. If neither config is usable, an interactive install opens the setup wizard and continues after a successful save; a non-interactive install stops before registering the service. On reinstall, it compares settings while ignoring the version and daemon update-check state. If configs differ, an interactive run asks which one to use; a non-interactive run keeps the daemon config. If the daemon config is damaged and the workspace config is usable, the program backs up the damaged file, restores the config, and continues installation. Use `--install --config-source workspace` to explicitly replace the runtime config; the existing file is backed up first. `--install --config-source runtime` explicitly selects it. A config from a newer program version is not automatically downgraded, and the service is not registered or reloaded if a config cannot be read or backed up. The LaunchAgent runs the deployed source through the system Swift runtime so it can read interface-scoped network state in the logged-in session; the compiled executable remains available for interactive commands. Login, network configuration changes, daemon config changes, and a 60-second interval trigger policy evaluation so the service retries if the network becomes ready later.
 
 Run network acceptance with `./auto_mount --self-test --network --remote-smb`. The `--remote-smb` check reads the configured remote profile and uses a matching peer's Tailscale address when available, avoiding a local DNS answer that could send the test over the home LAN. It temporarily mounts each SMB share under the user's cache directory, verifies its mounted source, and unmounts it. ARP checks are reported as `SKIP` when the current process cannot read ARP output; skipped checks are not counted as passed.
 
@@ -139,7 +139,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.7.0</string>
+    <string>2.7.2</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -225,7 +225,7 @@ The configuration file is located at `auto_mount.plist` using Apple Property Lis
 
 | Key | Type | Description |
 | :--- | :--- | :--- |
-| `version` | String | Schema version kept in sync with the software version (e.g., `2.7.0`). The program migrates existing config when loading an older schema. |
+| `version` | String | Schema version kept in sync with the software version (e.g., `2.7.2`). The program migrates existing config when loading an older schema. |
 | `update_channel` | String | Software update strategy: `off` (disabled, default), `notify` (system notification banner), or `auto` (silent background upgrade). |
 | `last_update_check_timestamp` | Real | Unix timestamp of the latest update-check attempt; absent a failure retry, normal checks are 24 hours apart. |
 | `update_retry_after_timestamp` | Real | Retry deadline after a failed background check or automatic deployment; once it expires, it bypasses the normal 24-hour interval. |
@@ -330,18 +330,22 @@ The tool interfaces directly with macOS internal `NetFS.framework`:
 var mountPoints: Unmanaged<CFArray>?
 let openOptions = NSMutableDictionary()
 openOptions[kNAUIOptionKey as String] = kNAUIOptionNoUI as String
+let mountOptions = NSMutableDictionary()
+if mountpointURL != nil {
+    mountOptions[kNetFSMountAtMountDirKey as String] = true
+}
 let status = NetFSMountURLSync(
     url as CFURL,
     mountpointURL,
     nil,
     nil,
     openOptions as CFMutableDictionary,
-    nil,
+    mountOptions.count > 0 ? mountOptions as CFMutableDictionary : nil,
     &mountPoints
 )
 ```
 
-In this fragment, `url` and `mountpointURL` are validated inputs. For a missing standard `/Volumes/<share>` path, `mountpointURL` is `nil` so NetFS can create the mount directory; other targets pass their configured path. The program leaves username and password parameters empty and sets the non-interactive NetAuth option. macOS can use existing SMB credentials from the user's Keychain. If no usable credential is available, mounting fails with a diagnostic instead of opening a credential prompt.
+In this fragment, `url` and `mountpointURL` are validated inputs. For a missing standard `/Volumes/<share>` path, `mountpointURL` is `nil` so NetFS can create the mount directory; other targets pass their configured path and set `kNetFSMountAtMountDirKey` to prevent NetFS from nesting the share below it. The program leaves username and password parameters empty and sets the non-interactive NetAuth option. macOS can use existing SMB credentials from the user's Keychain. If no usable credential is available, mounting fails with a diagnostic instead of opening a credential prompt.
 
 # Frequently Asked Questions (FAQ)
 
@@ -372,7 +376,7 @@ Select `[4] Update home gateway MAC`. The program detects the new hardware finge
 
 ### Q: What is the difference between `--init` and `--config`? What happens if I press Enter to skip mount targets in `--init`?
 
-- **`--init` (Full Scratch Initialization)**: Intended for first-time setup or clean rebuilds. The wizard builds an entirely new configuration object from scratch and **never reads, merges, or preserves existing settings**. Pressing Enter to skip in the mount target selection step sets the target list to empty (`targets: []`). When that profile matches, evaluation ends without mounting; on completion, `--init` **overwrites the existing `auto_mount.plist` configuration file**.
+- **`--init` (Safe Initialization)**: Starts the wizard when neither config store has a usable configuration. If one already exists, it is preserved and the command points to `--config` or `--install`. Run `./auto_mount --init --reset` to rebuild the workspace config; the old file is backed up first. Pressing Enter to skip mount targets sets that profile's target list to empty (`targets: []`), so a matching profile ends evaluation without mounting.
 - **`--config` (Incremental Daily Management)**: Intended for ongoing configuration maintenance. It loads existing configuration into memory, preserving all unedited settings, and allows adding new targets, removing specific targets, refreshing gateway MACs, or updating remote peers. Changes are safely saved back to disk and hot-synced to the LaunchAgent daemon. Always use `--config` for daily maintenance.
 
 ### Q: How do I synchronize changes to the running LaunchAgent daemon after modifying local workspace code?

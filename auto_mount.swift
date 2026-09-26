@@ -80,15 +80,6 @@ func getConfigURL() -> URL {
     return configURLOverride ?? getWorkspaceConfigURL()
 }
 
-func preferredManagementConfigURL(
-    workspaceURL: URL,
-    runtimeURL: URL,
-    launchAgentInstalled: Bool,
-    runtimeConfigExists: Bool
-) -> URL {
-    launchAgentInstalled && runtimeConfigExists ? runtimeURL : workspaceURL
-}
-
 // 执行外部命令辅助函数
 final class CommandOutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
@@ -204,7 +195,7 @@ func runCommandDiscardingOutputWithTimeout(
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.7.0"
+let autoMountVersion = "2.7.2"
 let minimumSupportedMacOSMajorVersion = 27
 let minimumSupportedMacOSVersion = "\(minimumSupportedMacOSMajorVersion).0"
 let githubRepo = "jiezhengj/AutoMount"
@@ -311,6 +302,141 @@ struct AutoMountConfig: Codable {
         case updateRetryAfterTimestamp = "update_retry_after_timestamp"
         case lastNotifiedVersion = "last_notified_version"
         case profiles
+    }
+}
+
+enum ConfigFileState: Equatable {
+    case missing
+    case usable
+    case invalid
+    case futureVersion(String)
+    case inaccessible
+}
+
+struct ConfigFileInspection {
+    let url: URL
+    let state: ConfigFileState
+    let config: AutoMountConfig?
+    let contents: Data?
+    let diagnostic: String?
+}
+
+func inspectConfigFile(at url: URL) -> ConfigFileInspection {
+    var fileInfo = stat()
+    let statResult = url.path.withCString { Darwin.lstat($0, &fileInfo) }
+    guard statResult == 0 else {
+        let errorCode = errno
+        let isMissing = errorCode == ENOENT
+        let diagnostic = String(cString: strerror(errorCode))
+        return ConfigFileInspection(url: url, state: isMissing ? .missing : .inaccessible,
+                                    config: nil, contents: nil,
+                                    diagnostic: isMissing ? nil : diagnostic)
+    }
+
+    guard fileInfo.st_mode & S_IFMT == S_IFREG else {
+        return ConfigFileInspection(url: url, state: .inaccessible, config: nil, contents: nil,
+                                    diagnostic: "Configuration path is not a regular file")
+    }
+
+    let data: Data
+    do {
+        data = try Data(contentsOf: url)
+    } catch {
+        return ConfigFileInspection(url: url, state: .inaccessible, config: nil, contents: nil,
+                                    diagnostic: error.localizedDescription)
+    }
+
+    guard var config = try? PropertyListDecoder().decode(AutoMountConfig.self, from: data),
+          !config.profiles.isEmpty,
+          !parseSemanticVersion(config.version).isEmpty else {
+        return ConfigFileInspection(url: url, state: .invalid, config: nil, contents: data,
+                                    diagnostic: "Configuration is malformed or has no profiles")
+    }
+    guard !isNewerVersion(config.version, than: autoMountVersion) else {
+        return ConfigFileInspection(url: url, state: .futureVersion(config.version), config: config,
+                                    contents: data, diagnostic: nil)
+    }
+    config.version = config.version.trimmingCharacters(in: .whitespacesAndNewlines)
+    return ConfigFileInspection(url: url, state: .usable, config: config, contents: data, diagnostic: nil)
+}
+
+func configInspectionMatches(_ expected: ConfigFileInspection, _ current: ConfigFileInspection) -> Bool {
+    expected.url.standardizedFileURL == current.url.standardizedFileURL
+        && expected.state == current.state
+        && expected.contents == current.contents
+}
+
+func configBackupURL(for configURL: URL, now: Date = Date()) -> URL {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let timestamp = formatter.string(from: now).replacingOccurrences(of: ":", with: "")
+    let parentURL = configURL.deletingLastPathComponent()
+    let baseName = "\(configURL.lastPathComponent).backup-\(timestamp)"
+    var candidate = parentURL.appendingPathComponent(baseName)
+    var suffix = 2
+    while FileManager.default.fileExists(atPath: candidate.path) {
+        candidate = parentURL.appendingPathComponent("\(baseName)-\(suffix)")
+        suffix += 1
+    }
+    return candidate
+}
+
+func backUpConfigFile(_ inspection: ConfigFileInspection) throws -> URL? {
+    guard let contents = inspection.contents else { return nil }
+    let backupURL = configBackupURL(for: inspection.url)
+    try atomicWrite(contents, to: backupURL, permissions: 0o600)
+    return backupURL
+}
+
+func replaceConfigFile(
+    with source: ConfigFileInspection,
+    at destinationURL: URL,
+    destination: ConfigFileInspection
+) throws -> URL? {
+    guard source.state == .usable, let sourceContents = source.contents else {
+        throw NSError(domain: "AutoMountConfig", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "The selected source config is not usable"])
+    }
+    guard destination.state != .inaccessible else {
+        throw NSError(domain: "AutoMountConfig", code: 2,
+                      userInfo: [NSLocalizedDescriptionKey: destination.diagnostic ?? "The destination config cannot be safely backed up"])
+    }
+
+    let latestSource = inspectConfigFile(at: source.url)
+    guard latestSource.state == .usable,
+          let latestSourceContents = latestSource.contents,
+          latestSourceContents == sourceContents,
+          configInspectionMatches(source, latestSource) else {
+        throw NSError(domain: "AutoMountConfig", code: 5,
+                      userInfo: [NSLocalizedDescriptionKey: "The selected source config changed during recovery; review the latest config and retry"])
+    }
+    let latestDestination = inspectConfigFile(at: destinationURL)
+    guard configInspectionMatches(destination, latestDestination) else {
+        throw NSError(domain: "AutoMountConfig", code: 6,
+                      userInfo: [NSLocalizedDescriptionKey: "The destination config changed during recovery; review the latest config and retry"])
+    }
+
+    let backupURL = try backUpConfigFile(latestDestination)
+    do {
+        try atomicWrite(latestSourceContents, to: destinationURL, permissions: 0o600)
+        let replaced = inspectConfigFile(at: destinationURL)
+        guard replaced.state == .usable, replaced.contents == latestSourceContents else {
+            throw NSError(domain: "AutoMountConfig", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "The replacement config did not pass read-back validation"])
+        }
+        return backupURL
+    } catch {
+        do {
+            if let originalContents = latestDestination.contents {
+                try atomicWrite(originalContents, to: destinationURL, permissions: 0o600)
+            } else if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try FileManager.default.removeItem(at: destinationURL)
+            }
+        } catch {
+            throw NSError(domain: "AutoMountConfig", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "Config replacement failed: \(error.localizedDescription). Restoring the previous destination also failed."])
+        }
+        throw error
     }
 }
 
@@ -566,16 +692,30 @@ func encodeConfigPreservingUnknownFields(_ config: AutoMountConfig, at configURL
 
 // 保存配置并限制读取权限，避免 SMB URL 中可能含有的凭据被其他本机用户读取。
 @discardableResult
-func saveConfig(_ config: AutoMountConfig, to configURL: URL? = nil, syncInstalled: Bool = true) -> Bool {
+func saveConfig(
+    _ config: AutoMountConfig,
+    to configURL: URL? = nil,
+    syncInstalled: Bool = true,
+    preserveUnknownFields: Bool = true,
+    mergeRuntimeMetadata: Bool = true
+) -> Bool {
     let resolvedURL = configURL ?? getConfigURL()
     var configToSave = config
     let runtimeConfigURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
-    if resolvedURL.standardizedFileURL.path != runtimeConfigURL.standardizedFileURL.path,
+    if mergeRuntimeMetadata,
+       resolvedURL.standardizedFileURL.path != runtimeConfigURL.standardizedFileURL.path,
        let runtimeConfig = loadConfig(from: runtimeConfigURL, migrate: false) {
         mergeDaemonOwnedMetadata(into: &configToSave, from: runtimeConfig)
     }
     do {
-        let data = try encodeConfigPreservingUnknownFields(configToSave, at: resolvedURL)
+        let data: Data
+        if preserveUnknownFields {
+            data = try encodeConfigPreservingUnknownFields(configToSave, at: resolvedURL)
+        } else {
+            let encoder = PropertyListEncoder()
+            encoder.outputFormat = .xml
+            data = try encoder.encode(configToSave)
+        }
         try atomicWrite(data, to: resolvedURL, permissions: 0o600)
         print(tr("✓ 配置已即时保存至: \(resolvedURL.path)",
                  "✓ Config saved to: \(resolvedURL.path)"))
@@ -1142,6 +1282,13 @@ func disableSpotlightIndex(at mountPath: String) {
 }
 
 // 静默挂载网络卷宗。/Volumes 下的标准共享名由 NetFS 创建挂载目录，避免普通 LaunchAgent 写系统目录。
+func netFSMountOptions(hasExplicitMountPoint: Bool) -> NSMutableDictionary? {
+    guard hasExplicitMountPoint else { return nil }
+    let options = NSMutableDictionary()
+    options[kNetFSMountAtMountDirKey as String] = true
+    return options
+}
+
 func silentMount(urlString: String, mountPath: String) -> Bool {
     if let error = validateMountTargetURL(urlString) {
         fputs("    ✗ \(error)\n", stderr)
@@ -1168,6 +1315,7 @@ func silentMount(urlString: String, mountPath: String) -> Bool {
     }
     let openOptions = NSMutableDictionary()
     openOptions[kNAUIOptionKey as String] = kNAUIOptionNoUI as String
+    let mountOptions = netFSMountOptions(hasExplicitMountPoint: mountpointURL != nil)
     var mountPoints: Unmanaged<CFArray>?
     let status = NetFSMountURLSync(
         url,
@@ -1175,7 +1323,7 @@ func silentMount(urlString: String, mountPath: String) -> Bool {
         nil,
         nil,
         openOptions as CFMutableDictionary,
-        nil,
+        mountOptions as CFMutableDictionary?,
         &mountPoints
     )
     let returnedMountPaths = mountPoints?.takeRetainedValue() as? [String] ?? []
@@ -1512,7 +1660,7 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
 
 // MARK: - 初始化向导 (--init)
 
-func runInitWizard() {
+func runInitWizard(offerServiceInstallation: Bool = true) -> Bool {
     print(tr("""
     Auto Mount Tool - 初始化配置向导 (v\(autoMountVersion))
     ======================================
@@ -1520,11 +1668,6 @@ func runInitWizard() {
     Auto Mount Tool - Setup Wizard (v\(autoMountVersion))
     ====================================
     """))
-
-    if loadConfig() != nil {
-        print(tr("  [提示] 检测到已存在配置文件，继续向导将全量重写配置；如需增删目标请使用 './auto_mount --config'。\n",
-                 "  [Note] Existing configuration detected. Continuing will overwrite it; use './auto_mount --config' for incremental edits.\n"))
-    }
 
     // 1. 物理网关 MAC 探测
     print(tr("[1/5] 局域网物理网关指纹检测", "[1/5] LAN Gateway Hardware Fingerprint Detection"))
@@ -1812,9 +1955,33 @@ func runInitWizard() {
 
     // 保存配置
     let config = AutoMountConfig(version: autoMountVersion, updateChannel: selectedChannel, lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: profiles)
-    saveConfig(config)
+    let workspaceConfigURL = getWorkspaceConfigURL()
+    let previousWorkspaceConfig = inspectConfigFile(at: workspaceConfigURL)
+    guard previousWorkspaceConfig.state != .inaccessible else {
+        fputs(tr("✗ 无法安全读取或备份工作区配置；未写入新配置。\n",
+                 "✗ The workspace config cannot be safely read or backed up; no new config was written.\n"), stderr)
+        return false
+    }
+    if let backupURL = try? backUpConfigFile(previousWorkspaceConfig) {
+        print(tr("✓ 已备份原工作区配置: \(backupURL.path)", "✓ Backed up the previous workspace config: \(backupURL.path)"))
+    } else if previousWorkspaceConfig.contents != nil {
+        fputs(tr("✗ 无法备份现有工作区配置；未覆盖原文件。\n",
+                 "✗ Could not back up the existing workspace config; the original file was not replaced.\n"), stderr)
+        return false
+    }
+    guard saveConfig(config, to: workspaceConfigURL, syncInstalled: false,
+                     preserveUnknownFields: false, mergeRuntimeMetadata: false) else {
+        fputs(tr("✗ 新配置未能保存；未继续部署守护服务。\n",
+                 "✗ The new config could not be saved; daemon deployment was not continued.\n"), stderr)
+        return false
+    }
     print(tr("\n[DONE] 初始化完成！配置已写入 \(getConfigURL().path)",
              "\n[DONE] Setup complete! Configuration written to \(getConfigURL().path)"))
+
+    guard offerServiceInstallation else {
+        print(tr("✓ 配置已保存；正在继续当前命令。\n", "✓ Config saved; continuing the current command.\n"))
+        return true
+    }
 
     // 5. 部署后台自启动守护服务
     let daemonOptions = [
@@ -1835,6 +2002,145 @@ func runInitWizard() {
         print(tr("  ✓ 已跳过后台服务安装。后续可随时运行 './auto_mount --install' 进行部署。\n",
                  "  ✓ Daemon deployment skipped. You can run './auto_mount --install' anytime later.\n"))
     }
+    return true
+}
+
+func runInitCommand(resetExistingConfig: Bool = false) -> Bool {
+    let workspaceURL = getWorkspaceConfigURL()
+    let runtimeURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
+    let workspace = inspectConfigFile(at: workspaceURL)
+    let runtime = inspectConfigFile(at: runtimeURL)
+
+    let equivalent = workspace.state == .usable && runtime.state == .usable
+        && workspace.config.map { workspaceConfig in
+            runtime.config.map { installConfigModelsAreEquivalent(workspaceConfig, $0) } ?? false
+        } == true
+    switch resolveInitConfigState(
+        resetExistingConfig: resetExistingConfig,
+        workspaceState: workspace.state,
+        runtimeState: runtime.state,
+        documentsEquivalent: equivalent
+    ) {
+    case .preserve(.runtime):
+        if workspace.state == .invalid {
+            print(tr("✓ 已保留有效的守护配置；工作区文件无效。请运行 `--config` 恢复工作区，或运行 `--install` 部署服务。",
+                     "✓ Preserved the usable daemon config; the workspace file is invalid. Run `--config` to restore the workspace or `--install` to deploy the service."))
+        } else {
+            print(tr("✓ 已找到有效的守护配置；`--init` 未重建它。请用 `--config` 管理配置，或用 `--install` 部署守护程序。",
+                     "✓ A usable daemon config already exists; `--init` left it intact. Use `--config` to manage it or `--install` to deploy the daemon."))
+        }
+        return true
+    case .preserve(.workspace):
+        if runtime.state == .invalid, FileManager.default.fileExists(atPath: getLaunchAgentPlistURL().path) {
+            print(tr("✓ 已保留有效的工作区配置；守护配置无效。请运行 `--install`，程序会先备份并恢复守护配置。",
+                     "✓ Preserved the usable workspace config; the daemon config is invalid. Run `--install` to back it up and restore it."))
+        } else {
+            print(tr("✓ 已找到有效的工作区配置；`--init` 未重建它。请用 `--config` 修改配置，或用 `--install` 部署守护程序。",
+                     "✓ A usable workspace config already exists; `--init` left it intact. Use `--config` to edit it or `--install` to deploy the daemon."))
+        }
+        return true
+    case .diverged:
+        print(tr("⚠ 工作区与守护配置都有效但内容不同；`--init` 未覆盖任何一份。请用 `--config` 管理活动守护配置，或用 `--install --config-source workspace` 明确选择工作区配置。",
+                 "⚠ Both workspace and daemon configs are valid but differ; `--init` did not replace either one. Use `--config` to manage the active daemon config, or `--install --config-source workspace` to explicitly select the workspace config."))
+        return true
+    case let .futureVersion(location, version):
+        let name = location == .runtime ? tr("守护", "daemon") : tr("工作区", "workspace")
+        fputs(tr("✗ \(name)配置版本 v\(version) 高于当前程序 v\(autoMountVersion)；未重置配置。请先使用兼容版本，或明确运行 `--init --reset`。\n",
+                 "✗ The \(name) config v\(version) is newer than program v\(autoMountVersion); it was not reset. Use a compatible newer program or explicitly run `--init --reset`.\n"), stderr)
+        return false
+    case let .inaccessible(location):
+        let name = location == .runtime ? tr("守护", "daemon") : tr("工作区", "workspace")
+        fputs(tr("✗ 无法安全读取或备份\(name)配置；未启动初始化向导。\n",
+                 "✗ The \(name) config cannot be safely read or backed up; the setup wizard was not started.\n"), stderr)
+        return false
+    case .initialize:
+        break
+    }
+
+    guard isatty(STDIN_FILENO) == 1 else {
+        fputs(tr("✗ 当前没有可用配置且输入不是交互终端；请在 Terminal 中运行 `./auto_mount --init`。\n",
+                 "✗ No usable config exists and stdin is not interactive; run `./auto_mount --init` in Terminal.\n"), stderr)
+        return false
+    }
+    return runInitWizard()
+}
+
+func configURL(for location: InstallConfigLocation) -> URL {
+    switch location {
+    case .workspace:
+        return getWorkspaceConfigURL()
+    case .runtime:
+        return getInstalledDir().appendingPathComponent("auto_mount.plist")
+    }
+}
+
+func prepareManagementConfigURL() -> URL? {
+    let workspaceURL = getWorkspaceConfigURL()
+    let runtimeURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
+    let launchAgentInstalled = FileManager.default.fileExists(atPath: getLaunchAgentPlistURL().path)
+    var didRunSetup = false
+
+    for _ in 0..<2 {
+        let workspace = inspectConfigFile(at: workspaceURL)
+        let runtime = inspectConfigFile(at: runtimeURL)
+        let resolution = resolveManagementConfigLocation(
+            launchAgentInstalled: launchAgentInstalled,
+            workspaceState: workspace.state,
+            runtimeState: runtime.state
+        )
+
+        switch resolution {
+        case let .selected(location):
+            if workspace.state == .usable, runtime.state == .usable,
+               let workspaceConfig = workspace.config, let runtimeConfig = runtime.config,
+               !installConfigModelsAreEquivalent(workspaceConfig, runtimeConfig) {
+                let active = launchAgentInstalled ? runtimeURL.path : workspaceURL.path
+                print(tr("⚠ 工作区与守护配置内容不同；本次管理活动配置：\(active)",
+                         "⚠ Workspace and daemon configs differ; managing the active config: \(active)"))
+            }
+            return configURL(for: location)
+        case let .recover(target, source):
+            let sourceInspection = source == .workspace ? workspace : runtime
+            let destinationInspection = target == .workspace ? workspace : runtime
+            do {
+                let backupURL = try replaceConfigFile(
+                    with: sourceInspection,
+                    at: configURL(for: target),
+                    destination: destinationInspection
+                )
+                if let backupURL {
+                    print(tr("✓ 已备份不可用配置: \(backupURL.path)", "✓ Backed up the unusable config: \(backupURL.path)"))
+                }
+                print(tr("✓ 已从\(source == .workspace ? "工作区" : "守护")配置恢复\(target == .workspace ? "工作区" : "守护")配置。",
+                         "✓ Restored the \(target == .workspace ? "workspace" : "daemon") config from the \(source == .workspace ? "workspace" : "daemon") config."))
+                writeLog("Configuration management restored \(target) config from \(source)")
+                return configURL(for: target)
+            } catch {
+                fputs(tr("✗ 配置恢复失败，未进入管理菜单: \(error.localizedDescription)\n",
+                         "✗ Config recovery failed; the management menu was not opened: \(error.localizedDescription)\n"), stderr)
+                return nil
+            }
+        case .initialize:
+            guard !didRunSetup, isatty(STDIN_FILENO) == 1 else {
+                fputs(tr("✗ 没有可用配置。请在交互式 Terminal 中运行 `./auto_mount --init`。\n",
+                         "✗ No usable config exists. Run `./auto_mount --init` in an interactive Terminal.\n"), stderr)
+                return nil
+            }
+            didRunSetup = true
+            guard runInitWizard(offerServiceInstallation: false) else { return nil }
+        case let .futureVersion(location, version):
+            let name = location == .runtime ? tr("守护", "daemon") : tr("工作区", "workspace")
+            fputs(tr("✗ \(name)配置版本 v\(version) 高于当前程序 v\(autoMountVersion)；未修改配置。请先使用兼容版本。\n",
+                     "✗ The \(name) config v\(version) is newer than program v\(autoMountVersion); no config was changed. Use a compatible newer program first.\n"), stderr)
+            return nil
+        case let .inaccessible(location):
+            let name = location == .runtime ? tr("守护", "daemon") : tr("工作区", "workspace")
+            fputs(tr("✗ 无法安全读取或备份\(name)配置；未修改任何文件。\n",
+                     "✗ The \(name) config cannot be safely read or backed up; no files were changed.\n"), stderr)
+            return nil
+        }
+    }
+    return nil
 }
 
 // MARK: - 日常配置维护菜单 (--config)
@@ -2564,13 +2870,8 @@ func manageUpdateChannel(config: inout AutoMountConfig) {
 // MARK: - 日常配置维护菜单入口 (--config)
 
 func manageConfiguration() {
-    let runtimeConfigURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
-    configURLOverride = preferredManagementConfigURL(
-        workspaceURL: getWorkspaceConfigURL(),
-        runtimeURL: runtimeConfigURL,
-        launchAgentInstalled: FileManager.default.fileExists(atPath: getLaunchAgentPlistURL().path),
-        runtimeConfigExists: FileManager.default.fileExists(atPath: runtimeConfigURL.path)
-    )
+    guard let managementConfigURL = prepareManagementConfigURL() else { exit(1) }
+    configURLOverride = managementConfigURL
     defer { configURLOverride = nil }
 
     print(tr("""
@@ -2582,8 +2883,8 @@ func manageConfiguration() {
     """))
 
     guard var config = loadConfig() else {
-        fputs(tr("✗ 未找到配置文件，请先运行 './auto_mount --init' 初始化。\n",
-                 "✗ Configuration not found. Please run './auto_mount --init' first.\n"), stderr)
+        fputs(tr("✗ 配置恢复或迁移失败；未打开管理菜单。\n",
+                 "✗ Config recovery or migration failed; the management menu was not opened.\n"), stderr)
         exit(1)
     }
     print(tr("当前配置编辑路径: \(getConfigURL().path)", "Current configuration edit path: \(getConfigURL().path)"))
@@ -2763,13 +3064,59 @@ enum InstallConfigLocation: Equatable {
 enum InstallConfigResolution: Equatable {
     case selected(InstallConfigLocation)
     case diverged
+    case repairRuntimeFromWorkspace
+    case initialize
     case unavailable(InstallConfigLocation)
-    case invalidRuntime
+    case futureVersion(InstallConfigLocation, String)
+    case inaccessible(InstallConfigLocation)
+}
+
+enum ManagementConfigResolution: Equatable {
+    case selected(InstallConfigLocation)
+    case recover(target: InstallConfigLocation, source: InstallConfigLocation)
+    case initialize
+    case futureVersion(InstallConfigLocation, String)
+    case inaccessible(InstallConfigLocation)
+}
+
+enum InitConfigResolution: Equatable {
+    case preserve(InstallConfigLocation)
+    case diverged
+    case initialize
+    case futureVersion(InstallConfigLocation, String)
+    case inaccessible(InstallConfigLocation)
+}
+
+func resolveInitConfigState(
+    resetExistingConfig: Bool,
+    workspaceState: ConfigFileState,
+    runtimeState: ConfigFileState,
+    documentsEquivalent: Bool
+) -> InitConfigResolution {
+    if resetExistingConfig {
+        if workspaceState == .inaccessible { return .inaccessible(.workspace) }
+        if runtimeState == .inaccessible { return .inaccessible(.runtime) }
+        return .initialize
+    }
+    if !resetExistingConfig, case let .futureVersion(version) = runtimeState {
+        return .futureVersion(.runtime, version)
+    }
+    if !resetExistingConfig, case let .futureVersion(version) = workspaceState {
+        return .futureVersion(.workspace, version)
+    }
+    if workspaceState == .inaccessible { return .inaccessible(.workspace) }
+    if runtimeState == .inaccessible { return .inaccessible(.runtime) }
+    if workspaceState == .usable, runtimeState == .usable,
+       !documentsEquivalent {
+        return .diverged
+    }
+    if workspaceState == .usable { return .preserve(.workspace) }
+    if runtimeState == .usable { return .preserve(.runtime) }
+    return .initialize
 }
 
 func installConfigIsUsable(at url: URL) -> Bool {
-    guard let config = loadConfig(from: url, migrate: false) else { return false }
-    return !config.profiles.isEmpty && configVersionCanBeMigrated(config.version)
+    inspectConfigFile(at: url).state == .usable
 }
 
 func installConfigModelsAreEquivalent(_ lhsConfig: AutoMountConfig, _ rhsConfig: AutoMountConfig) -> Bool {
@@ -2795,25 +3142,103 @@ func installConfigDocumentsAreEquivalent(_ lhsURL: URL, _ rhsURL: URL) -> Bool {
     return installConfigModelsAreEquivalent(lhs, rhs)
 }
 
+func resolveManagementConfigLocation(
+    launchAgentInstalled: Bool,
+    workspaceState: ConfigFileState,
+    runtimeState: ConfigFileState
+) -> ManagementConfigResolution {
+    let activeLocation: InstallConfigLocation = launchAgentInstalled ? .runtime : .workspace
+    let fallbackLocation: InstallConfigLocation = launchAgentInstalled ? .workspace : .runtime
+    let activeState = launchAgentInstalled ? runtimeState : workspaceState
+    let fallbackState = launchAgentInstalled ? workspaceState : runtimeState
+
+    switch activeState {
+    case .usable:
+        return .selected(activeLocation)
+    case let .futureVersion(version):
+        return .futureVersion(activeLocation, version)
+    case .inaccessible:
+        return .inaccessible(activeLocation)
+    case .missing, .invalid:
+        switch fallbackState {
+        case .usable:
+            return .recover(target: activeLocation, source: fallbackLocation)
+        case let .futureVersion(version):
+            return .futureVersion(fallbackLocation, version)
+        case .inaccessible:
+            return .inaccessible(fallbackLocation)
+        case .missing, .invalid:
+            return .initialize
+        }
+    }
+}
+
 func resolveInstallConfigLocation(
     requested: InstallConfigLocation?,
-    workspaceExists: Bool,
-    runtimeExists: Bool,
-    workspaceUsable: Bool,
-    runtimeUsable: Bool,
+    workspaceState: ConfigFileState,
+    runtimeState: ConfigFileState,
     documentsEquivalent: Bool
 ) -> InstallConfigResolution {
     if let requested {
-        let exists = requested == .workspace ? workspaceExists : runtimeExists
-        let usable = requested == .workspace ? workspaceUsable : runtimeUsable
-        return exists && usable ? .selected(requested) : .unavailable(requested)
+        let requestedState = requested == .workspace ? workspaceState : runtimeState
+        if requested == .workspace, runtimeState == .inaccessible {
+            return .inaccessible(.runtime)
+        }
+        switch requestedState {
+        case .usable:
+            return .selected(requested)
+        case let .futureVersion(version):
+            return .futureVersion(requested, version)
+        case .inaccessible:
+            return .inaccessible(requested)
+        case .missing, .invalid:
+            return .unavailable(requested)
+        }
     }
-    guard runtimeExists else {
-        return workspaceUsable ? .selected(.workspace) : .unavailable(.workspace)
+
+    switch runtimeState {
+    case let .futureVersion(version):
+        return .futureVersion(.runtime, version)
+    case .inaccessible:
+        return .inaccessible(.runtime)
+    case .usable:
+        if workspaceState == .usable {
+            return documentsEquivalent ? .selected(.runtime) : .diverged
+        }
+        return .selected(.runtime)
+    case .missing, .invalid:
+        switch workspaceState {
+        case .usable:
+            return runtimeState == .invalid ? .repairRuntimeFromWorkspace : .selected(.workspace)
+        case let .futureVersion(version):
+            return .futureVersion(.workspace, version)
+        case .inaccessible:
+            return .inaccessible(.workspace)
+        case .missing, .invalid:
+            return .initialize
+        }
     }
-    guard runtimeUsable else { return .invalidRuntime }
-    guard workspaceExists && workspaceUsable else { return .selected(.runtime) }
-    return documentsEquivalent ? .selected(.runtime) : .diverged
+}
+
+func printConfigRecoveryFailure(_ resolution: InstallConfigResolution) {
+    let message: String
+    switch resolution {
+    case .futureVersion(let location, let version):
+        let source = location == .runtime ? tr("守护", "daemon") : tr("工作区", "workspace")
+        message = tr("✗ \(source)配置版本 v\(version) 高于当前程序 v\(autoMountVersion)；为避免降级破坏配置，未覆盖任何文件。请先升级工作区程序，或显式选择一个当前程序可读取的配置来源。\n",
+                     "✗ The \(source) config v\(version) is newer than program v\(autoMountVersion); no files were replaced. Update the workspace program or explicitly select a config source supported by this program.\n")
+    case .inaccessible(let location):
+        let source = location == .runtime ? tr("守护", "daemon") : tr("工作区", "workspace")
+        message = tr("✗ \(source)配置无法安全读取或备份；未修改文件，也未注册服务。\n",
+                     "✗ The \(source) config cannot be safely read or backed up; no files were changed and no service was registered.\n")
+    case .unavailable(.runtime):
+        message = tr("✗ 请求使用的守护配置不存在或无效。\n", "✗ The requested daemon config is missing or invalid.\n")
+    case .unavailable(.workspace):
+        message = tr("✗ 请求使用的工作区配置不存在或无效。\n", "✗ The requested workspace config is missing or invalid.\n")
+    default:
+        message = tr("✗ 没有可迁移的有效配置。\n", "✗ No usable, migratable config is available.\n")
+    }
+    fputs(message, stderr)
 }
 
 func promptForInstallConfigLocation() -> InstallConfigLocation? {
@@ -2847,33 +3272,56 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
     let plistURL = getLaunchAgentPlistURL()
     let launchAgentsDir = plistURL.deletingLastPathComponent()
 
-    do {
-        try FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true, attributes: nil)
-        try FileManager.default.createDirectory(at: launchAgentsDir, withIntermediateDirectories: true, attributes: nil)
-    } catch {
-        fputs(tr("✗ 创建目录失败: \(error.localizedDescription)\n", "✗ Failed to create directory: \(error.localizedDescription)\n"), stderr)
-        exit(1)
-    }
-
     let sourceURL = currentAppDir.appendingPathComponent("auto_mount.swift")
-    let sourceConfigURL = getConfigURL()
+    let sourceConfigURL = getWorkspaceConfigURL()
     let installedBinaryURL = installDir.appendingPathComponent("auto_mount")
     let installedSourceURL = installDir.appendingPathComponent("auto_mount.swift")
     let installedConfigURL = installDir.appendingPathComponent("auto_mount.plist")
-    let workspaceConfigExists = FileManager.default.fileExists(atPath: sourceConfigURL.path)
-    let runtimeConfigExists = FileManager.default.fileExists(atPath: installedConfigURL.path)
-    let workspaceConfigUsable = workspaceConfigExists && installConfigIsUsable(at: sourceConfigURL)
-    let runtimeConfigUsable = runtimeConfigExists && installConfigIsUsable(at: installedConfigURL)
-    let configsEquivalent = workspaceConfigUsable && runtimeConfigUsable
-        && installConfigDocumentsAreEquivalent(sourceConfigURL, installedConfigURL)
+    var workspace = inspectConfigFile(at: sourceConfigURL)
+    var runtime = inspectConfigFile(at: installedConfigURL)
+    var configsEquivalent = workspace.state == .usable && runtime.state == .usable
+        && workspace.config.map { workspaceConfig in
+            runtime.config.map { installConfigModelsAreEquivalent(workspaceConfig, $0) } ?? false
+        } == true
     var resolution = resolveInstallConfigLocation(
         requested: requestedConfigLocation,
-        workspaceExists: workspaceConfigExists,
-        runtimeExists: runtimeConfigExists,
-        workspaceUsable: workspaceConfigUsable,
-        runtimeUsable: runtimeConfigUsable,
+        workspaceState: workspace.state,
+        runtimeState: runtime.state,
         documentsEquivalent: configsEquivalent
     )
+
+    if resolution == .initialize {
+        guard isatty(STDIN_FILENO) == 1 else {
+            fputs(tr("✗ 工作区和守护目录都没有可用配置；请在交互式 Terminal 中运行 `./auto_mount --install` 并完成配置向导。未注册服务。\n",
+                     "✗ Neither workspace nor daemon directory has a usable config. Run `./auto_mount --install` in an interactive Terminal to complete setup. No service was registered.\n"), stderr)
+            writeLog("Install stopped before service registration because setup requires an interactive terminal")
+            exit(1)
+        }
+        guard runInitWizard(offerServiceInstallation: false) else {
+            fputs(tr("✗ 配置向导未能保存有效配置；未注册服务。\n",
+                     "✗ The setup wizard did not save a usable config; no service was registered.\n"), stderr)
+            exit(1)
+        }
+        workspace = inspectConfigFile(at: sourceConfigURL)
+        runtime = inspectConfigFile(at: installedConfigURL)
+        configsEquivalent = workspace.state == .usable && runtime.state == .usable
+            && workspace.config.map { workspaceConfig in
+                runtime.config.map { installConfigModelsAreEquivalent(workspaceConfig, $0) } ?? false
+            } == true
+        resolution = resolveInstallConfigLocation(
+            requested: requestedConfigLocation,
+            workspaceState: workspace.state,
+            runtimeState: runtime.state,
+            documentsEquivalent: configsEquivalent
+        )
+    }
+
+    if resolution == .repairRuntimeFromWorkspace {
+        print(tr("⚠ 守护配置内容无效；将先备份它，再从有效工作区配置恢复。",
+                 "⚠ The daemon config is invalid; it will be backed up and restored from the usable workspace config."))
+        writeLog("Install will recover the invalid runtime config from the usable workspace config")
+        resolution = .selected(.workspace)
+    }
     if resolution == .diverged {
         if isatty(STDIN_FILENO) == 1 {
             guard let choice = promptForInstallConfigLocation() else {
@@ -2888,28 +3336,37 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
         }
     }
     guard case let .selected(configLocation) = resolution else {
-        let message: String
-        switch resolution {
-        case .invalidRuntime:
-            message = tr("✗ 已安装的守护配置无效或版本较新；未覆盖该配置。确认工作区配置后，可显式运行 './auto_mount --install --config-source workspace' 修复。\n",
-                         "✗ The installed daemon config is invalid or newer; it was not overwritten. After verifying the workspace config, explicitly run './auto_mount --install --config-source workspace' to repair it.\n")
-        case .unavailable(.runtime):
-            message = tr("✗ 请求使用的守护配置不存在或无效。\n", "✗ The requested daemon config is missing or invalid.\n")
-        default:
-            message = tr("✗ 没有可迁移的有效配置；请先运行 './auto_mount --init'，或显式选择有效的配置来源。\n",
-                         "✗ No valid, migratable config is available. Run './auto_mount --init' or explicitly select a valid config source.\n")
-        }
-        fputs(message, stderr)
+        printConfigRecoveryFailure(resolution)
         writeLog("Install aborted because no usable requested config source was available: \(resolution)")
         exit(1)
     }
     let configSourceURL = configLocation == .workspace ? sourceConfigURL : installedConfigURL
-    let shouldSeedRuntimeConfig = !runtimeConfigExists
-    if configLocation == .workspace && runtimeConfigExists {
-        print(tr("⚠ 本次明确使用工作区配置更新守护配置。", "⚠ This install will replace the daemon config with the explicitly selected workspace config."))
+    let configSourceInspection = configLocation == .workspace ? workspace : runtime
+    guard configSourceInspection.state == .usable, let configSourceContents = configSourceInspection.contents else {
+        fputs(tr("✗ 选中的配置来源在安装前已不可用；未注册或重载服务。\n",
+                 "✗ The selected config source is no longer usable; the service was not registered or reloaded.\n"), stderr)
+        exit(1)
+    }
+    let runtimeConfigExists = runtime.state != .missing
+    let workspaceConfigExists = workspace.state != .missing
+    let workspaceConfigUsable = workspace.state == .usable
+    let shouldSeedRuntimeConfig = runtime.state == .missing
+    let runtimeConfigWillBeReplaced = configLocation == .workspace
+        && runtime.contents != workspace.contents
+    if configLocation == .workspace && runtimeConfigExists && runtimeConfigWillBeReplaced {
+        print(tr("⚠ 本次将用工作区配置更新守护配置，并先备份现有守护配置。",
+                 "⚠ This install will replace the daemon config from the workspace after backing up the existing daemon config."))
         writeLog("Install explicitly selected workspace config to replace the runtime daemon config")
     } else if configLocation == .runtime && workspaceConfigExists && !workspaceConfigUsable {
         print(tr("⚠ 工作区配置无效或版本较新；本次保留有效的守护配置。", "⚠ Workspace config is invalid or newer; preserving the usable daemon config."))
+    }
+
+    do {
+        try FileManager.default.createDirectory(at: installDir, withIntermediateDirectories: true, attributes: nil)
+        try FileManager.default.createDirectory(at: launchAgentsDir, withIntermediateDirectories: true, attributes: nil)
+    } catch {
+        fputs(tr("✗ 创建目录失败: \(error.localizedDescription)\n", "✗ Failed to create directory: \(error.localizedDescription)\n"), stderr)
+        exit(1)
     }
 
     let stagedBinaryURL = FileManager.default.temporaryDirectory
@@ -2940,7 +3397,7 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
     }
 
     do {
-        try atomicCopyFile(from: configSourceURL, to: stagedConfigURL, permissions: 0o600)
+        try atomicWrite(configSourceContents, to: stagedConfigURL, permissions: 0o600)
     } catch {
         fputs(tr("✗ 无法暂存守护配置，现有文件未更改: \(error.localizedDescription)\n",
                  "✗ Could not stage daemon config; existing files were not changed: \(error.localizedDescription)\n"), stderr)
@@ -2960,6 +3417,13 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
         exit(1)
     }
 
+    let stagedConfigInspection = inspectConfigFile(at: stagedConfigURL)
+    guard stagedConfigInspection.state == .usable, let stagedConfigContents = stagedConfigInspection.contents else {
+        fputs(tr("✗ 暂存配置未通过回读验证；已安装文件和守护服务均未更改。\n",
+                 "✗ Staged config failed read-back validation; installed files and the daemon were not changed.\n"), stderr)
+        writeLog("Install aborted because staged config failed read-back validation")
+        exit(1)
+    }
     let programArguments = launchAgentProgramArguments(binaryURL: installedBinaryURL,
                                                        sourceURL: installedSourceURL,
                                                        preferSource: sourceExists)
@@ -2990,7 +3454,6 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
     } else {
         replacements.append(StagedFileReplacement(sourceURL: currentBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
     }
-    replacements.append(StagedFileReplacement(sourceURL: stagedConfigURL, destinationURL: installedConfigURL, permissions: 0o600))
     replacements.append(StagedFileReplacement(sourceURL: stagedPlistURL, destinationURL: plistURL, permissions: 0o644))
 
     let serviceTarget = "gui/\(getuid())/\(launchAgentLabel)"
@@ -3005,7 +3468,32 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
     }
 
     do {
-        try replaceFilesTransactionally(replacements) {
+        let latestSource = inspectConfigFile(at: configSourceURL)
+        guard latestSource.state == .usable, latestSource.contents == configSourceContents else {
+            throw NSError(domain: "AutoMountInstall", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "The selected config source changed during installation; rerun the command to review the latest config"])
+        }
+        let latestRuntime = inspectConfigFile(at: installedConfigURL)
+        guard latestRuntime.state != .inaccessible else {
+            throw NSError(domain: "AutoMountInstall", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "The runtime config cannot be read or backed up safely"])
+        }
+        let runtimeConfigNeedsReplacement = latestRuntime.contents != stagedConfigContents
+        if runtimeConfigNeedsReplacement, latestRuntime.contents != nil {
+            guard let backupURL = try backUpConfigFile(latestRuntime) else {
+                throw NSError(domain: "AutoMountInstall", code: 5,
+                              userInfo: [NSLocalizedDescriptionKey: "No readable bytes were available for the runtime config backup"])
+            }
+            print(tr("✓ 已备份原守护配置: \(backupURL.path)", "✓ Backed up the previous daemon config: \(backupURL.path)"))
+            writeLog("Backed up daemon config before replacement to \(backupURL.path)")
+        }
+        var finalReplacements = replacements
+        if runtimeConfigNeedsReplacement {
+            finalReplacements.append(StagedFileReplacement(sourceURL: stagedConfigURL,
+                                                           destinationURL: installedConfigURL,
+                                                           permissions: 0o600))
+        }
+        try replaceFilesTransactionally(finalReplacements) {
             let uid = getuid()
             let bootResult = runCommand(executable: "/bin/launchctl",
                                         arguments: ["bootstrap", "gui/\(uid)", plistURL.path])
@@ -3306,10 +3794,10 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
         print("SKIP \(name): \(reason)")
     }
 
-    check(parseSemanticVersion("v2.7.0") == [2, 7, 0], "semantic version parses v-prefixed release")
+    check(parseSemanticVersion("v2.7.2") == [2, 7, 2], "semantic version parses v-prefixed release")
     check(parseSemanticVersion("2.6.x").isEmpty, "malformed semantic version is rejected")
     check(parseSemanticVersion("2.06.1").isEmpty, "leading-zero semantic component is rejected")
-    check(isNewerVersion("v2.7.1", than: "2.7.0"), "newer patch version is ordered")
+    check(isNewerVersion("v2.7.2", than: "2.7.1"), "newer patch version is ordered")
     check(!isNewerVersion("2.6.99", than: "2.7.0"), "older version is not ordered as newer")
     check(!isNewerVersion("2.x.99", than: "2.7.0"), "malformed release cannot trigger update")
     check(swiftCompilerTargetTriple(architecture: "arm64") == "arm64-apple-macosx27.0",
@@ -3332,7 +3820,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
           "older macOS SDK versions are below the supported target")
     check(macOSSDKMajorVersion("unknown") == nil,
           "unrecognized SDK versions are rejected")
-    check(!configVersionCanBeMigrated("2.7.1"), "newer config versions are not downgraded")
+    check(!configVersionCanBeMigrated("2.7.3"), "newer config versions are not downgraded")
     check(configVersionCanBeMigrated("2.6.1"), "older config versions remain eligible for migration")
 
     let updateNow: TimeInterval = 10_000
@@ -3423,49 +3911,339 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
           && retainedExistingTarget?["custom_target"] as? String == "belongs to existing",
           "config merge does not transfer unknown fields to inserted or reordered items")
 
-    let workspaceConfigURL = URL(fileURLWithPath: "/tmp/automount-workspace/auto_mount.plist")
-    let runtimeConfigURL = URL(fileURLWithPath: "/tmp/automount-runtime/auto_mount.plist")
-    check(preferredManagementConfigURL(
-        workspaceURL: workspaceConfigURL,
-        runtimeURL: runtimeConfigURL,
-        launchAgentInstalled: true,
-        runtimeConfigExists: true
-    ) == runtimeConfigURL, "configuration management selects the installed daemon config")
-    check(preferredManagementConfigURL(
-        workspaceURL: workspaceConfigURL,
-        runtimeURL: runtimeConfigURL,
-        launchAgentInstalled: false,
-        runtimeConfigExists: false
-    ) == workspaceConfigURL, "configuration management falls back to workspace config without a daemon")
-
+    let missingConfigState = ConfigFileState.missing
+    let usableConfigState = ConfigFileState.usable
+    let invalidConfigState = ConfigFileState.invalid
+    let futureConfigState = ConfigFileState.futureVersion("2.7.3")
+    let inaccessibleConfigState = ConfigFileState.inaccessible
     check(resolveInstallConfigLocation(
-        requested: nil, workspaceExists: true, runtimeExists: false,
-        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
+        requested: nil, workspaceState: usableConfigState, runtimeState: missingConfigState,
+        documentsEquivalent: false
     ) == .selected(.workspace), "first daemon install seeds a valid workspace config")
     check(resolveInstallConfigLocation(
-        requested: nil, workspaceExists: true, runtimeExists: true,
-        workspaceUsable: true, runtimeUsable: true, documentsEquivalent: true
+        requested: nil, workspaceState: missingConfigState, runtimeState: usableConfigState,
+        documentsEquivalent: false
+    ) == .selected(.runtime), "runtime config is preserved when workspace config is missing")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceState: usableConfigState, runtimeState: usableConfigState,
+        documentsEquivalent: true
     ) == .selected(.runtime), "matching configs preserve daemon-owned runtime state")
     check(resolveInstallConfigLocation(
-        requested: nil, workspaceExists: true, runtimeExists: true,
-        workspaceUsable: true, runtimeUsable: true, documentsEquivalent: false
+        requested: nil, workspaceState: usableConfigState, runtimeState: usableConfigState,
+        documentsEquivalent: false
     ) == .diverged, "diverged configs require an explicit interactive choice")
     check(resolveInstallConfigLocation(
-        requested: nil, workspaceExists: false, runtimeExists: true,
-        workspaceUsable: false, runtimeUsable: true, documentsEquivalent: false
-    ) == .selected(.runtime), "runtime config is preserved when workspace config is absent")
+        requested: nil, workspaceState: usableConfigState, runtimeState: invalidConfigState,
+        documentsEquivalent: false
+    ) == .repairRuntimeFromWorkspace, "invalid runtime config is recovered from a valid workspace config")
     check(resolveInstallConfigLocation(
-        requested: nil, workspaceExists: true, runtimeExists: true,
-        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
-    ) == .invalidRuntime, "invalid runtime config is not silently replaced")
+        requested: nil, workspaceState: invalidConfigState, runtimeState: usableConfigState,
+        documentsEquivalent: false
+    ) == .selected(.runtime), "valid runtime config wins over an invalid workspace config")
     check(resolveInstallConfigLocation(
-        requested: .workspace, workspaceExists: true, runtimeExists: true,
-        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
+        requested: nil, workspaceState: invalidConfigState, runtimeState: missingConfigState,
+        documentsEquivalent: false
+    ) == .initialize, "installation requests setup when neither config is usable")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceState: futureConfigState, runtimeState: usableConfigState,
+        documentsEquivalent: false
+    ) == .selected(.runtime), "valid runtime config is retained when workspace config is from a newer version")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceState: usableConfigState, runtimeState: futureConfigState,
+        documentsEquivalent: false
+    ) == .futureVersion(.runtime, "2.7.3"), "newer runtime config prevents an implicit downgrade")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceState: usableConfigState, runtimeState: inaccessibleConfigState,
+        documentsEquivalent: false
+    ) == .inaccessible(.runtime), "runtime access failures stop installation before replacement")
+    check(resolveInstallConfigLocation(
+        requested: .workspace, workspaceState: usableConfigState, runtimeState: invalidConfigState,
+        documentsEquivalent: false
     ) == .selected(.workspace), "explicit workspace selection can repair an invalid runtime config")
     check(resolveInstallConfigLocation(
-        requested: .runtime, workspaceExists: true, runtimeExists: false,
-        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
+        requested: .workspace, workspaceState: usableConfigState, runtimeState: futureConfigState,
+        documentsEquivalent: false
+    ) == .selected(.workspace), "explicit workspace selection can replace a newer runtime after backup")
+    check(resolveInstallConfigLocation(
+        requested: .runtime, workspaceState: usableConfigState, runtimeState: missingConfigState,
+        documentsEquivalent: false
     ) == .unavailable(.runtime), "explicit runtime selection fails when runtime config is absent")
+    check(resolveInstallConfigLocation(
+        requested: .runtime, workspaceState: usableConfigState, runtimeState: futureConfigState,
+        documentsEquivalent: false
+    ) == .futureVersion(.runtime, "2.7.3"), "explicit runtime selection still rejects a config the current program cannot migrate")
+
+    let installStateMatrix: [(ConfigFileState, ConfigFileState, Bool, InstallConfigResolution)] = [
+        (.missing, .missing, false, .initialize),
+        (.missing, .usable, false, .selected(.runtime)),
+        (.missing, .invalid, false, .initialize),
+        (.missing, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.missing, .inaccessible, false, .inaccessible(.runtime)),
+        (.usable, .missing, false, .selected(.workspace)),
+        (.usable, .usable, true, .selected(.runtime)),
+        (.usable, .usable, false, .diverged),
+        (.usable, .invalid, false, .repairRuntimeFromWorkspace),
+        (.usable, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.usable, .inaccessible, false, .inaccessible(.runtime)),
+        (.invalid, .missing, false, .initialize),
+        (.invalid, .usable, false, .selected(.runtime)),
+        (.invalid, .invalid, false, .initialize),
+        (.invalid, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.invalid, .inaccessible, false, .inaccessible(.runtime)),
+        (.futureVersion("2.7.3"), .missing, false, .futureVersion(.workspace, "2.7.3")),
+        (.futureVersion("2.7.3"), .usable, false, .selected(.runtime)),
+        (.futureVersion("2.7.3"), .invalid, false, .futureVersion(.workspace, "2.7.3")),
+        (.futureVersion("2.7.3"), .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.futureVersion("2.7.3"), .inaccessible, false, .inaccessible(.runtime)),
+        (.inaccessible, .missing, false, .inaccessible(.workspace)),
+        (.inaccessible, .usable, false, .selected(.runtime)),
+        (.inaccessible, .invalid, false, .inaccessible(.workspace)),
+        (.inaccessible, .futureVersion("2.7.3"), false, .futureVersion(.runtime, "2.7.3")),
+        (.inaccessible, .inaccessible, false, .inaccessible(.runtime))
+    ]
+    for (index, scenario) in installStateMatrix.enumerated() {
+        let resolution = resolveInstallConfigLocation(
+            requested: nil,
+            workspaceState: scenario.0,
+            runtimeState: scenario.1,
+            documentsEquivalent: scenario.2
+        )
+        check(resolution == scenario.3, "install configuration state matrix branch \(index + 1)/\(installStateMatrix.count)")
+    }
+
+    let configStateCases: [(String, ConfigFileState)] = [
+        ("missing", missingConfigState),
+        ("usable", usableConfigState),
+        ("invalid", invalidConfigState),
+        ("future", futureConfigState),
+        ("inaccessible", inaccessibleConfigState)
+    ]
+    func expectedExplicitInstallResolution(
+        requested: InstallConfigLocation,
+        workspaceState: ConfigFileState,
+        runtimeState: ConfigFileState
+    ) -> InstallConfigResolution {
+        if requested == .workspace, runtimeState == .inaccessible {
+            return .inaccessible(.runtime)
+        }
+        let selectedState = requested == .workspace ? workspaceState : runtimeState
+        switch selectedState {
+        case .usable:
+            return .selected(requested)
+        case let .futureVersion(version):
+            return .futureVersion(requested, version)
+        case .inaccessible:
+            return .inaccessible(requested)
+        case .missing, .invalid:
+            return .unavailable(requested)
+        }
+    }
+    for (workspaceName, workspaceState) in configStateCases {
+        for (runtimeName, runtimeState) in configStateCases {
+            for requested in [InstallConfigLocation.workspace, .runtime] {
+                let resolution = resolveInstallConfigLocation(
+                    requested: requested,
+                    workspaceState: workspaceState,
+                    runtimeState: runtimeState,
+                    documentsEquivalent: false
+                )
+                let expected = expectedExplicitInstallResolution(
+                    requested: requested,
+                    workspaceState: workspaceState,
+                    runtimeState: runtimeState
+                )
+                check(resolution == expected,
+                      "explicit \(requested) install matrix \(workspaceName)/\(runtimeName)")
+            }
+        }
+    }
+
+    check(resolveManagementConfigLocation(
+        launchAgentInstalled: true, workspaceState: usableConfigState, runtimeState: invalidConfigState
+    ) == .recover(target: .runtime, source: .workspace), "config management repairs a damaged active runtime from workspace")
+    check(resolveManagementConfigLocation(
+        launchAgentInstalled: true, workspaceState: usableConfigState, runtimeState: missingConfigState
+    ) == .recover(target: .runtime, source: .workspace), "config management restores a missing active runtime config")
+    check(resolveManagementConfigLocation(
+        launchAgentInstalled: false, workspaceState: invalidConfigState, runtimeState: usableConfigState
+    ) == .recover(target: .workspace, source: .runtime), "config management restores an invalid workspace from the only usable config")
+    check(resolveManagementConfigLocation(
+        launchAgentInstalled: true, workspaceState: usableConfigState, runtimeState: futureConfigState
+    ) == .futureVersion(.runtime, "2.7.3"), "config management does not rewrite a newer active runtime config")
+    func expectedManagementResolution(
+        launchAgentInstalled: Bool,
+        workspaceState: ConfigFileState,
+        runtimeState: ConfigFileState
+    ) -> ManagementConfigResolution {
+        let active: InstallConfigLocation = launchAgentInstalled ? .runtime : .workspace
+        let fallback: InstallConfigLocation = launchAgentInstalled ? .workspace : .runtime
+        let activeState = launchAgentInstalled ? runtimeState : workspaceState
+        let fallbackState = launchAgentInstalled ? workspaceState : runtimeState
+        switch activeState {
+        case .usable:
+            return .selected(active)
+        case let .futureVersion(version):
+            return .futureVersion(active, version)
+        case .inaccessible:
+            return .inaccessible(active)
+        case .missing, .invalid:
+            switch fallbackState {
+            case .usable:
+                return .recover(target: active, source: fallback)
+            case let .futureVersion(version):
+                return .futureVersion(fallback, version)
+            case .inaccessible:
+                return .inaccessible(fallback)
+            case .missing, .invalid:
+                return .initialize
+            }
+        }
+    }
+    for (workspaceName, workspaceState) in configStateCases {
+        for (runtimeName, runtimeState) in configStateCases {
+            for launchAgentInstalled in [false, true] {
+                let resolution = resolveManagementConfigLocation(
+                    launchAgentInstalled: launchAgentInstalled,
+                    workspaceState: workspaceState,
+                    runtimeState: runtimeState
+                )
+                let expected = expectedManagementResolution(
+                    launchAgentInstalled: launchAgentInstalled,
+                    workspaceState: workspaceState,
+                    runtimeState: runtimeState
+                )
+                check(resolution == expected,
+                      "management matrix service=\(launchAgentInstalled) \(workspaceName)/\(runtimeName)")
+            }
+        }
+    }
+    check(resolveInitConfigState(
+        resetExistingConfig: false, workspaceState: usableConfigState, runtimeState: invalidConfigState,
+        documentsEquivalent: false
+    ) == .preserve(.workspace), "init preserves an existing usable workspace config")
+    check(resolveInitConfigState(
+        resetExistingConfig: false, workspaceState: usableConfigState, runtimeState: usableConfigState,
+        documentsEquivalent: false
+    ) == .diverged, "init refuses to overwrite two valid divergent configs")
+    check(resolveInitConfigState(
+        resetExistingConfig: false, workspaceState: missingConfigState, runtimeState: missingConfigState,
+        documentsEquivalent: false
+    ) == .initialize, "init starts the setup wizard when both configs are missing")
+    check(resolveInitConfigState(
+        resetExistingConfig: false, workspaceState: futureConfigState, runtimeState: missingConfigState,
+        documentsEquivalent: false
+    ) == .futureVersion(.workspace, "2.7.3"), "init protects a config written by a newer program")
+    check(resolveInitConfigState(
+        resetExistingConfig: true, workspaceState: usableConfigState, runtimeState: usableConfigState,
+        documentsEquivalent: false
+    ) == .initialize, "explicit init reset starts a fresh setup after backup")
+    func expectedInitResolution(
+        resetExistingConfig: Bool,
+        workspaceState: ConfigFileState,
+        runtimeState: ConfigFileState,
+        documentsEquivalent: Bool
+    ) -> InitConfigResolution {
+        if resetExistingConfig {
+            if workspaceState == .inaccessible { return .inaccessible(.workspace) }
+            if runtimeState == .inaccessible { return .inaccessible(.runtime) }
+            return .initialize
+        }
+        if case let .futureVersion(version) = runtimeState {
+            return .futureVersion(.runtime, version)
+        }
+        if case let .futureVersion(version) = workspaceState {
+            return .futureVersion(.workspace, version)
+        }
+        if workspaceState == .inaccessible { return .inaccessible(.workspace) }
+        if runtimeState == .inaccessible { return .inaccessible(.runtime) }
+        if workspaceState == .usable, runtimeState == .usable, !documentsEquivalent {
+            return .diverged
+        }
+        if workspaceState == .usable { return .preserve(.workspace) }
+        if runtimeState == .usable { return .preserve(.runtime) }
+        return .initialize
+    }
+    for (workspaceName, workspaceState) in configStateCases {
+        for (runtimeName, runtimeState) in configStateCases {
+            let equivalenceCases = workspaceState == .usable && runtimeState == .usable
+                ? [false, true] : [false]
+            for equivalent in equivalenceCases {
+                let resolution = resolveInitConfigState(
+                    resetExistingConfig: false,
+                    workspaceState: workspaceState,
+                    runtimeState: runtimeState,
+                    documentsEquivalent: equivalent
+                )
+                let expected = expectedInitResolution(
+                    resetExistingConfig: false,
+                    workspaceState: workspaceState,
+                    runtimeState: runtimeState,
+                    documentsEquivalent: equivalent
+                )
+                check(resolution == expected,
+                      "init preserve matrix \(workspaceName)/\(runtimeName) equivalent=\(equivalent)")
+            }
+            let resetResolution = resolveInitConfigState(
+                resetExistingConfig: true,
+                workspaceState: workspaceState,
+                runtimeState: runtimeState,
+                documentsEquivalent: false
+            )
+            let expectedResetResolution = expectedInitResolution(
+                resetExistingConfig: true,
+                workspaceState: workspaceState,
+                runtimeState: runtimeState,
+                documentsEquivalent: false
+            )
+            check(resetResolution == expectedResetResolution,
+                  "init reset matrix \(workspaceName)/\(runtimeName)")
+        }
+    }
+
+    let configFileTestDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("automount-config-state-\(UUID().uuidString)", isDirectory: true)
+    let invalidTestConfigURL = configFileTestDirectory.appendingPathComponent("config.plist")
+    let corruptConfigBytes = Data("corrupt plist test bytes".utf8)
+    do {
+        try FileManager.default.createDirectory(at: configFileTestDirectory, withIntermediateDirectories: true)
+        _ = FileManager.default.createFile(atPath: invalidTestConfigURL.path, contents: corruptConfigBytes,
+                                           attributes: [.posixPermissions: 0o644])
+    } catch {
+        fputs("FAIL could not create isolated config-state test files: \(error.localizedDescription)\n", stderr)
+    }
+    defer { try? FileManager.default.removeItem(at: configFileTestDirectory) }
+    let missingTestConfig = inspectConfigFile(at: configFileTestDirectory.appendingPathComponent("missing.plist"))
+    let invalidTestConfig = inspectConfigFile(at: invalidTestConfigURL)
+    check(missingTestConfig.state == .missing, "config inspection distinguishes a missing file")
+    check(invalidTestConfig.state == .invalid, "config inspection distinguishes a malformed file")
+    let changedInvalidSnapshot = ConfigFileInspection(
+        url: invalidTestConfigURL, state: .invalid, config: nil,
+        contents: Data("changed corrupt plist bytes".utf8), diagnostic: "Configuration is malformed"
+    )
+    check(!configInspectionMatches(invalidTestConfig, changedInvalidSnapshot),
+          "config snapshot validation detects concurrent content changes")
+    let nonFileConfigPath = configFileTestDirectory.appendingPathComponent("not-a-file", isDirectory: true)
+    try? FileManager.default.createDirectory(at: nonFileConfigPath, withIntermediateDirectories: true)
+    check(inspectConfigFile(at: nonFileConfigPath).state == .inaccessible,
+          "config inspection refuses a directory where a config file is expected")
+    let backupURL = try? backUpConfigFile(invalidTestConfig)
+    let backupBytes = backupURL.flatMap { try? Data(contentsOf: $0) }
+    let backupPermissions = backupURL.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.posixPermissions] as? NSNumber }
+    check(backupBytes == corruptConfigBytes && backupPermissions?.intValue == 0o600,
+          "config backup preserves bytes with owner-only permissions")
+    let unvalidatedReplacement = ConfigFileInspection(
+        url: configFileTestDirectory.appendingPathComponent("source.plist"), state: .usable,
+        config: nil, contents: Data("unvalidated replacement bytes".utf8), diagnostic: nil
+    )
+    var replacementWasRejected = false
+    do {
+        _ = try replaceConfigFile(with: unvalidatedReplacement, at: invalidTestConfigURL,
+                                  destination: invalidTestConfig)
+    } catch {
+        replacementWasRejected = true
+    }
+    check(replacementWasRejected && (try? Data(contentsOf: invalidTestConfigURL)) == corruptConfigBytes,
+          "stale config source is rejected without modifying the destination")
 
     let equivalenceProfile = NetworkProfile(
         id: "test_profile", description: "Generic test profile",
@@ -3507,6 +4285,11 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(validateMountPath("/Volumes/../private") != nil, "traversal mount path is rejected")
     check(usesSystemManagedMountPoint(MountTarget(url: "smb://nas.local/media", mountPath: "/Volumes/media")),
           "standard share mount path can be created by NetFS")
+    let explicitNetFSMountOptions = netFSMountOptions(hasExplicitMountPoint: true)
+    check(explicitNetFSMountOptions?.object(forKey: kNetFSMountAtMountDirKey as String) as? Bool == true,
+          "NetFS mounts at an explicit mount point instead of beneath it")
+    check(netFSMountOptions(hasExplicitMountPoint: false) == nil,
+          "NetFS keeps system-managed mount behavior when no explicit mount point is provided")
     check(!usesSystemManagedMountPoint(MountTarget(url: "smb://nas.local/media", mountPath: "/Volumes/archive")),
           "custom mount path is not delegated to the system")
     check(!usesSystemManagedMountPoint(MountTarget(url: "smb://nas.local/media", mountPath: "/Volumes/nas/media")),
@@ -4289,7 +5072,8 @@ func printUsage() {
 
     使用方法:
       ./auto_mount                正常执行 (评估网络策略并挂载匹配目标)
-      ./auto_mount --init         初始化配置向导 (支持自动嗅探与复选框交互)
+      ./auto_mount --init         安全初始化；已有有效配置时不覆盖
+      ./auto_mount --init --reset 明确备份后从头重建工作区配置
       ./auto_mount --config       日常配置管理 (增删目标、修改网关或远程节点、服务管理)
       ./auto_mount --install [--config-source workspace|runtime]
                                   部署守护服务；指定工作区或守护配置来源
@@ -4309,7 +5093,8 @@ func printUsage() {
 
     Usage:
       ./auto_mount                Run normal evaluation and mount targets
-      ./auto_mount --init         Interactive setup wizard (with device discovery)
+      ./auto_mount --init         Safe setup; preserves any existing usable config
+      ./auto_mount --init --reset Back up and rebuild the workspace config
       ./auto_mount --config       Daily configuration & daemon management menu
       ./auto_mount --install [--config-source workspace|runtime]
                                   Deploy LaunchAgent and select config source
@@ -4389,8 +5174,12 @@ func main() {
         let arg = args[1]
         switch arg {
         case "--init":
-            runInitWizard()
-            exit(0)
+            guard args.count == 2 || (args.count == 3 && args[2] == "--reset") else {
+                fputs(tr("✗ 用法: ./auto_mount --init [--reset]\n", "✗ Usage: ./auto_mount --init [--reset]\n"), stderr)
+                exit(2)
+            }
+            let succeeded = runInitCommand(resetExistingConfig: args.count == 3)
+            exit(succeeded ? 0 : 1)
         case "--config":
             manageConfiguration()
             exit(0)

@@ -39,7 +39,7 @@ swift auto_mount.swift
 
 首次使用时，请确保已在 Finder 中通过“连接服务器 (`Cmd + K`)”成功连接过目标 NAS 卷宗并勾选了“在钥匙串中记住密码”。
 
-连接家庭网络后，运行初始化向导：
+连接家庭网络后，运行初始化命令。只有工作区和守护目录都没有可用配置时才会启动向导；已有可用配置会被保留：
 
 ```bash
 ./auto_mount --init
@@ -62,15 +62,15 @@ swift auto_mount.swift
 - `Ctrl + C`：优雅退出并恢复终端状态
 
 > [!IMPORTANT]
-> **注意：`--init` 为全量覆写式初始化**
-> - `--init` 旨在从零构建全新的全量配置文件，**绝不读取、合并或保留既有的历史配置**。
-> - 若磁盘中已存在 `auto_mount.plist`，向导运行完毕后将全量覆写该文件。
+> **注意：`--init` 默认保护现有配置**
+> - 若工作区或守护目录中已有可用配置，`--init` 会保留配置并提示使用 `--config` 或 `--install`；不会悄悄启动全新向导。
+> - 只有明确运行 `./auto_mount --init --reset` 才会从头重建工作区配置。写入前会在原目录创建权限为 `0600` 的时间戳备份。
 > - 在“选择家庭局域网挂载目标”步骤中，若直接按回车跳过，代表**将该策略的挂载目标设为空列表；策略命中后本轮评估会结束，且原有挂载目标不会被保留**。
-> - 若已有配置且仅需在保留原有挂载项目的前提下进行增删、更新网关 MAC 或调整 Tailscale 节点，**切勿使用 `--init`，请改用 `./auto_mount --config`**。
+> - 若已有配置且仅需保留原有挂载项目并增删目标、更新网关 MAC 或调整远程节点，请使用 `./auto_mount --config`。
 
 ## 日常配置管理 (`--config`)
 
-日常如需新增挂载目录、删除已停用卷宗、或更换了家庭路由器，**切勿重新运行 `--init`（避免覆写已有配置）**。直接运行日常配置管理命令，即可在完整保留既有配置的基础上进行安全维护：
+日常如需新增挂载目录、删除已停用卷宗、或更换了家庭路由器，直接运行日常配置管理命令即可在保留既有配置的基础上进行维护。已有可用配置时，`--init` 默认不会覆盖它：
 
 ```bash
 ./auto_mount --config
@@ -78,10 +78,10 @@ swift auto_mount.swift
 
 终端将弹出交互式一站式控制中心：
 
-普通工作区命令读取可执行文件旁的配置。存在已安装守护配置时，`--config` 菜单直接读取和编辑 `~/Library/Application Support/AutoMount/auto_mount.plist`，守护状态页也从该路径读取；没有守护配置时才使用工作区配置。首次安装时，`--install` 从工作区初始化守护配置。重装时若两份有效配置不同，交互运行会询问来源；非交互运行默认保留守护配置。可用 `--install --config-source workspace` 明确用工作区配置覆盖守护配置，或用 `--config-source runtime` 明确保留守护配置。无效或版本更新的守护配置不会被静默覆盖。
+普通工作区命令读取可执行文件旁的配置。LaunchAgent 已安装时，`--config` 管理它实际使用的 `~/Library/Application Support/AutoMount/auto_mount.plist`，即使服务当前未运行。如果该配置缺失或损坏而工作区配置有效，程序会先备份不可用文件，再恢复守护配置；两边都没有可用配置时会进入交互式向导。两份配置都有效但内容不同，`--config` 保留并管理守护配置，同时提示差异。首次安装时，`--install` 从工作区初始化守护配置；重装时若两份有效配置不同，交互运行询问来源，非交互运行默认保留守护配置。明确选择 `--config-source workspace` 会在覆盖前备份守护配置。配置恢复写入前会重新核对来源和目标文件快照，避免静默覆盖并发改动。版本高于当前程序的配置不会自动覆盖；文件无法读取或备份时，安装会停止且不注册服务。
 
 ```text
-Auto Mount Tool - 日常配置管理 (v2.7.0)
+Auto Mount Tool - 日常配置管理 (v2.7.2)
 ====================================
 
 当前已配置策略流水线 (自顶向下顺序评估，首次命中即执行)：
@@ -90,7 +90,7 @@ Auto Mount Tool - 日常配置管理 (v2.7.0)
       • /Volumes/documents <- smb://nas.example.ts.net/documents
       • /Volumes/media <- smb://nas.example.ts.net/media
 
-软件版本: v2.7.0 | 自动更新信道: auto (后台静默自动升级)
+软件版本: v2.7.2 | 自动更新信道: auto (后台静默自动升级)
 后台守护服务状态: 已加载，当前空闲等待触发；守护配置存在 (gui/<uid>)
 
 请选择操作模块：
@@ -125,7 +125,7 @@ Auto Mount Tool - 日常配置管理 (v2.7.0)
 ./auto_mount --help
 ```
 
-`--install` 会从当前 Swift 源码编译命令行程序，并将程序和源码部署至 `~/Library/Application Support/AutoMount`。首次安装时，程序会从工作区复制配置；重装时会比较两份配置（忽略版本号和守护进程更新检查状态）。若配置不同，交互安装会询问来源；非交互安装默认保留守护配置。`--install --config-source workspace` 可明确把工作区配置写入守护目录，`--install --config-source runtime` 可明确保留现有守护配置。无效或版本较新的守护配置不会自动被工作区覆盖。LaunchAgent 通过系统 Swift 运行时启动已部署的源码，以读取当前登录会话中的接口作用域网络信息；编译后的程序仍用于交互式命令。登录、网络配置变化、守护配置变化和每 60 秒间隔都会触发一次策略评估，以便网络就绪较晚时重试。
+`--install` 会从当前 Swift 源码编译命令行程序，并将程序和源码部署至 `~/Library/Application Support/AutoMount`。首次安装时从工作区复制配置；两份都没有有效配置时，交互式安装会先运行配置向导，再继续安装，非交互安装会在注册服务前失败。重装时比较配置内容（忽略版本号和守护更新检查状态）；两份有效配置不同时，交互安装询问来源，非交互安装默认保留守护配置。若守护配置损坏且工作区配置有效，程序会先将损坏文件备份，再恢复配置并继续安装。`--install --config-source workspace` 可明确用工作区配置替换守护配置，替换前会备份原文件；`--install --config-source runtime` 明确选择守护配置。高于当前程序版本的配置不会被自动降级覆盖，无法读取或备份配置时也不会重载或注册服务。LaunchAgent 通过系统 Swift 运行时启动已部署的源码，以读取当前登录会话中的接口作用域网络信息；编译后的程序仍用于交互式命令。登录、网络配置变化、守护配置变化和每 60 秒间隔都会触发一次策略评估，以便网络就绪较晚时重试。
 
 要运行网络验收，可执行 `./auto_mount --self-test --network --remote-smb`。`--remote-smb` 会读取当前配置的远程策略；若 Tailscale 状态中存在匹配节点，它会用该节点的 Tailscale 地址进行实挂测试，避免家中 DNS 把测试流量送回局域网。每个 SMB 共享都会临时挂载到用户缓存目录，核对挂载源后卸载。自测会把当前进程拿不到 ARP 输出的检查标记为 `SKIP`，不会算作通过。
 
@@ -139,7 +139,7 @@ Auto Mount Tool - 日常配置管理 (v2.7.0)
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>2.7.0</string>
+    <string>2.7.2</string>
     <key>update_channel</key>
     <string>off</string>
     <key>profiles</key>
@@ -225,7 +225,7 @@ Auto Mount Tool - 日常配置管理 (v2.7.0)
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.7.0`）。程序读取配置时会自动升级配置并写回。 |
+| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.7.2`）。程序读取配置时会自动升级配置并写回。 |
 | `update_channel` | String | 软件自动更新策略，可选值为 `off`（关闭，默认）、`notify`（通知提醒）、`auto`（自动静默热升级）。 |
 | `last_update_check_timestamp` | Real | 最近一次更新检查尝试的 Unix 时间戳；无失败重试时，常规检查间隔为 24 小时。 |
 | `update_retry_after_timestamp` | Real | 后台检查或自动部署失败后的重试时间；到期后会绕过 24 小时正常间隔重新尝试。 |
@@ -330,18 +330,22 @@ AutoMount 采用以下两级防护：
 var mountPoints: Unmanaged<CFArray>?
 let openOptions = NSMutableDictionary()
 openOptions[kNAUIOptionKey as String] = kNAUIOptionNoUI as String
+let mountOptions = NSMutableDictionary()
+if mountpointURL != nil {
+    mountOptions[kNetFSMountAtMountDirKey as String] = true
+}
 let status = NetFSMountURLSync(
     url as CFURL,
     mountpointURL,
     nil,
     nil,
     openOptions as CFMutableDictionary,
-    nil,
+    mountOptions.count > 0 ? mountOptions as CFMutableDictionary : nil,
     &mountPoints
 )
 ```
 
-片段中的 `url` 和 `mountpointURL` 是经过校验的输入。标准 `/Volumes/<共享名>` 路径尚不存在时，`mountpointURL` 为 `nil`，由 NetFS 创建挂载目录；其他目标传入指定路径。程序将用户名与密码参数留空，并设置 NetAuth 无交互选项。macOS 可使用当前用户已有的钥匙串 SMB 凭据；如果没有可用凭据，挂载会失败并记录诊断信息，不会弹出凭据输入框。
+片段中的 `url` 和 `mountpointURL` 是经过校验的输入。标准 `/Volumes/<共享名>` 路径尚不存在时，`mountpointURL` 为 `nil`，由 NetFS 创建挂载目录；其他目标传入指定路径，并设置 `kNetFSMountAtMountDirKey`，避免 NetFS 把共享放在目标目录的子目录中。程序将用户名与密码参数留空，并设置 NetAuth 无交互选项。macOS 可使用当前用户已有的钥匙串 SMB 凭据；如果没有可用凭据，挂载会失败并记录诊断信息，不会弹出凭据输入框。
 
 # 常见问题
 
@@ -372,7 +376,7 @@ Tailscale MagicDNS 域名（如 `nas.example.ts.net`）可提供稳定的主机�
 
 ### Q: 运行 `--init` 与 `--config` 有何本质区别？在 `--init` 中直接按回车跳过挂载目标会发生什么？
 
-- **`--init`（从零全量初始化）**：用于首次全新配置或推倒重来。向导全程独立构造新的策略结构，**绝不读取、合并或继承旧配置**。在挂载目标步骤直接按回车跳过，意味着将该网络策略的目标列表明确设为空（`targets: []`）。当该策略匹配时，本轮评估会结束且不执行挂载；向导结束时会**直接覆盖原有的 `auto_mount.plist` 配置文件**。
+- **`--init`（安全初始化）**：没有可用配置时启动向导；已存在可用配置时保留它并提示下一步。需要从零重建工作区配置时运行 `./auto_mount --init --reset`，程序会先备份旧文件。挂载目标步骤直接按回车会把该策略的目标列表设为空（`targets: []`），策略命中后本轮评估会结束且不执行挂载。
 - **`--config`（日常增量维护）**：用于日常配置维护。它会首先完整载入并保留当前系统的有效配置，支持增量添加新挂载项、选择性删除指定挂载项、重新探测网关 MAC 或更新远程节点，修改完成后才写回磁盘并自动热同步至后台守护进程。日常维护务必使用 `--config`。
 
 ### Q: 更新了工作区代码后，后台运行的守护服务如何同步更新？

@@ -51,7 +51,7 @@ The macOS 27 SDK and APIs introduced in that release are the preferred developme
 
 ## Silent Mounting Through NetFS
 
-The program validates the SMB URL and mount path before calling `NetFSMountURLSync` with the requested mount point, empty credentials, and the non-interactive NetAuth option. For a missing standard `/Volumes/<share>` path, it leaves the mount point empty so NetFS can create the directory. After a successful return, the program checks the kernel mount table for the actual path and SMB source. If no usable Keychain credential exists, the operation fails and records a diagnostic.
+The program validates the SMB URL and mount path before calling `NetFSMountURLSync` with the requested mount point, empty credentials, and the non-interactive NetAuth option. When an explicit mount directory exists, it sets `kNetFSMountAtMountDirKey` so NetFS mounts at that directory instead of creating a nested share directory. For a missing standard `/Volumes/<share>` path, it leaves the mount point empty so NetFS can create the directory. After a successful return, the program checks the kernel mount table for the actual path and SMB source. If no usable Keychain credential exists, the operation fails and records a diagnostic.
 
 ## Non-Blocking Kernel Mount Table Inspection
 
@@ -137,7 +137,9 @@ The LaunchAgent uses `RunAtLoad` at user login, watches the system network confi
 </plist>
 ```
 
-The installer deploys the compiled CLI and Swift source. On first install, it seeds the runtime config from the workspace. On reinstall, it compares user settings while ignoring the config version and daemon update-check state, and preserves the runtime config when settings match. If two valid configs differ, an interactive install asks which one to use; a non-interactive install keeps the runtime config. `--config-source workspace` and `--config-source runtime` explicitly select the source. An invalid or newer runtime config is never silently overwritten; repair requires an explicit workspace selection. The LaunchAgent starts the runtime source through `/usr/bin/swift` so network detection can read interface-scoped neighbor entries in the logged-in session; the compiled executable remains available for interactive commands.
+The installer deploys the compiled CLI and Swift source. On first install, it seeds the runtime config from the workspace; when neither store has a usable config, an interactive install runs setup and continues. On reinstall, it compares settings while ignoring the config version and daemon update-check state, and preserves the runtime config when settings match. If two valid configs differ, an interactive install asks which one to use; a non-interactive install keeps the runtime config. `--config-source workspace` and `--config-source runtime` explicitly select the source. A damaged runtime config can be restored from a usable workspace config after a timestamped `0600` backup. A config from a newer program version is never automatically downgraded; unreadable files or failed backups stop installation. The LaunchAgent starts the runtime source through `/usr/bin/swift` so network detection can read interface-scoped neighbor entries in the logged-in session; the compiled executable remains available for interactive commands.
+
+`--init` preserves an existing usable config and starts setup only when neither store has one. `--init --reset` explicitly rebuilds the workspace config after making a timestamped `0600` backup. `--config` edits the active daemon config when a LaunchAgent is installed; otherwise it edits the workspace config. If the active config is missing or damaged and the other store has a usable config, it backs up and restores the active file before opening the menu. Recovery rechecks source and destination snapshots immediately before writing and stops if either changed.
 
 ## Modern Registration and Lifecycle Management
 
@@ -280,7 +282,7 @@ flowchart TD
 
 * **Field Preservation**: Migration updates managed fields while preserving unrecognized root, profile, match-rule, and mount-target fields;
 * **Atomic Persistence and Permissions**: Config data is written to a temporary file with mode `0600`, synchronized, and atomically renamed into place;
-* **Management Config Path**: When a LaunchAgent and runtime config exist, `--config` reads and edits `~/Library/Application Support/AutoMount/auto_mount.plist`. It uses the workspace config only when no runtime config is installed. Workspace and runtime configs migrate independently.
+* **Management Config Path**: When a LaunchAgent is installed, `--config` manages `~/Library/Application Support/AutoMount/auto_mount.plist` regardless of whether the service is currently running. If the runtime config is missing or damaged and the workspace config is usable, it backs up and restores the runtime file; if neither is usable, it opens setup. Without a LaunchAgent it manages the workspace config, restoring it from the only usable runtime copy when needed. Newer-version configs and file access errors are not overwritten automatically.
 
 ## 4. Workspace and Runtime Version Synchronization
 
