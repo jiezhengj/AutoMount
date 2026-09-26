@@ -21,7 +21,7 @@ AutoMount 是专为 macOS 设计的原生轻量级 SMB 自动挂载工具，支�
 
 ## 运行方式
 
-项目仅支持 macOS 27.0 或更高版本的 Apple silicon（arm64），不支持 Intel Mac。仓库包含 Swift 源码 [auto_mount.swift](auto_mount.swift) 和 arm64 预编译程序 [auto_mount](auto_mount)；运行源码和安装守护服务都会检查系统版本与 CPU 架构。`--install` 会使用 macOS 27 或更高版本 SDK 编译守护程序，因此需要提供该 SDK 的 Xcode 或 Command Line Tools：
+项目仅支持 macOS 27.0 或更高版本的 Apple silicon（arm64），不支持 Intel Mac。仓库包含 Swift 源码 [auto_mount.swift](auto_mount.swift) 和 arm64 预编译程序 [auto_mount](auto_mount)；运行和安装守护服务都会检查系统版本与 CPU 架构。`--install` 直接部署发布包中经过最高优化编译的原生可执行二进制 `auto_mount`，无需在用户电脑上安装 Xcode 或 Command Line Tools：
 
 ```bash
 cd /path/to/AutoMount
@@ -125,7 +125,7 @@ Auto Mount Tool - 日常配置管理 (v2.7.2)
 ./auto_mount --help
 ```
 
-`--install` 会从当前 Swift 源码编译命令行程序，并将程序和源码部署至 `~/Library/Application Support/AutoMount`。首次安装时从工作区复制配置；两份都没有有效配置时，交互式安装会先运行配置向导，再继续安装，非交互安装会在注册服务前失败。重装时比较配置内容（忽略版本号和守护更新检查状态）；两份有效配置不同时，交互安装询问来源，非交互安装默认保留守护配置。若守护配置损坏且工作区配置有效，程序会先将损坏文件备份，再恢复配置并继续安装。`--install --config-source workspace` 可明确用工作区配置替换守护配置，替换前会备份原文件；`--install --config-source runtime` 明确选择守护配置。高于当前程序版本的配置不会被自动降级覆盖，无法读取或备份配置时也不会重载或注册服务。LaunchAgent 通过系统 Swift 运行时启动已部署的源码，以读取当前登录会话中的接口作用域网络信息；编译后的程序仍用于交互式命令。登录、网络配置变化、守护配置变化和每 60 秒间隔都会触发一次策略评估，以便网络就绪较晚时重试。
+`--install` 直接将工作区中已编译好的命令行程序 `auto_mount`（以及可选的源码 `auto_mount.swift`）原子部署至 `~/Library/Application Support/AutoMount`。首次安装时从工作区复制配置；两份都没有有效配置时，交互式安装会先运行配置向导，再继续安装，非交互安装会在注册服务前失败。重装时比较配置内容（忽略版本号和守护更新检查状态）；两份有效配置不同时，交互安装询问来源，非交互安装默认保留守护配置。若守护配置损坏且工作区配置有效，程序会先将损坏文件备份，再恢复配置并继续安装。`--install --config-source workspace` 可明确用工作区配置替换守护配置，替换前会备份原文件；`--install --config-source runtime` 明确选择守护配置。高于当前程序版本的配置不会被自动降级覆盖，无法读取或备份配置时也不会重载或注册服务。LaunchAgent 直接执行已部署的原生二进制 `auto_mount`。登录、网络配置变化、守护配置变化和每 60 秒间隔都会触发一次策略评估，以便网络就绪较晚时重试。
 
 要运行网络验收，可执行 `./auto_mount --self-test --network --remote-smb`。`--remote-smb` 会读取当前配置的远程策略；若 Tailscale 状态中存在匹配节点，它会用该节点的 Tailscale 地址进行实挂测试，避免家中 DNS 把测试流量送回局域网。每个 SMB 共享都会临时挂载到用户缓存目录，核对挂载源后卸载。自测会把当前进程拿不到 ARP 输出的检查标记为 `SKIP`，不会算作通过。
 
@@ -271,7 +271,7 @@ Auto Mount Tool - 日常配置管理 (v2.7.2)
 1. **Release 与版本检查**：只查询 GitHub 已发布的最新 Release；单纯推送 commit 不会触发用户更新。Release 版本必须高于当前版本，且 tag 下的源码内版本号必须与 Release tag 一致。
 2. **工作区与运行目录版本同步**：
    - **工作区到运行目录**：从工作区执行 `--update` 时，程序更新已有的工作区和运行目录文件；已加载的 LaunchAgent 保持运行，并在配置变化触发或不超过 60 秒的下次启动时读取新文件；
-   - **运行目录到工作区**：工作区命令检测到已安装版本更新时，会在工作区允许同步的情况下更新源码、编译程序并迁移配置。
+   - **运行目录到工作区**：工作区命令检测到已安装版本更新时，会在工作区允许同步的情况下同步程序、更新源码并迁移配置。
 3. **配置迁移**：配置先复制到临时文件，再由新程序迁移。只有程序和所有目标配置均准备成功后才部署；迁移失败时原文件不变。
 4. **完整编译与回滚**：下载源码先完整编译。程序、源码和配置作为一组替换；任一文件替换失败时会恢复已替换的文件。
 5. **守护进程继续运行**：升级不会从当前守护进程中调用 `launchctl bootout`。LaunchAgent 使用固定的运行目录路径，新的程序文件会在配置变化触发或不超过 60 秒的下次启动时生效；升级不会强制启动原本未加载的服务。

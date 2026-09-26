@@ -195,7 +195,7 @@ func runCommandDiscardingOutputWithTimeout(
 
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.7.3"
+let autoMountVersion = "2.7.4"
 let minimumSupportedMacOSMajorVersion = 27
 let minimumSupportedMacOSVersion = "\(minimumSupportedMacOSMajorVersion).0"
 let githubRepo = "jiezhengj/AutoMount"
@@ -3158,11 +3158,8 @@ func replaceFilesTransactionally(
     }
 }
 
-func launchAgentProgramArguments(binaryURL: URL, sourceURL: URL, preferSource: Bool = true) -> [String] {
-    if preferSource, FileManager.default.isExecutableFile(atPath: "/usr/bin/swift") {
-        return ["/usr/bin/swift", sourceURL.path]
-    }
-    return [binaryURL.path]
+func launchAgentProgramArguments(binaryURL: URL) -> [String] {
+    [binaryURL.path]
 }
 
 enum InstallConfigLocation: Equatable {
@@ -3478,32 +3475,22 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
         exit(1)
     }
 
-    let stagedBinaryURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent("automount-install-\(UUID().uuidString)")
+    let currentBinaryURL = currentAppDir.appendingPathComponent("auto_mount")
+    guard FileManager.default.isExecutableFile(atPath: currentBinaryURL.path) else {
+        fputs(tr("✗ 找不到 auto_mount 可执行程序，无法安装守护服务。\n",
+                 "✗ No auto_mount executable is available to install the daemon.\n"), stderr)
+        writeLog("Install aborted because auto_mount executable was not available at \(currentBinaryURL.path)")
+        exit(1)
+    }
+
     let stagedConfigURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("automount-install-config-\(UUID().uuidString).plist")
     let stagedPlistURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("automount-install-launchagent-\(UUID().uuidString).plist")
-    defer { try? FileManager.default.removeItem(at: stagedBinaryURL) }
     defer { try? FileManager.default.removeItem(at: stagedConfigURL) }
     defer { try? FileManager.default.removeItem(at: stagedPlistURL) }
 
     let sourceExists = FileManager.default.fileExists(atPath: sourceURL.path)
-    let currentBinaryURL = currentAppDir.appendingPathComponent("auto_mount")
-    if sourceExists {
-        let compile = compileOptimizedSwiftSource(sourceURL: sourceURL, outputURL: stagedBinaryURL)
-        guard compile.status == 0 else {
-            fputs(tr("✗ 当前 Swift 源码编译失败，旧运行程序未覆盖。\n", "✗ Swift source compilation failed; the old executable was not replaced.\n"), stderr)
-            fputs(compile.stderr, stderr)
-            writeLog("Install aborted because source compilation failed: \(compile.stderr)")
-            exit(1)
-        }
-    } else if !FileManager.default.isExecutableFile(atPath: currentBinaryURL.path) {
-        fputs(tr("✗ 找不到 Swift 源码或可执行程序，无法安装守护服务。\n",
-                 "✗ No Swift source or executable is available to install the daemon.\n"), stderr)
-        writeLog("Install aborted because neither Swift source nor executable was available")
-        exit(1)
-    }
 
     do {
         try atomicWrite(configSourceContents, to: stagedConfigURL, permissions: 0o600)
@@ -3514,9 +3501,8 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
         exit(1)
     }
 
-    let migrationExecutable = sourceExists ? stagedBinaryURL : currentBinaryURL
     let migration = runCommand(
-        executable: migrationExecutable.path,
+        executable: currentBinaryURL.path,
         arguments: ["--migrate-only", stagedConfigURL.path]
     )
     guard migration.status == 0 else {
@@ -3533,9 +3519,7 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
         writeLog("Install aborted because staged config failed read-back validation")
         exit(1)
     }
-    let programArguments = launchAgentProgramArguments(binaryURL: installedBinaryURL,
-                                                       sourceURL: installedSourceURL,
-                                                       preferSource: sourceExists)
+    let programArguments = launchAgentProgramArguments(binaryURL: installedBinaryURL)
     let plistData: Data
     do {
         let plist: [String: Any] = [
@@ -3556,12 +3540,11 @@ func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
         exit(1)
     }
 
-    var replacements: [StagedFileReplacement] = []
+    var replacements: [StagedFileReplacement] = [
+        StagedFileReplacement(sourceURL: currentBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755)
+    ]
     if sourceExists {
-        replacements.append(StagedFileReplacement(sourceURL: sourceURL, destinationURL: installedSourceURL, permissions: 0o755))
-        replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
-    } else {
-        replacements.append(StagedFileReplacement(sourceURL: currentBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
+        replacements.append(StagedFileReplacement(sourceURL: sourceURL, destinationURL: installedSourceURL, permissions: 0o644))
     }
     replacements.append(StagedFileReplacement(sourceURL: stagedPlistURL, destinationURL: plistURL, permissions: 0o644))
 
@@ -3929,8 +3912,8 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
           "older macOS SDK versions are below the supported target")
     check(macOSSDKMajorVersion("unknown") == nil,
           "unrecognized SDK versions are rejected")
-    check(!configVersionCanBeMigrated("2.7.4"), "newer config versions are not downgraded")
-    check(configVersionCanBeMigrated("2.7.2"), "older config versions remain eligible for migration")
+    check(!configVersionCanBeMigrated("2.7.5"), "newer config versions are not downgraded")
+    check(configVersionCanBeMigrated("2.7.3"), "older config versions remain eligible for migration")
 
     let updateNow: TimeInterval = 10_000
     var updateState = AutoMountConfig(version: "2.7.0", updateChannel: "auto", lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: [])
@@ -4023,7 +4006,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     let missingConfigState = ConfigFileState.missing
     let usableConfigState = ConfigFileState.usable
     let invalidConfigState = ConfigFileState.invalid
-    let futureConfigState = ConfigFileState.futureVersion("2.7.4")
+    let futureConfigState = ConfigFileState.futureVersion("2.7.5")
     let inaccessibleConfigState = ConfigFileState.inaccessible
     check(resolveInstallConfigLocation(
         requested: nil, workspaceState: usableConfigState, runtimeState: missingConfigState,
@@ -4060,7 +4043,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(resolveInstallConfigLocation(
         requested: nil, workspaceState: usableConfigState, runtimeState: futureConfigState,
         documentsEquivalent: false
-    ) == .futureVersion(.runtime, "2.7.4"), "newer runtime config prevents an implicit downgrade")
+    ) == .futureVersion(.runtime, "2.7.5"), "newer runtime config prevents an implicit downgrade")
     check(resolveInstallConfigLocation(
         requested: nil, workspaceState: usableConfigState, runtimeState: inaccessibleConfigState,
         documentsEquivalent: false
@@ -4080,34 +4063,34 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(resolveInstallConfigLocation(
         requested: .runtime, workspaceState: usableConfigState, runtimeState: futureConfigState,
         documentsEquivalent: false
-    ) == .futureVersion(.runtime, "2.7.4"), "explicit runtime selection still rejects a config the current program cannot migrate")
+    ) == .futureVersion(.runtime, "2.7.5"), "explicit runtime selection still rejects a config the current program cannot migrate")
 
     let installStateMatrix: [(ConfigFileState, ConfigFileState, Bool, InstallConfigResolution)] = [
         (.missing, .missing, false, .initialize),
         (.missing, .usable, false, .selected(.runtime)),
         (.missing, .invalid, false, .initialize),
-        (.missing, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
+        (.missing, .futureVersion("2.7.5"), false, .futureVersion(.runtime, "2.7.5")),
         (.missing, .inaccessible, false, .inaccessible(.runtime)),
         (.usable, .missing, false, .selected(.workspace)),
         (.usable, .usable, true, .selected(.runtime)),
         (.usable, .usable, false, .diverged),
         (.usable, .invalid, false, .repairRuntimeFromWorkspace),
-        (.usable, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
+        (.usable, .futureVersion("2.7.5"), false, .futureVersion(.runtime, "2.7.5")),
         (.usable, .inaccessible, false, .inaccessible(.runtime)),
         (.invalid, .missing, false, .initialize),
         (.invalid, .usable, false, .selected(.runtime)),
         (.invalid, .invalid, false, .initialize),
-        (.invalid, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
+        (.invalid, .futureVersion("2.7.5"), false, .futureVersion(.runtime, "2.7.5")),
         (.invalid, .inaccessible, false, .inaccessible(.runtime)),
-        (.futureVersion("2.7.4"), .missing, false, .futureVersion(.workspace, "2.7.4")),
-        (.futureVersion("2.7.4"), .usable, false, .selected(.runtime)),
-        (.futureVersion("2.7.4"), .invalid, false, .futureVersion(.workspace, "2.7.4")),
-        (.futureVersion("2.7.4"), .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
-        (.futureVersion("2.7.4"), .inaccessible, false, .inaccessible(.runtime)),
+        (.futureVersion("2.7.5"), .missing, false, .futureVersion(.workspace, "2.7.5")),
+        (.futureVersion("2.7.5"), .usable, false, .selected(.runtime)),
+        (.futureVersion("2.7.5"), .invalid, false, .futureVersion(.workspace, "2.7.5")),
+        (.futureVersion("2.7.5"), .futureVersion("2.7.5"), false, .futureVersion(.runtime, "2.7.5")),
+        (.futureVersion("2.7.5"), .inaccessible, false, .inaccessible(.runtime)),
         (.inaccessible, .missing, false, .inaccessible(.workspace)),
         (.inaccessible, .usable, false, .selected(.runtime)),
         (.inaccessible, .invalid, false, .inaccessible(.workspace)),
-        (.inaccessible, .futureVersion("2.7.4"), false, .futureVersion(.runtime, "2.7.4")),
+        (.inaccessible, .futureVersion("2.7.5"), false, .futureVersion(.runtime, "2.7.5")),
         (.inaccessible, .inaccessible, false, .inaccessible(.runtime))
     ]
     for (index, scenario) in installStateMatrix.enumerated() {
@@ -4178,7 +4161,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     ) == .recover(target: .workspace, source: .runtime), "config management restores an invalid workspace from the only usable config")
     check(resolveManagementConfigLocation(
         launchAgentInstalled: true, workspaceState: usableConfigState, runtimeState: futureConfigState
-    ) == .futureVersion(.runtime, "2.7.4"), "config management does not rewrite a newer active runtime config")
+    ) == .futureVersion(.runtime, "2.7.5"), "config management does not rewrite a newer active runtime config")
     func expectedManagementResolution(
         launchAgentInstalled: Bool,
         workspaceState: ConfigFileState,
@@ -4241,7 +4224,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(resolveInitConfigState(
         resetExistingConfig: false, workspaceState: futureConfigState, runtimeState: missingConfigState,
         documentsEquivalent: false
-    ) == .futureVersion(.workspace, "2.7.4"), "init protects a config written by a newer program")
+    ) == .futureVersion(.workspace, "2.7.5"), "init protects a config written by a newer program")
     check(resolveInitConfigState(
         resetExistingConfig: true, workspaceState: usableConfigState, runtimeState: usableConfigState,
         documentsEquivalent: false
@@ -4420,11 +4403,11 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(!malformedURLRedacted.contains("alice") && !malformedURLRedacted.contains("sec ret"),
           "credentials are redacted from malformed URLs")
     let binaryURL = URL(fileURLWithPath: "/tmp/automount-test-binary")
-    let sourceURL = URL(fileURLWithPath: "/tmp/automount-test-source.swift")
-    check(launchAgentProgramArguments(binaryURL: binaryURL, sourceURL: sourceURL, preferSource: false) == [binaryURL.path],
-          "LaunchAgent falls back to the compiled binary when source launch is disabled")
-    check(launchAgentProgramArguments(binaryURL: binaryURL, sourceURL: sourceURL, preferSource: true) == ["/usr/bin/swift", sourceURL.path],
-          "first LaunchAgent install can select its staged Swift source")
+    check(launchAgentProgramArguments(binaryURL: binaryURL) == [binaryURL.path],
+          "LaunchAgent runs compiled binary directly")
+    check(launchAgentProgramArguments(binaryURL: binaryURL).count == 1
+          && launchAgentProgramArguments(binaryURL: binaryURL).first == binaryURL.path,
+          "LaunchAgent arguments contain exclusively the native executable path")
 
     let atomicWriteURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("automount-self-test-\(UUID().uuidString)")
@@ -5090,9 +5073,12 @@ func syncCurrentToInstalledDaemon() -> Bool {
     let installedBinaryURL = installDir.appendingPathComponent("auto_mount")
     let installedConfigURL = installDir.appendingPathComponent("auto_mount.plist")
     let shouldSeedRuntimeConfig = !FileManager.default.fileExists(atPath: installedConfigURL.path)
-    let stagedBinaryURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent("automount-sync-\(UUID().uuidString)")
-    defer { try? FileManager.default.removeItem(at: stagedBinaryURL) }
+    let binaryURL = currentAppDir.appendingPathComponent("auto_mount")
+    guard FileManager.default.isExecutableFile(atPath: binaryURL.path) else {
+        fputs("✗ Workspace auto_mount executable is not available or not executable; runtime synchronization stopped.\n", stderr)
+        writeLog("Daemon synchronization aborted because auto_mount executable is missing or not executable")
+        return false
+    }
 
     if !shouldSeedRuntimeConfig && loadConfig(from: installedConfigURL) == nil {
         fputs("✗ Existing daemon config is invalid or could not be migrated; runtime synchronization stopped.\n", stderr)
@@ -5100,21 +5086,11 @@ func syncCurrentToInstalledDaemon() -> Bool {
         return false
     }
 
-    var replacements: [StagedFileReplacement] = []
+    var replacements: [StagedFileReplacement] = [
+        StagedFileReplacement(sourceURL: binaryURL, destinationURL: installedBinaryURL, permissions: 0o755)
+    ]
     if sourceExists {
-        let compile = compileOptimizedSwiftSource(sourceURL: sourceURL, outputURL: stagedBinaryURL)
-        guard compile.status == 0 else {
-            fputs("✗ Swift source compilation failed; installed files were not replaced.\n", stderr)
-            fputs(compile.stderr, stderr)
-            writeLog("Daemon synchronization compilation failed: \(compile.stderr)")
-            return false
-        }
-        replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
-        replacements.append(StagedFileReplacement(sourceURL: sourceURL, destinationURL: installedSourceURL, permissions: 0o755))
-    } else {
-        let binaryURL = currentAppDir.appendingPathComponent("auto_mount")
-        guard FileManager.default.isExecutableFile(atPath: binaryURL.path) else { return false }
-        replacements.append(StagedFileReplacement(sourceURL: binaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
+        replacements.append(StagedFileReplacement(sourceURL: sourceURL, destinationURL: installedSourceURL, permissions: 0o644))
     }
     if shouldSeedRuntimeConfig && FileManager.default.fileExists(atPath: sourceConfigURL.path) {
         replacements.append(StagedFileReplacement(sourceURL: sourceConfigURL, destinationURL: installedConfigURL, permissions: 0o600))
@@ -5215,20 +5191,21 @@ func checkAndSyncWorkspaceFromInstalledDaemonIfNeeded() {
         }
     }
 
+    let installedBinaryURL = installDir.appendingPathComponent("auto_mount")
+    guard FileManager.default.isExecutableFile(atPath: installedBinaryURL.path) else {
+        fputs("✗ Daemon auto_mount executable is missing or not executable; workspace synchronization stopped.\n", stderr)
+        writeLog("Workspace synchronization aborted because installed auto_mount executable is missing or not executable")
+        return
+    }
+
     let localBinaryURL = currentAppDir.appendingPathComponent("auto_mount")
-    let shouldCompileBinary = FileManager.default.fileExists(atPath: localBinaryURL.path)
+    let shouldSyncBinary = FileManager.default.fileExists(atPath: localBinaryURL.path)
     do {
-        try atomicCopyFile(from: installedSwiftURL, to: stagedSourceURL, permissions: 0o755)
-        let compileResult = compileOptimizedSwiftSource(sourceURL: stagedSourceURL, outputURL: stagedBinaryURL)
-        guard compileResult.status == 0 else {
-            fputs("✗ Could not compile the installed source for the workspace.\n", stderr)
-            fputs(compileResult.stderr, stderr)
-            writeLog("Workspace synchronization compilation failed: \(compileResult.stderr)")
-            return
-        }
+        try atomicCopyFile(from: installedBinaryURL, to: stagedBinaryURL, permissions: 0o755)
+        try atomicCopyFile(from: installedSwiftURL, to: stagedSourceURL, permissions: 0o644)
     } catch {
-        fputs("✗ Failed to sync auto_mount.swift from daemon: \(error.localizedDescription)\n", stderr)
-        writeLog("Workspace source/binary synchronization failed: \(error.localizedDescription)")
+        fputs("✗ Failed to stage daemon files for workspace: \(error.localizedDescription)\n", stderr)
+        writeLog("Workspace source/binary staging failed: \(error.localizedDescription)")
         return
     }
 
@@ -5257,9 +5234,9 @@ func checkAndSyncWorkspaceFromInstalledDaemonIfNeeded() {
     }
 
     var replacements = [
-        StagedFileReplacement(sourceURL: stagedSourceURL, destinationURL: localSwiftURL, permissions: 0o755)
+        StagedFileReplacement(sourceURL: stagedSourceURL, destinationURL: localSwiftURL, permissions: 0o644)
     ]
-    if shouldCompileBinary {
+    if shouldSyncBinary {
         replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: localBinaryURL, permissions: 0o755))
     }
     if let stagedConfigURL {

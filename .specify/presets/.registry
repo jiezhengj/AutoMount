@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "presets": {
+    "tiny-model-tasks": {
+      "version": "2.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:47fb92d4120c42313bca74e124e4577e917d51617c22946e853e235cfcce7f33",
+      "enabled": true,
+      "priority": 5,
+      "registered_commands": {
+        "codex": [
+          "speckit.tasks"
+        ]
+      },
+      "registered_skills": {
+        "codex": [
+          "speckit-tasks"
+        ]
+      },
+      "installed_at": "2026-09-26T19:39:09.141507+00:00"
+    }
+  }
+}
