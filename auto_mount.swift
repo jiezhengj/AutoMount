@@ -1,17 +1,17 @@
 #!/usr/bin/env swift
 // auto_mount.swift
-// 自动挂载 NAS 工具 (macOS 27 多网络策略路由与现代化交互版 - 2.0)
+// 自动挂载 NAS 工具 (macOS 多网络策略路由与交互版)
 //
 // 核心架构与特性：
 // 1. 多策略优先级路由 (Profiles)：本地局域网 (local_lan) 优先直连；离开局域网自动降级至远程互联 (remote_network / Tailscale / WireGuard / 域名 / IP)。
-// 2. 失效挂载与源切换的超时强制清理 (Strategy B)：
+// 2. 失效 SMB 挂载与源切换的超时清理：
 //    - Darwin 原生 MNT_NOWAIT 内核挂载表非阻塞查询，杜绝 stat() 阻塞与系统彩虹球假死。
-//    - 自动比对挂载源同源性，带 3 秒严格超时熔断机制 (diskutil unmount force + POSIX MNT_FORCE)。
-// 3. Tailscale 握手就绪延迟应对机制 (Retry Window)：
-//    - 探测阶段提供轻量重试窗口（默认 3 次，间隔 1.0 秒），捕获 WireGuard 握手就绪时刻。
-// 4. 蜂窝热点流量与 Spotlight 索引防护：
-//    - 挂载后自动执行 mdutil -i off 并写入 .metadata_never_index，彻底屏蔽 Spotlight 对该远程卷宗的元数据检索。
-//    - 策略支持 exclude_gateway_ips，默认过滤 iPhone 个人热点网关 (172.20.10.1)。
+//    - 自动比对挂载源同源性，使用有界时限的 diskutil 与 umount -f 子进程清理。
+// 3. 远程 SMB 服务就绪重试：
+//    - 通过 TCP 445 探测 SMB 服务，并提供轻量重试窗口（默认 3 次，间隔 1.0 秒）。
+// 4. Spotlight 索引防护与网关排除：
+//    - 挂载后请求关闭 mdutil 索引并尝试写入 .metadata_never_index，同时记录操作结果。
+//    - 策略可显式排除用户提供的物理网关地址。
 // 5. 现代化交互与全自动动态嗅探：
 //    - 纯 Swift 原生 ANSI Raw 模式交互式复选框 (Space 勾选、Enter 提交、a 全选、k/j 上下移动)；
 //    - 动态扫描内核已挂载的 SMB 共享卷宗供勾选；
@@ -50,6 +50,12 @@ func getAppDir() -> URL {
     return exeURL.deletingLastPathComponent()
 }
 
+var configURLOverride: URL?
+
+func getWorkspaceConfigURL() -> URL {
+    return getAppDir().appendingPathComponent("auto_mount.plist")
+}
+
 // 写入日志（带时间戳）
 func writeLog(_ message: String) {
     let formatter = DateFormatter()
@@ -71,10 +77,43 @@ func writeLog(_ message: String) {
 
 // 配置文件路径
 func getConfigURL() -> URL {
-    return getAppDir().appendingPathComponent("auto_mount.plist")
+    return configURLOverride ?? getWorkspaceConfigURL()
+}
+
+func preferredManagementConfigURL(
+    workspaceURL: URL,
+    runtimeURL: URL,
+    launchAgentInstalled: Bool,
+    runtimeConfigExists: Bool
+) -> URL {
+    launchAgentInstalled && runtimeConfigExists ? runtimeURL : workspaceURL
 }
 
 // 执行外部命令辅助函数
+final class CommandOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var standardOutput = Data()
+    private var standardError = Data()
+
+    func storeStandardOutput(_ data: Data) {
+        lock.lock()
+        standardOutput = data
+        lock.unlock()
+    }
+
+    func storeStandardError(_ data: Data) {
+        lock.lock()
+        standardError = data
+        lock.unlock()
+    }
+
+    func snapshot() -> (standardOutput: Data, standardError: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (standardOutput, standardError)
+    }
+}
+
 @discardableResult
 func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdout: String, stderr: String) {
     let process = Process()
@@ -86,21 +125,134 @@ func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdo
     process.standardError = errPipe
     do {
         try process.run()
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        outPipe.fileHandleForWriting.closeFile()
+        errPipe.fileHandleForWriting.closeFile()
+
+        // Drain both pipes concurrently. Reading one to EOF before the other can
+        // deadlock when a child fills the unread pipe (for example, swiftc errors).
+        let readGroup = DispatchGroup()
+        let outputBuffer = CommandOutputBuffer()
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            outputBuffer.storeStandardOutput(data)
+            readGroup.leave()
+        }
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            outputBuffer.storeStandardError(data)
+            readGroup.leave()
+        }
         process.waitUntilExit()
-        let outStr = String(data: outData, encoding: .utf8) ?? ""
-        let errStr = String(data: errData, encoding: .utf8) ?? ""
+        readGroup.wait()
+        let captured = outputBuffer.snapshot()
+        let outStr = String(data: captured.standardOutput, encoding: .utf8) ?? ""
+        let errStr = String(data: captured.standardError, encoding: .utf8) ?? ""
         return (process.terminationStatus, outStr, errStr)
     } catch {
         return (-1, "", error.localizedDescription)
     }
 }
 
+struct BoundedCommandResult {
+    let status: Int32?
+    let timedOut: Bool
+    let processStopped: Bool
+    let error: String?
+}
+
+func runCommandDiscardingOutputWithTimeout(
+    executable: String,
+    arguments: [String],
+    timeout: TimeInterval
+) -> BoundedCommandResult {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+    } catch {
+        return BoundedCommandResult(status: nil, timedOut: false, processStopped: true,
+                                   error: error.localizedDescription)
+    }
+
+    let waitGroup = DispatchGroup()
+    waitGroup.enter()
+    DispatchQueue.global(qos: .utility).async {
+        process.waitUntilExit()
+        waitGroup.leave()
+    }
+
+    let boundedTimeout = timeout.isFinite ? max(timeout, 0) : 0
+    guard waitGroup.wait(timeout: .now() + boundedTimeout) == .timedOut else {
+        return BoundedCommandResult(status: process.terminationStatus, timedOut: false,
+                                   processStopped: true, error: nil)
+    }
+
+    process.terminate()
+    if waitGroup.wait(timeout: .now() + 0.5) == .timedOut {
+        _ = kill(process.processIdentifier, SIGKILL)
+        return BoundedCommandResult(status: nil, timedOut: true, processStopped: false, error: nil)
+    }
+    return BoundedCommandResult(status: process.terminationStatus, timedOut: true,
+                               processStopped: true, error: nil)
+}
+
 // MARK: - 版本与数据结构定义
 
-let autoMountVersion = "2.6.0"
+let autoMountVersion = "2.7.0"
+let minimumSupportedMacOSMajorVersion = 27
+let minimumSupportedMacOSVersion = "\(minimumSupportedMacOSMajorVersion).0"
 let githubRepo = "jiezhengj/AutoMount"
+
+func normalizedArchitecture(_ architecture: String) -> String {
+    architecture.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+}
+
+func swiftCompilerTargetTriple(architecture: String) -> String? {
+    guard normalizedArchitecture(architecture) == "arm64" else { return nil }
+    return "arm64-apple-macosx\(minimumSupportedMacOSVersion)"
+}
+
+func platformSupportIssue(macOSMajorVersion: Int, architecture: String) -> String? {
+    guard normalizedArchitecture(architecture) == "arm64" else { return "architecture" }
+    guard macOSMajorVersion >= minimumSupportedMacOSMajorVersion else { return "macOS_version" }
+    return nil
+}
+
+func macOSSDKMajorVersion(_ version: String) -> Int? {
+    Int(version.split(separator: ".").first ?? "")
+}
+
+func currentMacOSSDKPath() -> String? {
+    let sdk = runCommand(executable: "/usr/bin/xcrun", arguments: ["--sdk", "macosx", "--show-sdk-path"])
+    let version = runCommand(executable: "/usr/bin/xcrun", arguments: ["--sdk", "macosx", "--show-sdk-version"])
+    guard sdk.status == 0,
+          version.status == 0,
+          let majorVersion = macOSSDKMajorVersion(version.stdout.trimmingCharacters(in: .whitespacesAndNewlines)),
+          majorVersion >= minimumSupportedMacOSMajorVersion else { return nil }
+    let path = sdk.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    return FileManager.default.fileExists(atPath: path) ? path : nil
+}
+
+func compileOptimizedSwiftSource(sourceURL: URL, outputURL: URL) -> (status: Int32, stdout: String, stderr: String) {
+    let architectureResult = runCommand(executable: "/usr/bin/uname", arguments: ["-m"])
+    guard architectureResult.status == 0,
+          let target = swiftCompilerTargetTriple(architecture: architectureResult.stdout) else {
+        return (-1, "", "Could not determine a supported macOS CPU architecture.")
+    }
+    guard let sdkPath = currentMacOSSDKPath() else {
+        return (-1, "", "AutoMount requires the macOS 27 SDK or later from Xcode or Command Line Tools.")
+    }
+    return runCommand(
+        executable: "/usr/bin/swiftc",
+        arguments: ["-O", "-sdk", sdkPath, "-target", target, sourceURL.path, "-o", outputURL.path]
+    )
+}
 
 struct MatchRule: Codable {
     var type: String             // "gateway_mac" 或 "probe_host"
@@ -147,7 +299,8 @@ struct NetworkProfile: Codable {
 struct AutoMountConfig: Codable {
     var version: String
     var updateChannel: String?                 // "off" (默认), "notify", "auto"
-    var lastUpdateCheckTimestamp: Double?     // 24小时冷却时间戳
+    var lastUpdateCheckTimestamp: Double?     // 更新检查最近一次尝试时间戳
+    var updateRetryAfterTimestamp: Double? = nil
     var lastNotifiedVersion: String?          // 单版本仅提醒 1 次防打扰
     var profiles: [NetworkProfile]
 
@@ -155,14 +308,26 @@ struct AutoMountConfig: Codable {
         case version
         case updateChannel = "update_channel"
         case lastUpdateCheckTimestamp = "last_update_check_timestamp"
+        case updateRetryAfterTimestamp = "update_retry_after_timestamp"
         case lastNotifiedVersion = "last_notified_version"
         case profiles
     }
 }
 
-// MARK: - 配置文件原地无损自动升舱 (In-Place Schema Auto-Migration)
+// MARK: - 配置文件原地迁移 (In-Place Schema Migration)
 
-func migrateConfigIfNeeded(config: inout AutoMountConfig) -> Bool {
+func configVersionCanBeMigrated(_ configVersion: String) -> Bool {
+    !isNewerVersion(configVersion, than: autoMountVersion)
+}
+
+func migrateConfigIfNeeded(config: inout AutoMountConfig, at configURL: URL) -> Bool {
+    guard configVersionCanBeMigrated(config.version) else {
+        fputs(tr("✗ 配置版本 v\(config.version) 高于当前程序 v\(autoMountVersion)，为避免降级破坏配置，已停止运行。\n",
+                 "✗ Config version v\(config.version) is newer than program v\(autoMountVersion); refusing to downgrade the config.\n"), stderr)
+        writeLog("Refused to migrate newer config version \(config.version) with program \(autoMountVersion)")
+        return false
+    }
+
     var modified = false
     if config.version != autoMountVersion {
         config.version = autoMountVersion
@@ -192,60 +357,237 @@ func migrateConfigIfNeeded(config: inout AutoMountConfig) -> Bool {
             modified = true
         }
     }
-    if modified {
-        saveConfig(config)
-        print(tr("✓ 配置文件已自动平滑升级至 v\(autoMountVersion) 格式规范",
-                 "✓ Configuration automatically upgraded to v\(autoMountVersion) schema"))
-        writeLog("Configuration auto-migrated to v\(autoMountVersion)")
+    guard modified else { return true }
+    guard saveConfig(config, to: configURL, syncInstalled: false) else {
+        fputs(tr("✗ 配置已迁移到内存，但未能完整写入配置文件。\n",
+                 "✗ Configuration was migrated in memory, but could not be fully saved.\n"), stderr)
+        writeLog("Configuration migration to v\(autoMountVersion) could not be persisted")
+        return false
     }
-    return modified
+    print(tr("✓ 配置文件已自动平滑升级至 v\(autoMountVersion) 格式规范",
+             "✓ Configuration automatically upgraded to v\(autoMountVersion) schema"))
+    writeLog("Configuration auto-migrated to v\(autoMountVersion)")
+    return true
 }
 
-// 加载配置并按需执行原地无损升舱
-func loadConfig() -> AutoMountConfig? {
-    let configURL = getConfigURL()
-    guard let data = try? Data(contentsOf: configURL) else { return nil }
+// 加载配置并执行已定义的迁移
+func loadConfig(from configURL: URL? = nil, migrate: Bool = true) -> AutoMountConfig? {
+    let resolvedURL = configURL ?? getConfigURL()
+    guard let data = try? Data(contentsOf: resolvedURL) else { return nil }
     let decoder = PropertyListDecoder()
     guard var config = try? decoder.decode(AutoMountConfig.self, from: data) else { return nil }
-    _ = migrateConfigIfNeeded(config: &config)
+    if migrate {
+        guard migrateConfigIfNeeded(config: &config, at: resolvedURL) else { return nil }
+    }
     return config
 }
 
-// 自动同步配置到 LaunchAgent 运行时目录（若已安装）
-func syncConfigToInstalledDirIfNeeded() {
-    let installDir = getInstalledDir()
-    let dstURL = installDir.appendingPathComponent("auto_mount.plist")
-    if FileManager.default.fileExists(atPath: dstURL.path) {
-        let srcURL = getConfigURL()
-        if FileManager.default.fileExists(atPath: srcURL.path) {
-            try? FileManager.default.removeItem(at: dstURL)
-            try? FileManager.default.copyItem(at: srcURL, to: dstURL)
-            print(tr("✓ 已同步最新配置至后台守护服务: \(dstURL.path)",
-                     "✓ Synchronized updated configuration to LaunchAgent runtime: \(dstURL.path)"))
-            writeLog("Synchronized configuration to \(dstURL.path)")
+func atomicWrite(_ data: Data, to url: URL, permissions: Int? = nil) throws {
+    let parentURL = url.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: parentURL, withIntermediateDirectories: true)
+    let temporaryURL = parentURL.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+    let requestedPermissions = permissions ?? 0o600
+
+    guard FileManager.default.createFile(
+        atPath: temporaryURL.path,
+        contents: nil,
+        attributes: [.posixPermissions: requestedPermissions]
+    ) else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Could not create temporary file for \(url.lastPathComponent)"])
+    }
+    defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+    try FileManager.default.setAttributes([.posixPermissions: requestedPermissions], ofItemAtPath: temporaryURL.path)
+    let handle = try FileHandle(forWritingTo: temporaryURL)
+    try handle.write(contentsOf: data)
+    try handle.synchronize()
+    try handle.close()
+
+    let renameResult = temporaryURL.path.withCString { sourcePath in
+        url.path.withCString { destinationPath in
+            Darwin.rename(sourcePath, destinationPath)
         }
+    }
+    guard renameResult == 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Could not atomically replace \(url.lastPathComponent)"])
     }
 }
 
-// 保存 2.0 配置
-func saveConfig(_ config: AutoMountConfig) {
-    let configURL = getConfigURL()
+// 自动同步配置到已部署的 LaunchAgent 运行目录。
+@discardableResult
+func syncConfigToInstalledDirIfNeeded(from sourceURL: URL) -> Bool {
+    let plistURL = getLaunchAgentPlistURL()
+    guard FileManager.default.fileExists(atPath: plistURL.path) else { return true }
+
+    let destinationURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
+    guard sourceURL.standardizedFileURL.path != destinationURL.standardizedFileURL.path else { return true }
+    do {
+        let data = try Data(contentsOf: sourceURL)
+        try atomicWrite(data, to: destinationURL, permissions: 0o600)
+        print(tr("✓ 已同步最新配置至后台守护服务: \(destinationURL.path)",
+                 "✓ Synchronized configuration to LaunchAgent runtime: \(destinationURL.path)"))
+        writeLog("Synchronized configuration to \(destinationURL.path)")
+        return true
+    } catch {
+        fputs(tr("✗ 配置已保存，但同步到后台守护服务失败: \(error.localizedDescription)\n",
+                 "✗ Config saved, but synchronization to LaunchAgent runtime failed: \(error.localizedDescription)\n"), stderr)
+        writeLog("Failed to synchronize configuration to \(destinationURL.path): \(error.localizedDescription)")
+        return false
+    }
+}
+
+func mergeDaemonOwnedMetadata(into config: inout AutoMountConfig, from runtimeConfig: AutoMountConfig) {
+    let timestamps = [config.lastUpdateCheckTimestamp, runtimeConfig.lastUpdateCheckTimestamp]
+        .compactMap { $0 }
+        .filter { $0.isFinite }
+    config.lastUpdateCheckTimestamp = timestamps.max()
+
+    let retryTimestamps = [config.updateRetryAfterTimestamp, runtimeConfig.updateRetryAfterTimestamp]
+        .compactMap { $0 }
+        .filter { $0.isFinite }
+    config.updateRetryAfterTimestamp = retryTimestamps.max()
+
+    if let runtimeVersion = runtimeConfig.lastNotifiedVersion,
+       config.lastNotifiedVersion == nil || isNewerVersion(runtimeVersion, than: config.lastNotifiedVersion ?? "") {
+        config.lastNotifiedVersion = runtimeVersion
+    }
+}
+
+enum ConfigPlistContext: Equatable {
+    case root
+    case profiles
+    case profile
+    case match
+    case targets
+    case target
+    case other
+}
+
+func canonicalProfileID(_ value: String) -> String {
+    switch value {
+    case "home_lan": return "local_lan"
+    case "tailscale_remote": return "remote_network"
+    default: return value
+    }
+}
+
+func managedConfigKeys(for context: ConfigPlistContext) -> Set<String> {
+    switch context {
+    case .root:
+        return ["version", "update_channel", "last_update_check_timestamp",
+                "update_retry_after_timestamp", "last_notified_version", "profiles"]
+    case .profile:
+        return ["id", "description", "match", "exclude_gateway_ips",
+                "prevent_spotlight_index", "targets"]
+    case .match:
+        return ["type", "value", "retry_count", "retry_interval"]
+    case .target:
+        return ["url", "mount_path"]
+    case .profiles, .targets, .other:
+        return []
+    }
+}
+
+func childConfigPlistContext(parent: ConfigPlistContext, key: String) -> ConfigPlistContext {
+    switch (parent, key) {
+    case (.root, "profiles"): return .profiles
+    case (.profile, "match"): return .match
+    case (.profile, "targets"): return .targets
+    default: return .other
+    }
+}
+
+func configPlistIdentity(_ value: Any, context: ConfigPlistContext) -> String? {
+    guard let dictionary = value as? [String: Any] else { return nil }
+    switch context {
+    case .profiles:
+        guard let identifier = dictionary["id"] as? String else { return nil }
+        return canonicalProfileID(identifier)
+    case .targets:
+        return dictionary["mount_path"] as? String
+    default:
+        return nil
+    }
+}
+
+func mergeConfigPlistValue(
+    original: Any,
+    generated: Any,
+    context: ConfigPlistContext
+) -> Any {
+    if let originalDictionary = original as? [String: Any],
+       let generatedDictionary = generated as? [String: Any] {
+        var merged = originalDictionary
+        for key in managedConfigKeys(for: context) where generatedDictionary[key] == nil {
+            merged.removeValue(forKey: key)
+        }
+        for (key, newValue) in generatedDictionary {
+            let childContext = childConfigPlistContext(parent: context, key: key)
+            if let oldValue = originalDictionary[key] {
+                merged[key] = mergeConfigPlistValue(original: oldValue, generated: newValue, context: childContext)
+            } else {
+                merged[key] = newValue
+            }
+        }
+        return merged
+    }
+
+    if let originalArray = original as? [Any], let generatedArray = generated as? [Any] {
+        guard context == .profiles || context == .targets else { return generatedArray }
+        var unusedOriginalIndices = Set(originalArray.indices)
+        return generatedArray.map { newValue in
+            let identity = configPlistIdentity(newValue, context: context)
+            let matchedIndex = identity.flatMap { newIdentity in
+                unusedOriginalIndices.first { configPlistIdentity(originalArray[$0], context: context) == newIdentity }
+            }
+            guard let matchedIndex else { return newValue }
+            unusedOriginalIndices.remove(matchedIndex)
+            let childContext: ConfigPlistContext = context == .profiles ? .profile : .target
+            return mergeConfigPlistValue(original: originalArray[matchedIndex], generated: newValue, context: childContext)
+        }
+    }
+
+    return generated
+}
+
+func encodeConfigPreservingUnknownFields(_ config: AutoMountConfig, at configURL: URL) throws -> Data {
     let encoder = PropertyListEncoder()
     encoder.outputFormat = .xml
+    let encodedData = try encoder.encode(config)
+    guard FileManager.default.fileExists(atPath: configURL.path),
+          let originalData = try? Data(contentsOf: configURL),
+          let original = (try? PropertyListSerialization.propertyList(from: originalData, options: [], format: nil)) as? [String: Any],
+          let generated = (try? PropertyListSerialization.propertyList(from: encodedData, options: [], format: nil)) as? [String: Any],
+          let merged = mergeConfigPlistValue(original: original, generated: generated, context: .root) as? [String: Any] else {
+        return encodedData
+    }
+    return try PropertyListSerialization.data(fromPropertyList: merged, format: .xml, options: 0)
+}
+
+// 保存配置并限制读取权限，避免 SMB URL 中可能含有的凭据被其他本机用户读取。
+@discardableResult
+func saveConfig(_ config: AutoMountConfig, to configURL: URL? = nil, syncInstalled: Bool = true) -> Bool {
+    let resolvedURL = configURL ?? getConfigURL()
+    var configToSave = config
+    let runtimeConfigURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
+    if resolvedURL.standardizedFileURL.path != runtimeConfigURL.standardizedFileURL.path,
+       let runtimeConfig = loadConfig(from: runtimeConfigURL, migrate: false) {
+        mergeDaemonOwnedMetadata(into: &configToSave, from: runtimeConfig)
+    }
     do {
-        let data = try encoder.encode(config)
-        try data.write(to: configURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: configURL.path)
-        print(tr("✓ 配置已即时保存至: \(configURL.path)",
-                 "✓ Config saved to: \(configURL.path)"))
-        syncConfigToInstalledDirIfNeeded()
+        let data = try encodeConfigPreservingUnknownFields(configToSave, at: resolvedURL)
+        try atomicWrite(data, to: resolvedURL, permissions: 0o600)
+        print(tr("✓ 配置已即时保存至: \(resolvedURL.path)",
+                 "✓ Config saved to: \(resolvedURL.path)"))
+        return syncInstalled ? syncConfigToInstalledDirIfNeeded(from: resolvedURL) : true
     } catch {
         fputs("✗ Failed to save config: \(error.localizedDescription)\n", stderr)
         writeLog("Failed to save config: \(error.localizedDescription)")
+        return false
     }
 }
 
-// MARK: - 网络硬件探测 (穿透 TUN 隧道与 ARP 解析)
+// MARK: - 物理网关与接口作用域 ARP 探测
 
 func getPhysicalBSDInterfaces() -> [String] {
     let cfInterfaces = SCNetworkInterfaceCopyAll()
@@ -263,6 +605,11 @@ func getPhysicalBSDInterfaces() -> [String] {
     return names.isEmpty ? ["en0", "en1", "en2", "en3", "en4", "en5"] : names
 }
 
+func isIPv4Address(_ value: String) -> Bool {
+    var address = in_addr()
+    return value.withCString { inet_pton(AF_INET, $0, &address) } == 1
+}
+
 struct GatewayInfo {
     let ip: String
     let interface: String
@@ -270,80 +617,94 @@ struct GatewayInfo {
 
 func getPhysicalGatewayInfo() -> GatewayInfo? {
     let interfaces = getPhysicalBSDInterfaces()
+
+    // Prefer the active default route when macOS reports an Ethernet interface.
+    // VPN routes can replace the default route, so retain DHCP-router lookup as a fallback.
+    let route = runCommand(executable: "/sbin/route", arguments: ["-n", "get", "default"])
+    if route.status == 0 {
+        let gateway = route.stdout.components(separatedBy: .newlines).first {
+            $0.trimmingCharacters(in: .whitespaces).hasPrefix("gateway:")
+        }?.components(separatedBy: ":").dropFirst().joined(separator: ":").trimmingCharacters(in: .whitespaces)
+        let interface = route.stdout.components(separatedBy: .newlines).first {
+            $0.trimmingCharacters(in: .whitespaces).hasPrefix("interface:")
+        }?.components(separatedBy: ":").dropFirst().joined(separator: ":").trimmingCharacters(in: .whitespaces)
+        if let gateway, let interface, isIPv4Address(gateway), interface.hasPrefix("en") {
+            return GatewayInfo(ip: gateway, interface: interface)
+        }
+    }
+
     for iface in interfaces {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/sbin/ipconfig")
-        task.arguments = ["getoption", iface, "router"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do {
-            try task.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            task.waitUntilExit()
-            if task.terminationStatus == 0 {
-                if let output = String(data: data, encoding: .utf8) {
-                    let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        return GatewayInfo(ip: trimmed, interface: iface)
-                    }
-                }
-            }
-        } catch {
-            continue
+        let result = runCommand(executable: "/usr/sbin/ipconfig", arguments: ["getoption", iface, "router"])
+        guard result.status == 0 else { continue }
+        let router = result.stdout.split(whereSeparator: \.isWhitespace).map(String.init).first(where: isIPv4Address)
+        if let router {
+            return GatewayInfo(ip: router, interface: iface)
         }
     }
     return nil
 }
 
-func queryARPCache(for ip: String) -> String? {
-    let arp = Process()
-    arp.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
-    arp.arguments = ["-n", "-a"]
-    let pipe = Pipe()
-    arp.standardOutput = pipe
-    arp.standardError = Pipe()
-    do {
-        try arp.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        arp.waitUntilExit()
-        guard arp.terminationStatus == 0 else { return nil }
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
-        let pattern = "\\(\\Q" + ip + "\\E\\)\\s+at\\s+([0-9a-fA-F:]+)\\s+on"
-        if let regex = try? NSRegularExpression(pattern: pattern),
-           let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
-           let macRange = Range(match.range(at: 1), in: output) {
-            let mac = String(output[macRange]).lowercased()
-            if !mac.contains("incomplete") {
-                return mac
+func parseARPCacheOutput(_ output: String, for ip: String, interface: String? = nil) -> String? {
+    let escapedIP = NSRegularExpression.escapedPattern(for: ip)
+    let pattern = #"\("# + escapedIP + #"\)\s+at\s+((?:[0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})\s+on\b"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    for line in output.components(separatedBy: .newlines) where line.contains("(\(ip))") {
+        if let interface {
+            let escapedInterface = NSRegularExpression.escapedPattern(for: interface)
+            guard let interfaceRegex = try? NSRegularExpression(pattern: #"\bon\s+"# + escapedInterface + #"(?:\s|$)"#),
+                  interfaceRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil else {
+                continue
             }
         }
-    } catch {
-        return nil
+        guard let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+              let range = Range(match.range(at: 1), in: line) else { continue }
+        return String(line[range]).lowercased()
     }
     return nil
+}
+
+func queryARPCache(for ip: String, interface: String) -> String? {
+    // macOS can report a miss for a destination-specific lookup even when the
+    // same interface-scoped neighbor is present in its full ARP table.
+    let exact = runCommand(executable: "/usr/sbin/arp", arguments: ["-n", "-i", interface, ip])
+    if exact.status == 0, let mac = parseARPCacheOutput(exact.stdout, for: ip, interface: interface) {
+        return mac
+    }
+
+    let interfaceTable = runCommand(executable: "/usr/sbin/arp", arguments: ["-n", "-i", interface, "-a"])
+    if interfaceTable.status == 0,
+       let mac = parseARPCacheOutput(interfaceTable.stdout, for: ip, interface: interface) {
+        return mac
+    }
+
+    // The system may not return an entry for an interface-scoped query even
+    // when its normal route lookup can see that same physical neighbor.
+    let routedLookup = runCommand(executable: "/usr/sbin/arp", arguments: ["-n", ip])
+    guard routedLookup.status == 0 else { return nil }
+    return parseARPCacheOutput(routedLookup.stdout, for: ip, interface: interface)
 }
 
 func getMACAddress(for ip: String, interface: String? = nil) -> String? {
     guard !ip.isEmpty else { return nil }
-    if let cachedMAC = queryARPCache(for: ip) {
-        return cachedMAC
+    for attempt in 0..<4 {
+        if let iface = interface, let cachedMAC = queryARPCache(for: ip, interface: iface) {
+            return cachedMAC
+        }
+        var args = ["-c", "1", "-t", "1"]
+        if let iface = interface {
+            args.append(contentsOf: ["-b", iface])
+        }
+        args.append(ip)
+        let ping = runCommand(executable: "/sbin/ping", arguments: args)
+        if ping.status != 0 {
+            writeLog("Gateway neighbor probe failed for \(ip) on \(interface ?? "default route") (status \(ping.status)): \(ping.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        if attempt < 3 {
+            Thread.sleep(forTimeInterval: 0.35)
+        }
     }
-    let ping = Process()
-    ping.executableURL = URL(fileURLWithPath: "/sbin/ping")
-    var args = ["-c", "1", "-t", "1"]
-    if let iface = interface {
-        args.append(contentsOf: ["-b", iface])
-    }
-    args.append(ip)
-    ping.arguments = args
-    ping.standardOutput = Pipe()
-    ping.standardError = Pipe()
-    try? ping.run()
-    ping.waitUntilExit()
-
-    Thread.sleep(forTimeInterval: 0.1)
-    return queryARPCache(for: ip)
+    guard let interface else { return nil }
+    return queryARPCache(for: ip, interface: interface)
 }
 
 func getCurrentNetworkFingerprint() -> String? {
@@ -353,6 +714,11 @@ func getCurrentNetworkFingerprint() -> String? {
 
 func extractHost(from string: String) -> String {
     var clean = string.trimmingCharacters(in: .whitespacesAndNewlines)
+    let componentInput = clean.hasPrefix("//") ? "smb:\(clean)" : clean
+    if let components = URLComponents(string: componentInput),
+       let host = components.host, !host.isEmpty {
+        return host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+    }
     if clean.hasPrefix("smb://") {
         clean = String(clean.dropFirst(6))
     } else if clean.hasPrefix("//") {
@@ -364,37 +730,133 @@ func extractHost(from string: String) -> String {
     if let slashIndex = clean.firstIndex(of: "/") {
         clean = String(clean[..<slashIndex])
     }
-    if let colonIndex = clean.firstIndex(of: ":") {
+    if clean.hasPrefix("["), let end = clean.firstIndex(of: "]") {
+        clean = String(clean[clean.index(after: clean.startIndex)..<end])
+    } else if clean.filter({ $0 == ":" }).count == 1, let colonIndex = clean.firstIndex(of: ":") {
         clean = String(clean[..<colonIndex])
     }
     return clean.lowercased()
 }
 
+func smbResourceIdentity(_ value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    let input = trimmed.hasPrefix("//") ? "smb:\(trimmed)" : trimmed
+    guard let components = URLComponents(string: input),
+          components.scheme?.lowercased() == "smb",
+          let host = components.host, !host.isEmpty else { return nil }
+    let sharePath = components.path
+        .split(separator: "/")
+        .map(String.init)
+        .joined(separator: "/")
+        .lowercased()
+    guard !sharePath.isEmpty else { return nil }
+    let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+    return "\(normalizedHost)/\(sharePath)"
+}
+
+func redactedSMBURL(_ value: String) -> String {
+    if var components = URLComponents(string: value),
+       components.user != nil || components.password != nil {
+        components.user = nil
+        components.password = nil
+        if let sanitized = components.string { return sanitized }
+    }
+
+    // Invalid URLs still reach validation diagnostics. Redact authority userinfo
+    // there too, and apply the same rule to non-SMB schemes.
+    guard let regex = try? NSRegularExpression(
+        pattern: #"^((?:[A-Za-z][A-Za-z0-9+.-]*:)?//)[^/?#@]*@"#
+    ) else { return value }
+    let range = NSRange(value.startIndex..., in: value)
+    return regex.stringByReplacingMatches(in: value, range: range, withTemplate: "$1<redacted>@")
+}
+
+func validateMountTargetURL(_ value: String) -> String? {
+    guard let components = URLComponents(string: value),
+          components.scheme?.lowercased() == "smb",
+          let host = components.host, !host.isEmpty,
+          !components.path.split(separator: "/").isEmpty else {
+        return tr("SMB 地址必须包含 smb://、服务器和共享名。", "SMB URL must include smb://, a server, and a share name.")
+    }
+    guard components.query == nil, components.fragment == nil else {
+        return tr("SMB 地址不能包含查询参数或片段。", "SMB URL cannot contain a query or fragment.")
+    }
+    return nil
+}
+
+func validateMountPath(_ value: String) -> String? {
+    guard value.hasPrefix("/"), value != "/" else {
+        return tr("挂载路径必须是非根目录的绝对路径。", "Mount path must be an absolute path other than '/'.")
+    }
+    if URL(fileURLWithPath: value).standardizedFileURL.path == "/Volumes" {
+        return tr("不能将 /Volumes 本身用作挂载点。", "'/Volumes' itself cannot be used as a mount point.")
+    }
+    let components = value.split(separator: "/")
+    guard !components.contains("."), !components.contains("..") else {
+        return tr("挂载路径不能包含 . 或 .. 路径段。", "Mount path cannot contain '.' or '..' path components.")
+    }
+    return nil
+}
+
+func usesSystemManagedMountPoint(_ target: MountTarget) -> Bool {
+    let mountURL = URL(fileURLWithPath: target.mountPath, isDirectory: true).standardizedFileURL
+    guard mountURL.deletingLastPathComponent().path == "/Volumes",
+          let components = URLComponents(string: target.url),
+          let shareName = components.path.split(separator: "/").last else { return false }
+    return String(shareName).caseInsensitiveCompare(mountURL.lastPathComponent) == .orderedSame
+}
+
+func isIPAddress(_ value: String) -> Bool {
+    if isIPv4Address(value) { return true }
+    var address6 = in6_addr()
+    return value.withCString({ inet_pton(AF_INET6, $0, &address6) }) == 1
+}
+
+func promptExcludedGateways() -> [String]? {
+    while true {
+        print(tr("  可选：输入要排除的物理网关 IP，多个地址用逗号分隔；直接回车表示不排除：",
+                 "  Optional: enter physical gateway IPs to exclude, separated by commas; Enter means none: "), terminator: "")
+        let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if input.isEmpty { return nil }
+        let addresses = input.split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !addresses.isEmpty, addresses.allSatisfy(isIPAddress) else {
+            print(tr("  ✗ 列表中存在无效 IP 地址，请重新输入。", "  ✗ The list contains an invalid IP address. Please try again."))
+            continue
+        }
+        return Array(Set(addresses)).sorted()
+    }
+}
+
 func probeHostWithRetries(host: String, retries: Int = 3, interval: Double = 1.0) -> Bool {
     let cleanHost = extractHost(from: host)
-    for attempt in 1...retries {
-        let ping = Process()
-        ping.executableURL = URL(fileURLWithPath: "/sbin/ping")
-        ping.arguments = ["-c", "1", "-t", "1", cleanHost]
-        ping.standardOutput = Pipe()
-        ping.standardError = Pipe()
+    guard !cleanHost.isEmpty, retries > 0 else { return false }
+    let attempts = min(retries, 10)
+    let retryInterval = interval.isFinite ? min(max(interval, 0), 10) : 1.0
+    for attempt in 1...attempts {
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+        probe.arguments = ["-z", "-G", "2", cleanHost, "445"]
+        probe.standardOutput = FileHandle.nullDevice
+        probe.standardError = FileHandle.nullDevice
         do {
-            try ping.run()
-            ping.waitUntilExit()
-            if ping.terminationStatus == 0 {
+            try probe.run()
+            probe.waitUntilExit()
+            if probe.terminationStatus == 0 {
                 return true
             }
         } catch {
-            // ignore
+            writeLog("SMB TCP probe failed to start for \(cleanHost): \(error.localizedDescription)")
         }
-        if attempt < retries {
-            Thread.sleep(forTimeInterval: interval)
+        if attempt < attempts, retryInterval > 0 {
+            Thread.sleep(forTimeInterval: retryInterval)
         }
     }
     return false
 }
 
-// MARK: - 内核非阻塞挂载表快照与断网失效挂载清理 (Strategy B)
+// MARK: - 内核非阻塞挂载表快照与失效 SMB 挂载清理
 
 struct KernelMountEntry {
     let mountPath: String
@@ -493,71 +955,86 @@ func findTailscaleBinary() -> String? {
 
 func discoverTailscalePeers() -> [DiscoveredTailscalePeer] {
     guard let binPath = findTailscaleBinary() else { return [] }
-
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: binPath)
-    task.arguments = ["status", "--json"]
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = Pipe()
-    do {
-        try task.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return [] }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    let result = runCommand(executable: binPath, arguments: ["status", "--json"])
+    guard result.status == 0,
+          let data = result.stdout.data(using: .utf8),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let peers = json["Peer"] as? [String: [String: Any]] else { return [] }
 
-        var list: [DiscoveredTailscalePeer] = []
-        for (_, peer) in peers {
-            let name = peer["HostName"] as? String ?? "unknown"
-            var dns = peer["DNSName"] as? String
-            if let d = dns, d.hasSuffix(".") {
-                dns = String(d.dropLast())
-            }
-            let ips = peer["TailscaleIPs"] as? [String] ?? []
-            let ip = ips.first ?? ""
-            let os = peer["OS"] as? String ?? ""
-            list.append(DiscoveredTailscalePeer(name: name, magicDNS: dns, ip: ip, os: os))
+    var list: [DiscoveredTailscalePeer] = []
+    for (_, peer) in peers {
+        let name = peer["HostName"] as? String ?? "unknown"
+        var dns = peer["DNSName"] as? String
+        if let d = dns, d.hasSuffix(".") {
+            dns = String(d.dropLast())
         }
-        return list.sorted { $0.name < $1.name }
-    } catch {
-        return []
+        let ips = peer["TailscaleIPs"] as? [String] ?? []
+        let ip = ips.first ?? ""
+        let os = peer["OS"] as? String ?? ""
+        list.append(DiscoveredTailscalePeer(name: name, magicDNS: dns, ip: ip, os: os))
     }
+    return list.sorted { $0.name < $1.name }
 }
 
-// 严格带超时限制的强制卸载函数 (3 秒超时)
+func remoteSMBAcceptanceURL(_ urlString: String, peers: [DiscoveredTailscalePeer]) -> (url: String, usesTailscaleAddress: Bool) {
+    let configuredHost = extractHost(from: urlString).lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    guard let peer = peers.first(where: {
+        $0.magicDNS?.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) == configuredHost
+    }),
+          let address = URLComponents(string: urlString).flatMap({ components -> String? in
+              var routedComponents = components
+              routedComponents.host = peer.ip
+              return routedComponents.url?.absoluteString
+          }) else {
+        return (urlString, false)
+    }
+    return (address, true)
+}
+
+// 通过共享时限内的子进程尝试强制卸载。
 @discardableResult
 func forceUnmountWithTimeout(path: String, timeoutSeconds: Double = 3.0) -> Bool {
     print("    [Unmount] Force unmounting stale/conflicting volume at \(path)...")
     writeLog("Attempting force unmount on \(path) (timeout \(timeoutSeconds)s)")
 
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-    task.arguments = ["unmount", "force", path]
-    task.standardOutput = Pipe()
-    task.standardError = Pipe()
+    let requestedTimeout = timeoutSeconds.isFinite ? max(timeoutSeconds, 0) : 3.0
+    let startedAt = Date()
+    let diskutil = runCommandDiscardingOutputWithTimeout(
+        executable: "/usr/sbin/diskutil",
+        arguments: ["unmount", "force", path],
+        timeout: requestedTimeout * 0.6
+    )
 
-    let group = DispatchGroup()
-    group.enter()
-    do {
-        try task.run()
-        DispatchQueue.global().async {
-            task.waitUntilExit()
-            group.leave()
+    if diskutil.status != 0 || diskutil.timedOut {
+        guard diskutil.processStopped else {
+            writeLog("diskutil unmount did not stop after SIGKILL; skipped concurrent fallback")
+            return false
         }
-        let result = group.wait(timeout: .now() + timeoutSeconds)
-        if result == .timedOut {
-            task.terminate()
-            writeLog("diskutil unmount timed out, falling back to Darwin unmount(MNT_FORCE)")
-            _ = Darwin.unmount(path, MNT_FORCE)
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let remaining = max(requestedTimeout - elapsed, 0)
+        writeLog("diskutil unmount failed or timed out; trying bounded umount -f fallback")
+        if remaining > 0 {
+            let fallback = runCommandDiscardingOutputWithTimeout(
+                executable: "/sbin/umount",
+                arguments: ["-f", path],
+                timeout: remaining
+            )
+            guard fallback.processStopped else {
+                writeLog("umount -f fallback did not stop after SIGKILL")
+                return false
+            }
+            if fallback.status != 0 {
+                writeLog("umount -f fallback failed with status \(fallback.status.map(String.init) ?? "unknown")")
+            }
+        } else {
+            writeLog("No timeout budget remained for umount -f fallback")
         }
-    } catch {
-        _ = Darwin.unmount(path, MNT_FORCE)
-        group.leave()
     }
 
-    Thread.sleep(forTimeInterval: 0.5)
+    let remaining = max(requestedTimeout - Date().timeIntervalSince(startedAt), 0)
+    if remaining > 0 {
+        Thread.sleep(forTimeInterval: min(0.5, remaining))
+    }
     let stillMounted = getKernelMountSource(for: path) != nil
     if !stillMounted {
         print("    ✓ Successfully unmounted \(path)")
@@ -577,18 +1054,55 @@ enum MountPointStatus {
 }
 
 func ensureMountPointReady(target: MountTarget) -> MountPointStatus {
+    if let error = validateMountTargetURL(target.url) {
+        print("    [Validation] \(error)")
+        writeLog("Rejected invalid SMB URL for \(target.mountPath): \(redactedSMBURL(target.url))")
+        return .unmountFailed
+    }
+    if let error = validateMountPath(target.mountPath) {
+        print("    [Validation] \(error)")
+        writeLog("Rejected invalid mount path: \(target.mountPath)")
+        return .unmountFailed
+    }
+
     guard let currentSource = getKernelMountSource(for: target.mountPath) else {
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: target.mountPath, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else {
+                print("    [Mount Point] The configured path exists and is not a directory.")
+                writeLog("Mount point is not a directory: \(target.mountPath)")
+                return .unmountFailed
+            }
+        } else if !usesSystemManagedMountPoint(target) {
+            do {
+                try FileManager.default.createDirectory(
+                    at: URL(fileURLWithPath: target.mountPath),
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                print("    [Mount Point] Could not create directory: \(error.localizedDescription)")
+                writeLog("Could not create mount point \(target.mountPath): \(error.localizedDescription)")
+                return .unmountFailed
+            }
+        }
         return .readyToMount
     }
 
+    guard let currentResource = smbResourceIdentity(currentSource) else {
+        print("    [Mount Point] An unrelated filesystem is mounted at this path; it will be left untouched.")
+        writeLog("Refusing to unmount non-SMB filesystem at configured mount path \(target.mountPath): \(currentSource)")
+        return .unmountFailed
+    }
+
+    let targetResource = smbResourceIdentity(target.url)!
     let currentHost = extractHost(from: currentSource)
     let targetHost = extractHost(from: target.url)
 
-    if currentHost == targetHost {
+    if currentResource == targetResource {
         if probeHostWithRetries(host: targetHost, retries: 1, interval: 0.5) {
             return .alreadyMountedHealthy
         } else {
-            print("    [Health Check] Stale mount detected (host \(targetHost) unreachable).")
+            print("    [Health Check] SMB endpoint \(targetHost):445 is unreachable.")
             writeLog("Stale mount detected on \(target.mountPath), unmounting...")
             return forceUnmountWithTimeout(path: target.mountPath) ? .readyToMount : .unmountFailed
         }
@@ -602,49 +1116,177 @@ func ensureMountPointReady(target: MountTarget) -> MountPointStatus {
 // MARK: - 流量保护与 Spotlight 索引阻断
 
 func disableSpotlightIndex(at mountPath: String) {
-    let mdutil = Process()
-    mdutil.executableURL = URL(fileURLWithPath: "/usr/bin/mdutil")
-    mdutil.arguments = ["-i", "off", mountPath]
-    mdutil.standardOutput = Pipe()
-    mdutil.standardError = Pipe()
-    try? mdutil.run()
-    mdutil.waitUntilExit()
+    let mdutil = runCommand(executable: "/usr/bin/mdutil", arguments: ["-i", "off", mountPath])
+    var markerCreated = false
+    if mdutil.status != 0 {
+        writeLog("mdutil could not disable indexing for \(mountPath): \(mdutil.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        fputs("    ⚠ Could not confirm Spotlight indexing is disabled for \(mountPath).\n", stderr)
+    }
 
     let flagURL = URL(fileURLWithPath: mountPath).appendingPathComponent(".metadata_never_index")
     if !FileManager.default.fileExists(atPath: flagURL.path) {
-        try? "".write(to: flagURL, atomically: true, encoding: .utf8)
+        do {
+            try "".write(to: flagURL, atomically: true, encoding: .utf8)
+            markerCreated = true
+        } catch {
+            writeLog("Could not create Spotlight marker at \(mountPath): \(error.localizedDescription)")
+        }
+    } else {
+        markerCreated = true
     }
-    writeLog("Spotlight indexing disabled for \(mountPath)")
+    if mdutil.status == 0 || markerCreated {
+        writeLog("Spotlight indexing prevention requested for \(mountPath) (mdutil status: \(mdutil.status), marker present: \(markerCreated))")
+    } else {
+        writeLog("Spotlight indexing prevention could not be confirmed for \(mountPath)")
+    }
 }
 
-// 静默挂载网络卷宗（NetFS 核心 API）
-func silentMount(urlString: String) -> Bool {
-    guard let url = CFURLCreateWithString(kCFAllocatorDefault, urlString as CFString, nil) else {
-        fputs("    ✗ Invalid URL: \(urlString)\n", stderr)
+// 静默挂载网络卷宗。/Volumes 下的标准共享名由 NetFS 创建挂载目录，避免普通 LaunchAgent 写系统目录。
+func silentMount(urlString: String, mountPath: String) -> Bool {
+    if let error = validateMountTargetURL(urlString) {
+        fputs("    ✗ \(error)\n", stderr)
         return false
     }
+    if let error = validateMountPath(mountPath) {
+        fputs("    ✗ \(error)\n", stderr)
+        return false
+    }
+    guard let url = CFURLCreateWithString(kCFAllocatorDefault, urlString as CFString, nil) else {
+        fputs("    ✗ Invalid SMB URL: \(redactedSMBURL(urlString))\n", stderr)
+        return false
+    }
+    let standardizedMountPath = URL(fileURLWithPath: mountPath, isDirectory: true).standardizedFileURL.path
+    let mountpointURL: CFURL?
+    if FileManager.default.fileExists(atPath: standardizedMountPath) {
+        mountpointURL = URL(fileURLWithPath: standardizedMountPath, isDirectory: true).standardizedFileURL as CFURL
+    } else if usesSystemManagedMountPoint(MountTarget(url: urlString, mountPath: standardizedMountPath)) {
+        mountpointURL = nil
+    } else {
+        fputs("    ✗ Mount point does not exist and cannot be delegated to NetFS: \(standardizedMountPath)\n", stderr)
+        writeLog("Mount point is missing and is not a NetFS-managed /Volumes share path: \(standardizedMountPath)")
+        return false
+    }
+    let openOptions = NSMutableDictionary()
+    openOptions[kNAUIOptionKey as String] = kNAUIOptionNoUI as String
     var mountPoints: Unmanaged<CFArray>?
     let status = NetFSMountURLSync(
         url,
+        mountpointURL,
         nil,
         nil,
-        nil,
-        nil,
+        openOptions as CFMutableDictionary,
         nil,
         &mountPoints
     )
-    if let mp = mountPoints {
-        mp.release()
-    }
+    let returnedMountPaths = mountPoints?.takeRetainedValue() as? [String] ?? []
     if status == noErr {
-        print("    ✓ Mounted: \(urlString)")
-        writeLog("Mounted: \(urlString)")
-        return true
+        let candidatePaths = ([standardizedMountPath] + returnedMountPaths).reduce(into: [String]()) { paths, path in
+            let normalizedPath = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+            if !paths.contains(normalizedPath) { paths.append(normalizedPath) }
+        }
+        for candidatePath in candidatePaths {
+            for _ in 0..<20 {
+                if let mountedSource = getKernelMountSource(for: candidatePath) {
+                    if smbResourceIdentity(mountedSource) == smbResourceIdentity(urlString) {
+                        if candidatePath == standardizedMountPath {
+                            print("    ✓ Mounted at \(candidatePath): \(redactedSMBURL(urlString))")
+                            writeLog("Mounted \(redactedSMBURL(urlString)) at \(candidatePath)")
+                            return true
+                        }
+                        fputs("    ✗ NetFS mounted this share at \(candidatePath), not the configured path \(standardizedMountPath).\n", stderr)
+                        writeLog("NetFS mounted \(redactedSMBURL(urlString)) at \(candidatePath), not configured path \(standardizedMountPath); cleaning up the new mount")
+                        _ = forceUnmountWithTimeout(path: candidatePath)
+                        return false
+                    }
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+        }
+        fputs("    ✗ NetFS returned success, but no matching mount appeared at \(standardizedMountPath).\n", stderr)
+        writeLog("NetFS returned success for \(redactedSMBURL(urlString)), but no matching mount appeared at \(standardizedMountPath)")
+        return false
     } else {
-        fputs("    ✗ Failed to mount: \(urlString) (error: \(status))\n", stderr)
-        writeLog("Failed to mount: \(urlString) (error: \(status))")
+        fputs("    ✗ Failed to mount \(redactedSMBURL(urlString)) at \(standardizedMountPath) (error: \(status))\n", stderr)
+        writeLog("Failed to mount \(redactedSMBURL(urlString)) at \(standardizedMountPath) (error: \(status))")
         return false
     }
+}
+
+func runRemoteSMBAcceptanceChecks() -> Bool {
+    guard let config = loadConfig(from: getConfigURL(), migrate: false),
+          let profile = config.profiles.first(where: { $0.match.type == "probe_host" && !$0.targets.isEmpty }) else {
+        fputs("FAIL remote SMB acceptance: no valid remote profile is configured.\n", stderr)
+        return false
+    }
+
+    print("Remote SMB acceptance: profile \(profile.id), \(profile.targets.count) target(s)")
+    var passed = 0
+    var failed = 0
+    let tailscalePeers = discoverTailscalePeers()
+    guard let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+        fputs("FAIL remote SMB acceptance: no user cache directory is available.\n", stderr)
+        return false
+    }
+    let testRoot = cacheDirectory
+        .appendingPathComponent("AutoMountRemoteAcceptance-\(UUID().uuidString)", isDirectory: true)
+
+    for (index, target) in profile.targets.enumerated() {
+        let mountPath = testRoot.appendingPathComponent("target-\(index + 1)", isDirectory: true).path
+        guard validateMountTargetURL(target.url) == nil,
+              validateMountPath(mountPath) == nil else {
+            fputs("FAIL remote SMB target \(index + 1): invalid configured target.\n", stderr)
+            failed += 1
+            continue
+        }
+        do {
+            try FileManager.default.createDirectory(atPath: mountPath, withIntermediateDirectories: true)
+        } catch {
+            fputs("FAIL remote SMB target \(index + 1): could not create a temporary mount point (\(error.localizedDescription)).\n", stderr)
+            failed += 1
+            continue
+        }
+
+        let endpoint = remoteSMBAcceptanceURL(target.url, peers: tailscalePeers)
+        if endpoint.usesTailscaleAddress {
+            print("  Target \(index + 1): using the configured peer's Tailscale address for this test")
+        }
+        let testHost = extractHost(from: endpoint.url)
+        let reachable = probeHostWithRetries(
+            host: testHost,
+            retries: profile.match.retryCount ?? 3,
+            interval: profile.match.retryInterval ?? 1.0
+        )
+        var mountVerified = false
+        if reachable {
+            _ = silentMount(urlString: endpoint.url, mountPath: mountPath)
+            if let source = getKernelMountSource(for: mountPath) {
+                mountVerified = smbResourceIdentity(source) == smbResourceIdentity(endpoint.url)
+            }
+        }
+
+        var cleanupSucceeded = true
+        if getKernelMountSource(for: mountPath) != nil {
+            cleanupSucceeded = forceUnmountWithTimeout(path: mountPath)
+        }
+        if cleanupSucceeded {
+            try? FileManager.default.removeItem(at: testRoot)
+        } else {
+            fputs("FAIL remote SMB target \(index + 1): unmount failed; temporary mount remains at \(mountPath).\n", stderr)
+        }
+
+        if mountVerified && cleanupSucceeded {
+            passed += 1
+            print("PASS remote SMB target \(index + 1): mounted the configured share through the remote endpoint and unmounted it")
+        } else {
+            failed += 1
+            let reason = reachable ? "remote mount or source verification failed" : "remote SMB TCP port 445 is unreachable"
+            fputs("FAIL remote SMB target \(index + 1): \(reason).\n", stderr)
+        }
+    }
+
+    print("Remote SMB acceptance: \(passed) passed, \(failed) failed")
+    return failed == 0 && passed == profile.targets.count
 }
 
 // MARK: - 终端 ANSI Raw Mode 交互式复选框与单选组件
@@ -915,7 +1557,7 @@ func runInitWizard() {
     let activeMounts = discoverActiveSMBMounts()
 
     if !activeMounts.isEmpty {
-        let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
+        let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: redactedSMBURL($0.url)) }
         let selectedIndices = promptInteractiveCheckbox(
             title: tr("发现当前系统中已挂载的 SMB 卷宗，请选择需要纳入自动挂载的目标 (直接按回车跳过)：",
                       "Discovered currently mounted SMB volumes. Select targets to auto-mount (Enter to skip):"),
@@ -924,7 +1566,7 @@ func runInitWizard() {
         for idx in selectedIndices {
             let item = activeMounts[idx]
             homeTargets.append(MountTarget(url: item.url, mountPath: item.path))
-            print(tr("  ✓ 已添加: \(item.path) (\(item.url))", "  ✓ Added: \(item.path) (\(item.url))"))
+            print(tr("  ✓ 已添加: \(item.path) (\(redactedSMBURL(item.url)))", "  ✓ Added: \(item.path) (\(redactedSMBURL(item.url)))"))
         }
     }
 
@@ -944,7 +1586,7 @@ func runInitWizard() {
             let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let pathStr = pathInput.isEmpty ? defaultPath : pathInput
             homeTargets.append(MountTarget(url: urlStr, mountPath: pathStr))
-            print(tr("  ✓ 已添加: \(pathStr) (\(urlStr))", "  ✓ Added: \(pathStr) (\(urlStr))"))
+                        print(tr("  ✓ 已添加: \(pathStr) (\(redactedSMBURL(urlStr)))", "  ✓ Added: \(pathStr) (\(redactedSMBURL(urlStr)))"))
             print(tr("  继续添加另一个挂载目标？(y/n) [默认 n]: ",
                      "  Add another mount target? (y/n) [Default n]: "), terminator: "")
             let cont = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
@@ -955,8 +1597,8 @@ func runInitWizard() {
     }
 
     if homeTargets.isEmpty {
-        print(tr("  ✓ 局域网内不挂载任何共享，该网络仅作为外出判定排他基准。",
-                 "  ✓ No shares configured for LAN. This network acts solely as an exclusion gatekeeper."))
+        print(tr("  ✓ 未为此局域网配置挂载目标；策略命中后会结束本轮评估。",
+                 "  ✓ No local shares are configured. A match ends profile evaluation on this network."))
     }
 
     let homeProfileDesc = tr("本地局域网高速直连", "Local LAN Direct")
@@ -1076,8 +1718,8 @@ func runInitWizard() {
                         }
                         let remoteURL = "smb://\(selectedHost)\(pathPart)"
                         remoteTargets.append(MountTarget(url: remoteURL, mountPath: target.mountPath))
-                        print(tr("  ✓ 自动映射: \(remoteURL) -> \(target.mountPath)",
-                                 "  ✓ Auto-mapped: \(remoteURL) -> \(target.mountPath)"))
+                        print(tr("  ✓ 自动映射: \(redactedSMBURL(remoteURL)) -> \(target.mountPath)",
+                                 "  ✓ Auto-mapped: \(redactedSMBURL(remoteURL)) -> \(target.mountPath)"))
                     }
                 }
             }
@@ -1090,7 +1732,7 @@ func runInitWizard() {
                 }
 
                 if !matchingMounts.isEmpty {
-                    let mOptions = matchingMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: $0.url) }
+                    let mOptions = matchingMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: redactedSMBURL($0.url)) }
                     let picked = promptInteractiveCheckbox(
                         title: tr("检测到当前已挂载该设备的共享卷宗，请勾选需要自动挂载的项 (直接回车跳过)：",
                                   "Discovered active mounts for this device. Select items to include (Enter to skip):"),
@@ -1099,7 +1741,7 @@ func runInitWizard() {
                     for pIdx in picked {
                         let item = matchingMounts[pIdx]
                         remoteTargets.append(MountTarget(url: item.url, mountPath: item.path))
-                        print(tr("  ✓ 已添加: \(item.path) (\(item.url))", "  ✓ Added: \(item.path) (\(item.url))"))
+                        print(tr("  ✓ 已添加: \(item.path) (\(redactedSMBURL(item.url)))", "  ✓ Added: \(item.path) (\(redactedSMBURL(item.url)))"))
                     }
                 }
 
@@ -1123,7 +1765,7 @@ func runInitWizard() {
                         let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                         let pathStr = pathInput.isEmpty ? defaultPath : pathInput
                         remoteTargets.append(MountTarget(url: remoteURL, mountPath: pathStr))
-                        print(tr("  ✓ 已添加: \(pathStr) (\(remoteURL))", "  ✓ Added: \(pathStr) (\(remoteURL))"))
+                print(tr("  ✓ 已添加: \(pathStr) (\(redactedSMBURL(remoteURL)))", "  ✓ Added: \(pathStr) (\(redactedSMBURL(remoteURL)))"))
                         print(tr("  继续添加另一个远程挂载目标？(y/n) [默认 n]: ",
                                  "  Add another remote target? (y/n) [Default n]: "), terminator: "")
                         let cont = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
@@ -1140,7 +1782,7 @@ func runInitWizard() {
                     id: "remote_network",
                     description: desc,
                     match: MatchRule(type: "probe_host", value: selectedHost, retryCount: 3, retryInterval: 1.0),
-                    excludeGatewayIPs: ["172.20.10.1"],
+                    excludeGatewayIPs: promptExcludedGateways(),
                     preventSpotlightIndex: true,
                     targets: remoteTargets
                 )
@@ -1177,7 +1819,7 @@ func runInitWizard() {
     // 5. 部署后台自启动守护服务
     let daemonOptions = [
         SelectionOption(title: tr("立即部署自启动后台守护服务 (推荐)", "Deploy LaunchAgent daemon now (Recommended)"),
-                        subtitle: tr("登录与网络状态切换时静默自动按策略挂载", "Auto-mount silently on login and network transitions")),
+                        subtitle: tr("登录、网络或配置变化时运行，并每 60 秒重试", "Run on login, network/config changes, and retry every 60 seconds")),
         SelectionOption(title: tr("暂不部署", "Skip for now"),
                         subtitle: tr("后续可随时运行 './auto_mount --install' 进行部署", "Run './auto_mount --install' anytime later"))
     ]
@@ -1197,18 +1839,52 @@ func runInitWizard() {
 
 // MARK: - 日常配置维护菜单 (--config)
 
+struct LaunchAgentDiagnostic {
+    let loaded: Bool
+    let output: String
+    let state: String?
+    let lastExitCode: Int?
+    let pid: Int?
+}
+
+func firstRegexCapture(_ pattern: String, in text: String) -> String? {
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+          match.numberOfRanges > 1,
+          let range = Range(match.range(at: 1), in: text) else { return nil }
+    return String(text[range])
+}
+
+func getLaunchAgentDiagnostic() -> LaunchAgentDiagnostic {
+    let serviceTarget = "gui/\(getuid())/\(launchAgentLabel)"
+    let result = runCommand(executable: "/bin/launchctl", arguments: ["print", serviceTarget])
+    let state = firstRegexCapture(#"(?m)^\s*state = (.+)$"#, in: result.stdout)
+    let exitCode = firstRegexCapture(#"(?m)^\s*last exit code = (-?\d+)\s*$"#, in: result.stdout).flatMap(Int.init)
+    let pid = firstRegexCapture(#"(?m)^\s*pid = (\d+)\s*$"#, in: result.stdout).flatMap(Int.init)
+    return LaunchAgentDiagnostic(loaded: result.status == 0, output: result.stdout, state: state, lastExitCode: exitCode, pid: pid)
+}
+
 func getLaunchAgentStatusSummary() -> String {
     let plistURL = getLaunchAgentPlistURL()
     if !FileManager.default.fileExists(atPath: plistURL.path) {
         return tr("未安装 (可选择 [5] 部署守护)", "Not installed (Select [5] to deploy)")
     }
-    let uid = getuid()
-    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
-    let check = runCommand(executable: "/bin/launchctl", arguments: ["print", serviceTarget])
-    if check.status == 0 {
-        return tr("已注册运行 (\(serviceTarget))", "Active & running (\(serviceTarget))")
+    let runtimeConfigURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
+    let configState = FileManager.default.fileExists(atPath: runtimeConfigURL.path)
+        ? tr("守护配置存在", "runtime config present")
+        : tr("守护配置缺失", "runtime config missing")
+    let diagnostic = getLaunchAgentDiagnostic()
+    if diagnostic.loaded {
+        if let exitCode = diagnostic.lastExitCode, exitCode != 0 {
+            return tr("已加载；最近一次运行失败 (退出码 \(exitCode))；\(configState)",
+                      "Loaded; last run failed (exit \(exitCode)); \(configState)")
+        }
+        if diagnostic.pid != nil {
+            return tr("已加载且当前正在执行；\(configState)", "Loaded and currently running; \(configState)")
+        }
+        return tr("已加载，当前空闲等待触发；\(configState)", "Loaded and idle, waiting for a trigger; \(configState)")
     } else {
-        return tr("已部署描述文件但未处于激活状态", "Deployed but inactive in launchd")
+        return tr("描述文件已安装但未加载；\(configState)", "Plist installed but not loaded; \(configState)")
     }
 }
 
@@ -1229,9 +1905,11 @@ func pauseForUser() {
 }
 
 func validateMountTarget(profile: NetworkProfile, newURL: String, newPath: String) -> String? {
+    if let error = validateMountTargetURL(newURL) { return error }
+    if let error = validateMountPath(newPath) { return error }
     if profile.targets.contains(where: { $0.url.caseInsensitiveCompare(newURL) == .orderedSame }) {
-        return tr("策略 '\(profile.id)' 下已存在相同的 SMB 地址: \(newURL)",
-                  "Profile '\(profile.id)' already contains SMB URL: \(newURL)")
+        return tr("策略 '\(profile.id)' 下已存在相同的 SMB 地址: \(redactedSMBURL(newURL))",
+                  "Profile '\(profile.id)' already contains SMB URL: \(redactedSMBURL(newURL))")
     }
     if profile.targets.contains(where: { $0.mountPath.caseInsensitiveCompare(newPath) == .orderedSame }) {
         return tr("策略 '\(profile.id)' 下本地挂载路径已被占用: \(newPath)",
@@ -1286,7 +1964,7 @@ func manageMountTargets(config: inout AutoMountConfig) {
             // 1. 嗅探活动 SMB 挂载，支持复选框多选导入
             let activeMounts = discoverActiveSMBMounts()
             if !activeMounts.isEmpty {
-                let mOptions = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: "\($0.path) <- \($0.url)") }
+                let mOptions = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: "\($0.path) <- \(redactedSMBURL($0.url))") }
                 if let picked = promptInteractiveCheckbox(
                     title: tr("发现当前系统中已挂载的 SMB 卷宗，请勾选需要导入的目标 (Space 勾选，a 全选，Enter 确认，Esc 跳过)：",
                               "Discovered active SMB mounts. Check items to import (Space toggle, a all, Enter confirm, Esc skip):"),
@@ -1299,7 +1977,7 @@ func manageMountTargets(config: inout AutoMountConfig) {
                             print(tr("  ✗ 跳过重复项: \(err)", "  ✗ Skipped duplicate: \(err)"))
                         } else {
                             config.profiles[profileIndex].targets.append(MountTarget(url: m.url, mountPath: m.path))
-                            print(tr("  ✓ 已添加: \(m.path) <- \(m.url)", "  ✓ Added: \(m.path) <- \(m.url)"))
+                            print(tr("  ✓ 已添加: \(m.path) <- \(redactedSMBURL(m.url))", "  ✓ Added: \(m.path) <- \(redactedSMBURL(m.url))"))
                             addedCount += 1
                         }
                     }
@@ -1350,7 +2028,7 @@ func manageMountTargets(config: inout AutoMountConfig) {
                     } else {
                         config.profiles[profileIndex].targets.append(MountTarget(url: url, mountPath: path))
                         addedManual += 1
-                        print(tr("  ✓ 已添加: \(path) <- \(url)", "  ✓ Added: \(path) <- \(url)"))
+                        print(tr("  ✓ 已添加: \(path) <- \(redactedSMBURL(url))", "  ✓ Added: \(path) <- \(redactedSMBURL(url))"))
                     }
 
                     print(tr("继续添加另一个目标？(y/n) [默认 n]: ",
@@ -1387,7 +2065,7 @@ func manageMountTargets(config: inout AutoMountConfig) {
             }
 
             let deleteOptions = flatItems.map {
-                SelectionOption(title: "\($0.target.mountPath) <- \($0.target.url)",
+            SelectionOption(title: "\($0.target.mountPath) <- \(redactedSMBURL($0.target.url))",
                                 subtitle: tr("归属策略: \($0.profileId)", "Profile: \($0.profileId)"))
             }
             guard let toDelete = promptInteractiveCheckbox(
@@ -1613,7 +2291,7 @@ func manageNetworkProfiles(config: inout AutoMountConfig) {
                     id: pId,
                     description: pDesc?.isEmpty ?? true ? tr("远程互联", "Remote Network") : pDesc,
                     match: MatchRule(type: "probe_host", value: chosenHost, retryCount: 3, retryInterval: 1.0),
-                    excludeGatewayIPs: ["172.20.10.1"],
+                    excludeGatewayIPs: promptExcludedGateways(),
                     preventSpotlightIndex: true,
                     targets: []
                 )
@@ -1641,10 +2319,12 @@ func manageNetworkProfiles(config: inout AutoMountConfig) {
             let curP = config.profiles[eIdx]
             let curPrevent = curP.preventSpotlightIndex ?? true
             let preventSub = curPrevent ? tr("当前: 开启防索引", "Current: Indexing Prevented") : tr("当前: 允许索引", "Current: Indexing Allowed")
+            let currentExclusions = curP.excludeGatewayIPs?.joined(separator: ", ") ?? tr("无", "None")
             let attrOptions = [
                 SelectionOption(title: tr("修改策略描述名称", "Edit Profile Description"), subtitle: curP.description ?? tr("无描述", "No description")),
                 SelectionOption(title: tr("更新匹配规则值 (网关 MAC / 探测主机)", "Update Match Value (Gateway MAC / Probe Host)"), subtitle: "\(curP.match.type) = \(curP.match.value)"),
                 SelectionOption(title: tr("切换 Spotlight 防索引开关", "Toggle Prevent Spotlight Index"), subtitle: preventSub),
+                SelectionOption(title: tr("编辑排除网关 IP 列表", "Edit Excluded Gateway IPs"), subtitle: currentExclusions),
                 SelectionOption(title: tr("↩ 返回", "↩ Back"), subtitle: nil)
             ]
             guard let aSel = promptInteractiveRadio(
@@ -1734,6 +2414,11 @@ func manageNetworkProfiles(config: inout AutoMountConfig) {
                 let stateStr = (!cur) ? tr("开启防索引", "Prevent Indexing Enabled") : tr("允许索引", "Indexing Allowed")
                 print(tr("✓ Spotlight 防索引已更新为: \(stateStr)", "✓ Prevent Spotlight Index updated to: \(stateStr)"))
                 pauseForUser()
+            } else if aSel == 3 {
+                config.profiles[eIdx].excludeGatewayIPs = promptExcludedGateways()
+                saveConfig(config)
+                print(tr("✓ 排除网关 IP 列表已更新。", "✓ Excluded gateway IP list updated."))
+                pauseForUser()
             }
 
         case 3:
@@ -1802,7 +2487,7 @@ func manageDaemonService() {
         let status = getLaunchAgentStatusSummary()
         let options = [
             SelectionOption(title: tr("部署 / 重新加载自启动守护服务 (LaunchAgent)", "Deploy / reload LaunchAgent daemon"),
-                            subtitle: tr("开机登录及网络切换时静默评估挂载", "Auto-mount silently on login and network changes")),
+                            subtitle: tr("登录、网络或守护配置变化时运行，并每 60 秒重试", "Run on login, network/config changes, and retry every 60 seconds")),
             SelectionOption(title: tr("查看守护服务运行状态与挂载详情", "View service runtime status and active mount details"),
                             subtitle: tr("打印 launchd 诊断与当前物理网络/挂载点状态", "Print launchd diagnostic, network & mount status")),
             SelectionOption(title: tr("卸载并移除自启动守护服务", "Uninstall and remove LaunchAgent daemon"),
@@ -1879,6 +2564,15 @@ func manageUpdateChannel(config: inout AutoMountConfig) {
 // MARK: - 日常配置维护菜单入口 (--config)
 
 func manageConfiguration() {
+    let runtimeConfigURL = getInstalledDir().appendingPathComponent("auto_mount.plist")
+    configURLOverride = preferredManagementConfigURL(
+        workspaceURL: getWorkspaceConfigURL(),
+        runtimeURL: runtimeConfigURL,
+        launchAgentInstalled: FileManager.default.fileExists(atPath: getLaunchAgentPlistURL().path),
+        runtimeConfigExists: FileManager.default.fileExists(atPath: runtimeConfigURL.path)
+    )
+    defer { configURLOverride = nil }
+
     print(tr("""
     Auto Mount Tool - 日常配置管理 (v\(autoMountVersion))
     ====================================
@@ -1892,6 +2586,7 @@ func manageConfiguration() {
                  "✗ Configuration not found. Please run './auto_mount --init' first.\n"), stderr)
         exit(1)
     }
+    print(tr("当前配置编辑路径: \(getConfigURL().path)", "Current configuration edit path: \(getConfigURL().path)"))
 
     while true {
         print(tr("\n当前已配置策略流水线 (自顶向下顺序评估，首次命中即执行)：",
@@ -1900,13 +2595,13 @@ func manageConfiguration() {
             let typeLabel = p.match.type == "gateway_mac" ? tr("局域网", "LAN") : tr("远程", "Remote")
             let descStr = p.description ?? tr("无描述", "No description")
             if p.targets.isEmpty {
-                print(tr("  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - 0 个挂载目标 (网络排他门牌，不执行本地挂载)",
-                         "  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - 0 mount targets (Exclusion Gatekeeper, no local mounts)"))
+                print(tr("  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - 0 个挂载目标 (命中后结束策略评估)",
+                         "  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - 0 targets (a match ends profile evaluation)"))
             } else {
                 print(tr("  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - \(p.targets.count) 个挂载目标",
                          "  [\(i + 1)] [\(typeLabel)] \(p.id) (\(descStr)) - \(p.targets.count) mount targets"))
                 for t in p.targets {
-                    print("      • \(t.mountPath) <- \(t.url)")
+                    print("      • \(t.mountPath) <- \(redactedSMBURL(t.url))")
                 }
             }
         }
@@ -1977,7 +2672,168 @@ func getInstalledDir() -> URL {
     return appSupport.appendingPathComponent("AutoMount")
 }
 
-func installLaunchAgent() {
+func atomicCopyFile(from sourceURL: URL, to destinationURL: URL, permissions: Int) throws {
+    let data = try Data(contentsOf: sourceURL)
+    try atomicWrite(data, to: destinationURL, permissions: permissions)
+}
+
+struct StagedFileReplacement {
+    let sourceURL: URL
+    let destinationURL: URL
+    let permissions: Int
+}
+
+func replaceFilesTransactionally(
+    _ replacements: [StagedFileReplacement],
+    afterReplacement: (() throws -> Void)? = nil
+) throws {
+    struct Snapshot {
+        let url: URL
+        let contents: Data?
+        let permissions: Int
+    }
+
+    var seenPaths = Set<String>()
+    var snapshots: [Snapshot] = []
+    for replacement in replacements {
+        let path = replacement.destinationURL.standardizedFileURL.path
+        guard seenPaths.insert(path).inserted else {
+            throw NSError(domain: "AutoMountUpdate", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "A destination was listed more than once: \(path)"])
+        }
+        if FileManager.default.fileExists(atPath: path) {
+            let attributes = try FileManager.default.attributesOfItem(atPath: path)
+            let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? replacement.permissions
+            snapshots.append(Snapshot(url: replacement.destinationURL,
+                                      contents: try Data(contentsOf: replacement.destinationURL),
+                                      permissions: permissions))
+        } else {
+            snapshots.append(Snapshot(url: replacement.destinationURL, contents: nil,
+                                      permissions: replacement.permissions))
+        }
+    }
+
+    var appliedCount = 0
+    func rollbackAppliedFiles() -> [String] {
+        var rollbackFailures: [String] = []
+        for snapshot in snapshots.prefix(appliedCount).reversed() {
+            do {
+                if let contents = snapshot.contents {
+                    try atomicWrite(contents, to: snapshot.url, permissions: snapshot.permissions)
+                } else {
+                    try FileManager.default.removeItem(at: snapshot.url)
+                }
+            } catch {
+                rollbackFailures.append("\(snapshot.url.path): \(error.localizedDescription)")
+            }
+        }
+        return rollbackFailures
+    }
+
+    do {
+        for replacement in replacements {
+            try atomicCopyFile(from: replacement.sourceURL,
+                               to: replacement.destinationURL,
+                               permissions: replacement.permissions)
+            appliedCount += 1
+        }
+        try afterReplacement?()
+    } catch {
+        let rollbackFailures = rollbackAppliedFiles()
+        let rollbackMessage = rollbackFailures.isEmpty
+            ? ""
+            : " Rollback also failed for: \(rollbackFailures.joined(separator: "; "))"
+        throw NSError(domain: "AutoMountUpdate", code: 2,
+                      userInfo: [NSLocalizedDescriptionKey: "\(error.localizedDescription).\(rollbackMessage)"])
+    }
+}
+
+func launchAgentProgramArguments(binaryURL: URL, sourceURL: URL, preferSource: Bool = true) -> [String] {
+    if preferSource, FileManager.default.isExecutableFile(atPath: "/usr/bin/swift") {
+        return ["/usr/bin/swift", sourceURL.path]
+    }
+    return [binaryURL.path]
+}
+
+enum InstallConfigLocation: Equatable {
+    case workspace
+    case runtime
+}
+
+enum InstallConfigResolution: Equatable {
+    case selected(InstallConfigLocation)
+    case diverged
+    case unavailable(InstallConfigLocation)
+    case invalidRuntime
+}
+
+func installConfigIsUsable(at url: URL) -> Bool {
+    guard let config = loadConfig(from: url, migrate: false) else { return false }
+    return !config.profiles.isEmpty && configVersionCanBeMigrated(config.version)
+}
+
+func installConfigModelsAreEquivalent(_ lhsConfig: AutoMountConfig, _ rhsConfig: AutoMountConfig) -> Bool {
+    var lhs = lhsConfig
+    var rhs = rhsConfig
+    lhs.version = ""
+    rhs.version = ""
+    lhs.lastUpdateCheckTimestamp = nil
+    rhs.lastUpdateCheckTimestamp = nil
+    lhs.updateRetryAfterTimestamp = nil
+    rhs.updateRetryAfterTimestamp = nil
+    lhs.lastNotifiedVersion = nil
+    rhs.lastNotifiedVersion = nil
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let lhsData = try? encoder.encode(lhs), let rhsData = try? encoder.encode(rhs) else { return false }
+    return lhsData == rhsData
+}
+
+func installConfigDocumentsAreEquivalent(_ lhsURL: URL, _ rhsURL: URL) -> Bool {
+    guard let lhs = loadConfig(from: lhsURL, migrate: false),
+          let rhs = loadConfig(from: rhsURL, migrate: false) else { return false }
+    return installConfigModelsAreEquivalent(lhs, rhs)
+}
+
+func resolveInstallConfigLocation(
+    requested: InstallConfigLocation?,
+    workspaceExists: Bool,
+    runtimeExists: Bool,
+    workspaceUsable: Bool,
+    runtimeUsable: Bool,
+    documentsEquivalent: Bool
+) -> InstallConfigResolution {
+    if let requested {
+        let exists = requested == .workspace ? workspaceExists : runtimeExists
+        let usable = requested == .workspace ? workspaceUsable : runtimeUsable
+        return exists && usable ? .selected(requested) : .unavailable(requested)
+    }
+    guard runtimeExists else {
+        return workspaceUsable ? .selected(.workspace) : .unavailable(.workspace)
+    }
+    guard runtimeUsable else { return .invalidRuntime }
+    guard workspaceExists && workspaceUsable else { return .selected(.runtime) }
+    return documentsEquivalent ? .selected(.runtime) : .diverged
+}
+
+func promptForInstallConfigLocation() -> InstallConfigLocation? {
+    print(tr("工作区配置与已安装的守护配置内容不同。默认保留守护配置。",
+             "Workspace and installed daemon configs differ. Keeping the daemon config is the default."))
+    print(tr("  1) 保留守护配置（推荐）\n  2) 用工作区配置覆盖守护配置\n  3) 取消安装",
+             "  1) Keep daemon config (recommended)\n  2) Replace it with workspace config\n  3) Cancel installation"))
+    while true {
+        print(tr("请选择 [1]: ", "Choose [1]: "), terminator: "")
+        guard let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else { return .runtime }
+        switch input {
+        case "", "1": return .runtime
+        case "2": return .workspace
+        case "3": return nil
+        default: print(tr("请输入 1、2 或 3。", "Enter 1, 2, or 3."))
+        }
+    }
+}
+
+func installLaunchAgent(requestedConfigLocation: InstallConfigLocation? = nil) {
     print(tr("""
     Auto Mount Tool - 安装并启用自启动守护服务
     ===========================================
@@ -1985,13 +2841,6 @@ func installLaunchAgent() {
     Auto Mount Tool - Install LaunchAgent Daemon
     ============================================
     """))
-
-    guard let config = loadConfig(), !config.profiles.isEmpty else {
-        fputs(tr("✗ 未找到有效配置，请先运行 './auto_mount --init' 初始化配置。\n",
-                 "✗ Configuration not found. Please run './auto_mount --init' first.\n"), stderr)
-        writeLog("Install aborted: config missing or invalid")
-        exit(1)
-    }
 
     let currentAppDir = getAppDir()
     let installDir = getInstalledDir()
@@ -2006,69 +2855,207 @@ func installLaunchAgent() {
         exit(1)
     }
 
-    let filesToDeploy = ["auto_mount", "auto_mount.swift", "auto_mount.plist"]
-    for fileName in filesToDeploy {
-        let srcURL = currentAppDir.appendingPathComponent(fileName)
-        let dstURL = installDir.appendingPathComponent(fileName)
-        if FileManager.default.fileExists(atPath: srcURL.path) {
-            if FileManager.default.fileExists(atPath: dstURL.path) {
-                try? FileManager.default.removeItem(at: dstURL)
+    let sourceURL = currentAppDir.appendingPathComponent("auto_mount.swift")
+    let sourceConfigURL = getConfigURL()
+    let installedBinaryURL = installDir.appendingPathComponent("auto_mount")
+    let installedSourceURL = installDir.appendingPathComponent("auto_mount.swift")
+    let installedConfigURL = installDir.appendingPathComponent("auto_mount.plist")
+    let workspaceConfigExists = FileManager.default.fileExists(atPath: sourceConfigURL.path)
+    let runtimeConfigExists = FileManager.default.fileExists(atPath: installedConfigURL.path)
+    let workspaceConfigUsable = workspaceConfigExists && installConfigIsUsable(at: sourceConfigURL)
+    let runtimeConfigUsable = runtimeConfigExists && installConfigIsUsable(at: installedConfigURL)
+    let configsEquivalent = workspaceConfigUsable && runtimeConfigUsable
+        && installConfigDocumentsAreEquivalent(sourceConfigURL, installedConfigURL)
+    var resolution = resolveInstallConfigLocation(
+        requested: requestedConfigLocation,
+        workspaceExists: workspaceConfigExists,
+        runtimeExists: runtimeConfigExists,
+        workspaceUsable: workspaceConfigUsable,
+        runtimeUsable: runtimeConfigUsable,
+        documentsEquivalent: configsEquivalent
+    )
+    if resolution == .diverged {
+        if isatty(STDIN_FILENO) == 1 {
+            guard let choice = promptForInstallConfigLocation() else {
+                print(tr("安装已取消；现有文件和守护服务均未更改。", "Installation cancelled; existing files and daemon were not changed."))
+                exit(0)
             }
-            do {
-                try FileManager.default.copyItem(at: srcURL, to: dstURL)
-            } catch {
-                fputs(tr("✗ 拷贝 \(fileName) 失败: \(error.localizedDescription)\n",
-                         "✗ Failed to copy \(fileName): \(error.localizedDescription)\n"), stderr)
-                exit(1)
-            }
+            resolution = .selected(choice)
+        } else {
+            print(tr("⚠ 工作区与守护配置不同；本次非交互安装保留守护配置。若要用工作区覆盖，请运行 './auto_mount --install --config-source workspace'。",
+                     "⚠ Workspace and daemon configs differ; this non-interactive install keeps the daemon config. To replace it, run './auto_mount --install --config-source workspace'."))
+            resolution = .selected(.runtime)
         }
     }
+    guard case let .selected(configLocation) = resolution else {
+        let message: String
+        switch resolution {
+        case .invalidRuntime:
+            message = tr("✗ 已安装的守护配置无效或版本较新；未覆盖该配置。确认工作区配置后，可显式运行 './auto_mount --install --config-source workspace' 修复。\n",
+                         "✗ The installed daemon config is invalid or newer; it was not overwritten. After verifying the workspace config, explicitly run './auto_mount --install --config-source workspace' to repair it.\n")
+        case .unavailable(.runtime):
+            message = tr("✗ 请求使用的守护配置不存在或无效。\n", "✗ The requested daemon config is missing or invalid.\n")
+        default:
+            message = tr("✗ 没有可迁移的有效配置；请先运行 './auto_mount --init'，或显式选择有效的配置来源。\n",
+                         "✗ No valid, migratable config is available. Run './auto_mount --init' or explicitly select a valid config source.\n")
+        }
+        fputs(message, stderr)
+        writeLog("Install aborted because no usable requested config source was available: \(resolution)")
+        exit(1)
+    }
+    let configSourceURL = configLocation == .workspace ? sourceConfigURL : installedConfigURL
+    let shouldSeedRuntimeConfig = !runtimeConfigExists
+    if configLocation == .workspace && runtimeConfigExists {
+        print(tr("⚠ 本次明确使用工作区配置更新守护配置。", "⚠ This install will replace the daemon config with the explicitly selected workspace config."))
+        writeLog("Install explicitly selected workspace config to replace the runtime daemon config")
+    } else if configLocation == .runtime && workspaceConfigExists && !workspaceConfigUsable {
+        print(tr("⚠ 工作区配置无效或版本较新；本次保留有效的守护配置。", "⚠ Workspace config is invalid or newer; preserving the usable daemon config."))
+    }
 
-    let installedWrapper = installDir.appendingPathComponent("auto_mount").path
-    let installedSwift = installDir.appendingPathComponent("auto_mount.swift").path
-    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedWrapper)
-    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedSwift)
+    let stagedBinaryURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("automount-install-\(UUID().uuidString)")
+    let stagedConfigURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("automount-install-config-\(UUID().uuidString).plist")
+    let stagedPlistURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("automount-install-launchagent-\(UUID().uuidString).plist")
+    defer { try? FileManager.default.removeItem(at: stagedBinaryURL) }
+    defer { try? FileManager.default.removeItem(at: stagedConfigURL) }
+    defer { try? FileManager.default.removeItem(at: stagedPlistURL) }
 
-    let executablePath = FileManager.default.fileExists(atPath: installedWrapper) ? installedWrapper : installedSwift
-    print(tr("✓ 已将运行程序与配置同步部署至:\n  \(installDir.path)",
-             "✓ Deployed executable and configuration to:\n  \(installDir.path)"))
-
-    let plistData: [String: Any] = [
-        "Label": launchAgentLabel,
-        "ProgramArguments": [executablePath],
-        "RunAtLoad": true,
-        "WatchPaths": ["/Library/Preferences/SystemConfiguration"],
-        "StandardOutPath": "/tmp/\(launchAgentLabel).stdout.log",
-        "StandardErrorPath": "/tmp/\(launchAgentLabel).stderr.log"
-    ]
-
-    do {
-        let data = try PropertyListSerialization.data(fromPropertyList: plistData, format: .xml, options: 0)
-        try data.write(to: plistURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: plistURL.path)
-        print(tr("✓ 已生成服务描述文件:\n  \(plistURL.path)", "✓ Generated LaunchAgent plist:\n  \(plistURL.path)"))
-    } catch {
-        fputs(tr("✗ 写入描述文件失败: \(error.localizedDescription)\n",
-                 "✗ Failed to write plist file: \(error.localizedDescription)\n"), stderr)
+    let sourceExists = FileManager.default.fileExists(atPath: sourceURL.path)
+    let currentBinaryURL = currentAppDir.appendingPathComponent("auto_mount")
+    if sourceExists {
+        let compile = compileOptimizedSwiftSource(sourceURL: sourceURL, outputURL: stagedBinaryURL)
+        guard compile.status == 0 else {
+            fputs(tr("✗ 当前 Swift 源码编译失败，旧运行程序未覆盖。\n", "✗ Swift source compilation failed; the old executable was not replaced.\n"), stderr)
+            fputs(compile.stderr, stderr)
+            writeLog("Install aborted because source compilation failed: \(compile.stderr)")
+            exit(1)
+        }
+    } else if !FileManager.default.isExecutableFile(atPath: currentBinaryURL.path) {
+        fputs(tr("✗ 找不到 Swift 源码或可执行程序，无法安装守护服务。\n",
+                 "✗ No Swift source or executable is available to install the daemon.\n"), stderr)
+        writeLog("Install aborted because neither Swift source nor executable was available")
         exit(1)
     }
 
+    do {
+        try atomicCopyFile(from: configSourceURL, to: stagedConfigURL, permissions: 0o600)
+    } catch {
+        fputs(tr("✗ 无法暂存守护配置，现有文件未更改: \(error.localizedDescription)\n",
+                 "✗ Could not stage daemon config; existing files were not changed: \(error.localizedDescription)\n"), stderr)
+        writeLog("Install aborted while staging config: \(error.localizedDescription)")
+        exit(1)
+    }
+
+    let migrationExecutable = sourceExists ? stagedBinaryURL : currentBinaryURL
+    let migration = runCommand(
+        executable: migrationExecutable.path,
+        arguments: ["--migrate-only", stagedConfigURL.path]
+    )
+    guard migration.status == 0 else {
+        fputs(tr("✗ 配置迁移失败，已安装文件和现有配置未更改: \(migration.stderr)",
+                 "✗ Config migration failed; installed files and existing config were not changed: \(migration.stderr)"), stderr)
+        writeLog("Install aborted because staged config migration failed: \(migration.stderr)")
+        exit(1)
+    }
+
+    let programArguments = launchAgentProgramArguments(binaryURL: installedBinaryURL,
+                                                       sourceURL: installedSourceURL,
+                                                       preferSource: sourceExists)
+    let plistData: Data
+    do {
+        let plist: [String: Any] = [
+            "Label": launchAgentLabel,
+            "ProgramArguments": programArguments,
+            "RunAtLoad": true,
+            "StartInterval": 60,
+            "WatchPaths": ["/Library/Preferences/SystemConfiguration", installedConfigURL.path],
+            "StandardOutPath": "/tmp/\(launchAgentLabel).stdout.log",
+            "StandardErrorPath": "/tmp/\(launchAgentLabel).stderr.log"
+        ]
+        plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try atomicWrite(plistData, to: stagedPlistURL, permissions: 0o644)
+    } catch {
+        fputs(tr("✗ 无法生成服务描述文件，现有服务未更改: \(error.localizedDescription)\n",
+                 "✗ Could not stage LaunchAgent plist; the existing service was not changed: \(error.localizedDescription)\n"), stderr)
+        writeLog("Install aborted while staging LaunchAgent plist: \(error.localizedDescription)")
+        exit(1)
+    }
+
+    var replacements: [StagedFileReplacement] = []
+    if sourceExists {
+        replacements.append(StagedFileReplacement(sourceURL: sourceURL, destinationURL: installedSourceURL, permissions: 0o755))
+        replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
+    } else {
+        replacements.append(StagedFileReplacement(sourceURL: currentBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
+    }
+    replacements.append(StagedFileReplacement(sourceURL: stagedConfigURL, destinationURL: installedConfigURL, permissions: 0o600))
+    replacements.append(StagedFileReplacement(sourceURL: stagedPlistURL, destinationURL: plistURL, permissions: 0o644))
+
+    let serviceTarget = "gui/\(getuid())/\(launchAgentLabel)"
+    let serviceWasLoaded = getLaunchAgentDiagnostic().loaded
+    if serviceWasLoaded {
+        let stopResult = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
+        if stopResult.status != 0 && getLaunchAgentDiagnostic().loaded {
+            fputs(tr("✗ 无法先停止旧服务，已取消覆盖运行文件。\n", "✗ Could not unload the existing service; runtime files were not replaced.\n"), stderr)
+            writeLog("Install aborted because existing LaunchAgent could not be unloaded: \(stopResult.stderr)")
+            exit(1)
+        }
+    }
+
+    do {
+        try replaceFilesTransactionally(replacements) {
+            let uid = getuid()
+            let bootResult = runCommand(executable: "/bin/launchctl",
+                                        arguments: ["bootstrap", "gui/\(uid)", plistURL.path])
+            let loaded = bootResult.status == 0 && getLaunchAgentDiagnostic().loaded
+            guard loaded else {
+                _ = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
+                let detail = bootResult.stderr.isEmpty
+                    ? "launchctl bootstrap did not load the service"
+                    : bootResult.stderr
+                throw NSError(domain: "AutoMountInstall", code: Int(bootResult.status),
+                              userInfo: [NSLocalizedDescriptionKey: detail])
+            }
+        }
+    } catch {
+        var restoreMessage = ""
+        if serviceWasLoaded {
+            let restore = runCommand(executable: "/bin/launchctl",
+                                     arguments: ["bootstrap", "gui/\(getuid())", plistURL.path])
+            if restore.status != 0 || !getLaunchAgentDiagnostic().loaded {
+                restoreMessage = tr("；恢复旧服务也失败: \(restore.stderr)", "; restoring the previous service also failed: \(restore.stderr)")
+            }
+        }
+        fputs(tr("✗ 部署或启动失败，已回滚文件替换尝试: \(error.localizedDescription)\(restoreMessage)\n",
+                 "✗ Deployment or launch failed; file rollback was attempted: \(error.localizedDescription)\(restoreMessage)\n"), stderr)
+        writeLog("Install failed and file rollback was attempted: \(error.localizedDescription)\(restoreMessage)")
+        exit(1)
+    }
+
+    if shouldSeedRuntimeConfig {
+        print(tr("✓ 已部署编译后的程序，并从工作区初始化守护配置:\n  \(installDir.path)",
+                 "✓ Deployed the compiled program and initialized daemon config from the workspace:\n  \(installDir.path)"))
+    } else if configLocation == .workspace {
+        print(tr("✓ 已部署编译后的程序，并将工作区配置同步到守护目录:\n  \(installedConfigURL.path)",
+                 "✓ Deployed the compiled program and synchronized the workspace config to the daemon directory:\n  \(installedConfigURL.path)"))
+    } else {
+        print(tr("✓ 已部署编译后的程序，并保留现有守护配置内容:\n  \(installedConfigURL.path)",
+                 "✓ Deployed the compiled program and preserved existing daemon config settings:\n  \(installedConfigURL.path)"))
+        writeLog("Install preserved the existing runtime config at \(installedConfigURL.path)")
+    }
+
     let uid = getuid()
-    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
-    _ = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
-
-    let domainTarget = "gui/\(uid)"
-    let bootResult = runCommand(executable: "/bin/launchctl", arguments: ["bootstrap", domainTarget, plistURL.path])
-
-    if bootResult.status == 0 {
-        print(tr("✓ 成功注册并加载至系统 launchd 守护进程 (gui/\(uid))",
-                 "✓ Successfully registered and loaded into system launchd (gui/\(uid))"))
-        print(tr("""
+    print(tr("✓ 已生成服务描述文件:\n  \(plistURL.path)", "✓ Generated LaunchAgent plist:\n  \(plistURL.path)"))
+    print(tr("✓ 成功注册并加载至系统 launchd 守护进程 (gui/\(uid))",
+             "✓ Successfully registered and loaded into system launchd (gui/\(uid))"))
+    print(tr("""
 
         服务详情:
           • 标识 (Label): \(launchAgentLabel)
-          • 执行路径: \(executablePath)
-          • 触发时机: 开机登录 (RunAtLoad) & 网络状态切换 (WatchPaths)
+          • 执行命令: \(programArguments.joined(separator: " "))
+          • 触发时机: 登录、网络或守护配置变化及每 60 秒重试
           • 日志路径: /tmp/\(launchAgentLabel).stdout.log
 
         自启动与网络监听服务已生效。
@@ -2076,19 +3063,13 @@ func installLaunchAgent() {
 
         Service Details:
           • Label: \(launchAgentLabel)
-          • Program: \(executablePath)
-          • Trigger: Login (RunAtLoad) & Network Configuration Changes (WatchPaths)
+          • Command: \(programArguments.joined(separator: " "))
+          • Trigger: Login, network/config changes, and every 60 seconds
           • Log file: /tmp/\(launchAgentLabel).stdout.log
 
-        Auto-mount daemon is active and running.
+        LaunchAgent is loaded and will evaluate the configured network policy.
         """))
-        writeLog("LaunchAgent installed and loaded successfully to \(installDir.path)")
-    } else {
-        fputs(tr("✗ 加载服务失败 (代码 \(bootResult.status)): \(bootResult.stderr)\n",
-                 "✗ Failed to bootstrap service (Code \(bootResult.status)): \(bootResult.stderr)\n"), stderr)
-        writeLog("Failed to bootstrap LaunchAgent: \(bootResult.stderr)")
-        exit(1)
-    }
+    writeLog("LaunchAgent installed and loaded successfully to \(installDir.path); runtime config: \(installedConfigURL.path)")
 }
 
 func uninstallLaunchAgent() {
@@ -2105,48 +3086,50 @@ func uninstallLaunchAgent() {
     let plistURL = getLaunchAgentPlistURL()
     let installDir = getInstalledDir()
 
-    var unloaded = false
     let bootResult = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
     if bootResult.status == 0 {
         print(tr("✓ 成功从系统 launchd 中卸载服务 (\(serviceTarget))",
                  "✓ Unloaded service from system launchd (\(serviceTarget))"))
-        unloaded = true
-    } else {
-        print(tr("• 服务当前未在运行或已被卸载。", "• Service is not currently running or already unloaded."))
+    }
+    if getLaunchAgentDiagnostic().loaded {
+        fputs(tr("✗ launchd 仍报告服务已加载；为避免留下失效服务，未删除描述文件或运行目录。\n",
+                 "✗ launchd still reports the service as loaded; its plist and runtime directory were preserved.\n"), stderr)
+        writeLog("Uninstall aborted because LaunchAgent remains loaded after bootout: \(bootResult.stderr)")
+        return
+    }
+    if bootResult.status != 0 {
+        print(tr("• 服务当前已卸载。", "• Service is already unloaded."))
     }
 
-    var removedPlist = false
     if FileManager.default.fileExists(atPath: plistURL.path) {
         do {
             try FileManager.default.removeItem(at: plistURL)
             print(tr("✓ 已删除服务描述文件: \(plistURL.path)", "✓ Removed LaunchAgent plist: \(plistURL.path)"))
-            removedPlist = true
         } catch {
             fputs(tr("✗ 删除描述文件失败: \(error.localizedDescription)\n",
                      "✗ Failed to remove plist: \(error.localizedDescription)\n"), stderr)
+            writeLog("Uninstall stopped because the LaunchAgent plist could not be removed: \(error.localizedDescription)")
+            return
         }
     } else {
         print(tr("• 描述文件不存在: \(plistURL.path)", "• Plist file does not exist: \(plistURL.path)"))
     }
 
-    var removedDir = false
     if FileManager.default.fileExists(atPath: installDir.path) {
         do {
             try FileManager.default.removeItem(at: installDir)
             print(tr("✓ 已清理部署运行目录: \(installDir.path)", "✓ Removed runtime directory: \(installDir.path)"))
-            removedDir = true
         } catch {
             fputs(tr("✗ 清理目录失败: \(error.localizedDescription)\n",
                      "✗ Failed to clean directory: \(error.localizedDescription)\n"), stderr)
+            writeLog("LaunchAgent plist was removed, but runtime files remain: \(error.localizedDescription)")
+            return
         }
     }
 
-    if unloaded || removedPlist || removedDir {
-        print(tr("\n自启动服务与部署文件已彻底移除。", "\nLaunchAgent service and deployed files completely removed."))
-        writeLog("LaunchAgent uninstalled")
-    } else {
-        print(tr("\n无需清理。", "\nNothing to clean."))
-    }
+    print(tr("\n已确认服务未加载，LaunchAgent 描述文件与运行目录已移除。",
+             "\nConfirmed service is unloaded; LaunchAgent plist and runtime directory were removed."))
+    writeLog("LaunchAgent uninstalled")
 }
 
 func checkServiceStatus() {
@@ -2160,30 +3143,35 @@ func checkServiceStatus() {
 
     let plistURL = getLaunchAgentPlistURL()
     let installDir = getInstalledDir()
-    let uid = getuid()
-    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
-
+    let runtimeConfigURL = installDir.appendingPathComponent("auto_mount.plist")
     let plistExists = FileManager.default.fileExists(atPath: plistURL.path)
     print(tr("  • LaunchAgent 服务配置: \(plistExists ? "已安装 (\(plistURL.path))" : "未安装")",
              "  • LaunchAgent Configuration: \(plistExists ? "Installed (\(plistURL.path))" : "Not Installed")"))
+    print(tr("  • 守护运行目录: \(installDir.path)", "  • Runtime Directory: \(installDir.path)"))
+    let runtimeConfigExists = FileManager.default.fileExists(atPath: runtimeConfigURL.path)
+    print(tr("  • 守护配置来源: \(runtimeConfigExists ? "已安装 (\(runtimeConfigURL.path))" : "缺失 (\(runtimeConfigURL.path))")",
+             "  • Runtime Config Source: \(runtimeConfigExists ? "Installed (\(runtimeConfigURL.path))" : "Missing (\(runtimeConfigURL.path))")"))
 
-    let installedExists = FileManager.default.fileExists(atPath: installDir.path)
-    if installedExists {
-        print(tr("  • 部署运行目录: \(installDir.path)", "  • Runtime Directory: \(installDir.path)"))
-    }
-
-    let res = runCommand(executable: "/bin/launchctl", arguments: ["print", serviceTarget])
-    if res.status == 0 {
-        print(tr("  • launchd 运行状态: 已加载并处于激活监听中 (gui/\(uid))",
-                 "  • launchd Status: Active & listening (gui/\(uid))"))
-        for line in res.stdout.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.starts(with: "state = ") || trimmed.starts(with: "last exit code = ") || trimmed.starts(with: "pid = ") {
-                print("    \(trimmed)")
-            }
+    let diagnostic = getLaunchAgentDiagnostic()
+    if diagnostic.loaded {
+        print(tr("  • launchd 注册状态: 已加载 (gui/\(getuid()))",
+                 "  • launchd Registration: Loaded (gui/\(getuid()))"))
+        print(tr("  • 当前执行状态: \(diagnostic.pid == nil ? "空闲，等待触发" : "正在运行 (pid \(diagnostic.pid!))")",
+                 "  • Current Process: \(diagnostic.pid == nil ? "Idle, waiting for a trigger" : "Running (pid \(diagnostic.pid!))")"))
+        if let state = diagnostic.state {
+            print(tr("  • launchd 状态字段: \(state)", "  • launchd State: \(state)"))
+        }
+        if let exitCode = diagnostic.lastExitCode {
+            print(tr("  • 最近一次运行退出码: \(exitCode)\(exitCode == 0 ? " (成功)" : " (失败)")",
+                     "  • Last Run Exit Code: \(exitCode)\(exitCode == 0 ? " (success)" : " (failure)")"))
         }
     } else {
-        print(tr("  • launchd 运行状态: 未加载 / 处于休眠状态", "  • launchd Status: Inactive / Not loaded"))
+        print(tr("  • launchd 注册状态: 未加载", "  • launchd Registration: Not loaded"))
+    }
+    if let installedVersion = getInstalledAppVersion() {
+        print(tr("  • 守护程序版本: v\(installedVersion)", "  • Runtime Program Version: v\(installedVersion)"))
+    } else {
+        print(tr("  • 守护程序版本: 无法读取", "  • Runtime Program Version: unavailable"))
     }
 
     print(tr("\n  • 当前物理网络状态:", "\n  • Physical Network Status:"))
@@ -2199,8 +3187,8 @@ func checkServiceStatus() {
         print(tr("    未检测到活跃的底层物理网络。", "    No active physical network detected."))
     }
 
-    print(tr("\n  • 已配置策略列表:", "\n  • Configured Policy Profiles:"))
-    if let config = loadConfig() {
+    print(tr("\n  • 守护服务使用的策略列表:", "\n  • Profiles Used by the LaunchAgent:"))
+    if let config = loadConfig(from: runtimeConfigURL, migrate: false) {
         print(tr("    配置版本: \(config.version)", "    Config Version: \(config.version)"))
         let kernelEntries = getKernelMountEntries()
 
@@ -2217,25 +3205,31 @@ func checkServiceStatus() {
             for t in profile.targets {
                 let stdPath = URL(fileURLWithPath: t.mountPath).standardizedFileURL.path
                 if let entry = kernelEntries.first(where: { URL(fileURLWithPath: $0.mountPath).standardizedFileURL.path == stdPath }) {
-                    print(tr("          - \(t.mountPath) -> 已挂载 (来源: \(entry.source))",
-                             "          - \(t.mountPath) -> Mounted (Source: \(entry.source))"))
+                    let sourceURL = entry.source.hasPrefix("//") ? "smb:\(entry.source)" : entry.source
+                    if smbResourceIdentity(entry.source) == smbResourceIdentity(t.url) {
+                        print(tr("          - \(t.mountPath) -> 已挂载且来源匹配 (\(redactedSMBURL(sourceURL)))",
+                                 "          - \(t.mountPath) -> Mounted, source matches (\(redactedSMBURL(sourceURL)))"))
+                    } else {
+                        print(tr("          - \(t.mountPath) -> 已挂载但来源不匹配 (实际: \(redactedSMBURL(sourceURL)))",
+                                 "          - \(t.mountPath) -> Mounted from a different source (actual: \(redactedSMBURL(sourceURL)))"))
+                    }
                 } else {
-                    print(tr("          - \(t.mountPath) -> 未挂载 (目标: \(t.url))",
-                             "          - \(t.mountPath) -> Not Mounted (Target: \(t.url))"))
+                    print(tr("          - \(t.mountPath) -> 未挂载 (目标: \(redactedSMBURL(t.url)))",
+                             "          - \(t.mountPath) -> Not Mounted (Target: \(redactedSMBURL(t.url)))"))
                 }
             }
         }
     } else {
-        print(tr("    未找到配置文件 (可运行: ./auto_mount --init 初始化)",
-                 "    Configuration file not found (Run: ./auto_mount --init to initialize)"))
+        print(tr("    守护服务配置缺失或无法解析。配置路径: \(runtimeConfigURL.path)",
+                 "    Runtime config is missing or invalid. Config path: \(runtimeConfigURL.path)"))
     }
 
-    if let config = loadConfig() {
+    if let config = loadConfig(from: runtimeConfigURL, migrate: false) {
         let channel = config.updateChannel ?? "off"
-        print(tr("\n  • 软件版本: v\(autoMountVersion) (自动更新信道: \(channel))",
-                 "\n  • Software Version: v\(autoMountVersion) (Update Channel: \(channel))"))
+        print(tr("\n  • 当前命令程序版本: v\(autoMountVersion) (守护配置更新信道: \(channel))",
+                 "\n  • Invoked Program Version: v\(autoMountVersion) (Runtime Config Update Channel: \(channel))"))
     } else {
-        print(tr("\n  • 软件版本: v\(autoMountVersion)", "\n  • Software Version: v\(autoMountVersion)"))
+        print(tr("\n  • 当前命令程序版本: v\(autoMountVersion)", "\n  • Invoked Program Version: v\(autoMountVersion)"))
     }
 }
 
@@ -2252,24 +3246,397 @@ func showMacOSNotification(title: String, subtitle: String, message: String) {
 }
 
 func parseSemanticVersion(_ versionStr: String) -> [Int] {
-    var clean = versionStr.trimmingCharacters(in: .whitespacesAndNewlines)
-    if clean.hasPrefix("v") || clean.hasPrefix("V") {
-        clean.removeFirst()
+    let clean = versionStr.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let regex = try? NSRegularExpression(pattern: #"^[vV]?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$"#),
+          let match = regex.firstMatch(in: clean, range: NSRange(clean.startIndex..., in: clean)),
+          match.numberOfRanges == 4 else { return [] }
+    var parts: [Int] = []
+    for index in 1...3 {
+        guard let range = Range(match.range(at: index), in: clean),
+              let component = Int(clean[range]) else { return [] }
+        parts.append(component)
     }
-    return clean.split(separator: ".").compactMap { Int($0) }
+    return parts
 }
 
 func isNewerVersion(_ remote: String, than current: String) -> Bool {
     let rParts = parseSemanticVersion(remote)
     let cParts = parseSemanticVersion(current)
-    let maxLen = max(rParts.count, cParts.count)
-    for i in 0..<maxLen {
-        let r = i < rParts.count ? rParts[i] : 0
-        let c = i < cParts.count ? cParts[i] : 0
+    guard rParts.count == 3, cParts.count == 3 else { return false }
+    for i in 0..<3 {
+        let r = rParts[i]
+        let c = cParts[i]
         if r > c { return true }
         if r < c { return false }
     }
     return false
+}
+
+let backgroundUpdateCheckCooldown: TimeInterval = 24 * 60 * 60
+let backgroundUpdateRetryDelay: TimeInterval = 15 * 60
+
+func shouldCheckForBackgroundUpdate(config: AutoMountConfig, now: TimeInterval) -> Bool {
+    if let retryAfter = config.updateRetryAfterTimestamp, retryAfter.isFinite {
+        return now >= retryAfter
+    }
+    guard let lastCheck = config.lastUpdateCheckTimestamp, lastCheck.isFinite else { return true }
+    return now - lastCheck >= backgroundUpdateCheckCooldown
+}
+
+func recordBackgroundUpdateFailure(config: inout AutoMountConfig, now: TimeInterval) {
+    config.lastUpdateCheckTimestamp = now
+    config.updateRetryAfterTimestamp = now + backgroundUpdateRetryDelay
+}
+
+func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
+    var passed = 0
+    var skipped = 0
+    var failed = 0
+    func check(_ condition: @autoclosure () -> Bool, _ name: String) {
+        if condition() {
+            passed += 1
+            print("PASS \(name)")
+        } else {
+            failed += 1
+            fputs("FAIL \(name)\n", stderr)
+        }
+    }
+    func skip(_ name: String, reason: String) {
+        skipped += 1
+        print("SKIP \(name): \(reason)")
+    }
+
+    check(parseSemanticVersion("v2.7.0") == [2, 7, 0], "semantic version parses v-prefixed release")
+    check(parseSemanticVersion("2.6.x").isEmpty, "malformed semantic version is rejected")
+    check(parseSemanticVersion("2.06.1").isEmpty, "leading-zero semantic component is rejected")
+    check(isNewerVersion("v2.7.1", than: "2.7.0"), "newer patch version is ordered")
+    check(!isNewerVersion("2.6.99", than: "2.7.0"), "older version is not ordered as newer")
+    check(!isNewerVersion("2.x.99", than: "2.7.0"), "malformed release cannot trigger update")
+    check(swiftCompilerTargetTriple(architecture: "arm64") == "arm64-apple-macosx27.0",
+          "Apple silicon builds target macOS 27.0")
+    check(swiftCompilerTargetTriple(architecture: " x86_64\n") == nil,
+          "Intel architecture is rejected before compilation")
+    check(swiftCompilerTargetTriple(architecture: "unsupported") == nil,
+          "unsupported CPU architectures are rejected before compilation")
+    check(platformSupportIssue(macOSMajorVersion: 27, architecture: "arm64") == nil,
+          "macOS 27 on Apple silicon is supported")
+    check(platformSupportIssue(macOSMajorVersion: 28, architecture: "arm64") == nil,
+          "future macOS releases on Apple silicon remain supported")
+    check(platformSupportIssue(macOSMajorVersion: 26, architecture: "arm64") == "macOS_version",
+          "macOS releases before 27 are rejected")
+    check(platformSupportIssue(macOSMajorVersion: 27, architecture: "x86_64") == "architecture",
+          "Intel Macs are rejected")
+    check(macOSSDKMajorVersion("27.0") == 27 && macOSSDKMajorVersion("28.1") == 28,
+          "macOS 27 and later SDK versions are recognized")
+    check(macOSSDKMajorVersion("26.4") ?? 0 < minimumSupportedMacOSMajorVersion,
+          "older macOS SDK versions are below the supported target")
+    check(macOSSDKMajorVersion("unknown") == nil,
+          "unrecognized SDK versions are rejected")
+    check(!configVersionCanBeMigrated("2.7.1"), "newer config versions are not downgraded")
+    check(configVersionCanBeMigrated("2.6.1"), "older config versions remain eligible for migration")
+
+    let updateNow: TimeInterval = 10_000
+    var updateState = AutoMountConfig(version: "2.7.0", updateChannel: "auto", lastUpdateCheckTimestamp: nil, lastNotifiedVersion: nil, profiles: [])
+    check(shouldCheckForBackgroundUpdate(config: updateState, now: updateNow),
+          "background updater checks when no successful check is recorded")
+    updateState.lastUpdateCheckTimestamp = updateNow - 60
+    check(!shouldCheckForBackgroundUpdate(config: updateState, now: updateNow),
+          "background updater observes the normal 24-hour cooldown")
+    updateState.updateRetryAfterTimestamp = updateNow + backgroundUpdateRetryDelay
+    check(!shouldCheckForBackgroundUpdate(config: updateState, now: updateNow + 1),
+          "background updater waits during a persisted failure retry delay")
+    check(shouldCheckForBackgroundUpdate(config: updateState, now: updateNow + backgroundUpdateRetryDelay),
+          "failed update retries when its shorter retry delay expires")
+    recordBackgroundUpdateFailure(config: &updateState, now: updateNow)
+    check(updateState.updateRetryAfterTimestamp == updateNow + backgroundUpdateRetryDelay,
+          "update failure persists an explicit retry deadline")
+
+    var workspaceMetadata = AutoMountConfig(version: "2.7.0", updateChannel: "auto", lastUpdateCheckTimestamp: 100, lastNotifiedVersion: "2.6.1", profiles: [])
+    var daemonMetadata = AutoMountConfig(version: "2.7.0", updateChannel: "auto", lastUpdateCheckTimestamp: 200, lastNotifiedVersion: "2.6.1", profiles: [])
+    daemonMetadata.updateRetryAfterTimestamp = updateNow + backgroundUpdateRetryDelay
+    mergeDaemonOwnedMetadata(into: &workspaceMetadata, from: daemonMetadata)
+    check(workspaceMetadata.lastUpdateCheckTimestamp == 200 && workspaceMetadata.lastNotifiedVersion == "2.6.1",
+          "workspace config saves preserve newer daemon update state")
+    check(workspaceMetadata.updateRetryAfterTimestamp == updateState.updateRetryAfterTimestamp,
+          "workspace config saves preserve the daemon update retry deadline")
+
+    let originalConfigPlist: [String: Any] = [
+        "version": "2.6.1",
+        "custom_root": "keep",
+        "profiles": [[
+            "id": "home_lan",
+            "custom_profile": "keep",
+            "match": ["type": "probe_host", "value": "example.invalid", "custom_match": true],
+            "targets": [[
+                "url": "smb://server.invalid/share",
+                "mount_path": "/Volumes/share",
+                "custom_target": 7
+            ]]
+        ]]
+    ]
+    let migratedConfigPlist: [String: Any] = [
+        "version": "2.7.0",
+        "profiles": [[
+            "id": "local_lan",
+            "match": ["type": "probe_host", "value": "example.invalid"],
+            "targets": [[
+                "url": "smb://server.invalid/share",
+                "mount_path": "/Volumes/share"
+            ]]
+        ]]
+    ]
+    let mergedConfigPlist = mergeConfigPlistValue(
+        original: originalConfigPlist,
+        generated: migratedConfigPlist,
+        context: .root
+    ) as? [String: Any]
+    let mergedProfiles = mergedConfigPlist?["profiles"] as? [[String: Any]]
+    let mergedMatch = mergedProfiles?.first?["match"] as? [String: Any]
+    let mergedTarget = (mergedProfiles?.first?["targets"] as? [[String: Any]])?.first
+    check(mergedConfigPlist?["custom_root"] as? String == "keep"
+          && mergedProfiles?.first?["custom_profile"] as? String == "keep"
+          && mergedMatch?["custom_match"] as? Bool == true
+          && mergedTarget?["custom_target"] as? Int == 7,
+          "config migration preserves unknown root, profile, match, and target fields")
+
+    let insertedConfig = mergeConfigPlistValue(
+        original: ["profiles": [[
+            "id": "existing",
+            "custom_profile": "belongs to existing",
+            "targets": [["url": "smb://server.invalid/share", "mount_path": "/Volumes/existing", "custom_target": "belongs to existing"]]
+        ]]],
+        generated: ["profiles": [
+            ["id": "new", "match": ["type": "probe_host", "value": "new.invalid"],
+             "targets": [["url": "smb://new.invalid/share", "mount_path": "/Volumes/new"]]],
+            ["id": "existing", "match": ["type": "probe_host", "value": "existing.invalid"],
+             "targets": [["url": "smb://server.invalid/share", "mount_path": "/Volumes/existing"]]]
+        ]],
+        context: .root
+    ) as? [String: Any]
+    let insertedProfiles = insertedConfig?["profiles"] as? [[String: Any]]
+    let insertedTargets = insertedProfiles?.first?["targets"] as? [[String: Any]]
+    let retainedExistingProfile = insertedProfiles?.last
+    let retainedExistingTarget = (retainedExistingProfile?["targets"] as? [[String: Any]])?.first
+    check(insertedProfiles?.first?["custom_profile"] == nil
+          && insertedTargets?.first?["custom_target"] == nil
+          && retainedExistingProfile?["custom_profile"] as? String == "belongs to existing"
+          && retainedExistingTarget?["custom_target"] as? String == "belongs to existing",
+          "config merge does not transfer unknown fields to inserted or reordered items")
+
+    let workspaceConfigURL = URL(fileURLWithPath: "/tmp/automount-workspace/auto_mount.plist")
+    let runtimeConfigURL = URL(fileURLWithPath: "/tmp/automount-runtime/auto_mount.plist")
+    check(preferredManagementConfigURL(
+        workspaceURL: workspaceConfigURL,
+        runtimeURL: runtimeConfigURL,
+        launchAgentInstalled: true,
+        runtimeConfigExists: true
+    ) == runtimeConfigURL, "configuration management selects the installed daemon config")
+    check(preferredManagementConfigURL(
+        workspaceURL: workspaceConfigURL,
+        runtimeURL: runtimeConfigURL,
+        launchAgentInstalled: false,
+        runtimeConfigExists: false
+    ) == workspaceConfigURL, "configuration management falls back to workspace config without a daemon")
+
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceExists: true, runtimeExists: false,
+        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
+    ) == .selected(.workspace), "first daemon install seeds a valid workspace config")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceExists: true, runtimeExists: true,
+        workspaceUsable: true, runtimeUsable: true, documentsEquivalent: true
+    ) == .selected(.runtime), "matching configs preserve daemon-owned runtime state")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceExists: true, runtimeExists: true,
+        workspaceUsable: true, runtimeUsable: true, documentsEquivalent: false
+    ) == .diverged, "diverged configs require an explicit interactive choice")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceExists: false, runtimeExists: true,
+        workspaceUsable: false, runtimeUsable: true, documentsEquivalent: false
+    ) == .selected(.runtime), "runtime config is preserved when workspace config is absent")
+    check(resolveInstallConfigLocation(
+        requested: nil, workspaceExists: true, runtimeExists: true,
+        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
+    ) == .invalidRuntime, "invalid runtime config is not silently replaced")
+    check(resolveInstallConfigLocation(
+        requested: .workspace, workspaceExists: true, runtimeExists: true,
+        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
+    ) == .selected(.workspace), "explicit workspace selection can repair an invalid runtime config")
+    check(resolveInstallConfigLocation(
+        requested: .runtime, workspaceExists: true, runtimeExists: false,
+        workspaceUsable: true, runtimeUsable: false, documentsEquivalent: false
+    ) == .unavailable(.runtime), "explicit runtime selection fails when runtime config is absent")
+
+    let equivalenceProfile = NetworkProfile(
+        id: "test_profile", description: "Generic test profile",
+        match: MatchRule(type: "probe_host", value: "server.invalid", retryCount: nil, retryInterval: nil),
+        excludeGatewayIPs: nil, preventSpotlightIndex: nil,
+        targets: [MountTarget(url: "smb://server.invalid/share", mountPath: "/Volumes/share")]
+    )
+    let runtimeSettings = AutoMountConfig(
+        version: "2.7.0", updateChannel: "auto", lastUpdateCheckTimestamp: 1,
+        updateRetryAfterTimestamp: 2, lastNotifiedVersion: "2.7.0", profiles: [equivalenceProfile]
+    )
+    var workspaceSettings = runtimeSettings
+    workspaceSettings.version = "2.7.1"
+    workspaceSettings.lastUpdateCheckTimestamp = 10
+    workspaceSettings.updateRetryAfterTimestamp = 20
+    workspaceSettings.lastNotifiedVersion = "2.7.1"
+    check(installConfigModelsAreEquivalent(workspaceSettings, runtimeSettings),
+          "install config comparison ignores version and daemon update bookkeeping")
+    workspaceSettings.updateChannel = "off"
+    check(!installConfigModelsAreEquivalent(workspaceSettings, runtimeSettings),
+          "install config comparison detects user settings changes")
+
+    check(smbResourceIdentity("smb://user:secret@NAS.local/Media") == smbResourceIdentity("//NAS.local/media"),
+          "SMB identity ignores credentials and case")
+    check(smbResourceIdentity("smb://nas.local/media") != smbResourceIdentity("smb://nas.local/archive"),
+          "different SMB shares have different identities")
+    check(extractHost(from: "smb://[fd00::1]/share") == "fd00::1", "IPv6 SMB host is extracted")
+    check(validateMountTargetURL("smb://nas.local/share") == nil, "valid SMB URL is accepted")
+    check(validateMountTargetURL("https://nas.local/share") != nil, "non-SMB URL is rejected")
+    check(validateMountTargetURL("smb://nas.local") != nil, "SMB URL without share is rejected")
+    let routedTestURL = remoteSMBAcceptanceURL(
+        "smb://nas.example.ts.net/share",
+        peers: [DiscoveredTailscalePeer(name: "nas", magicDNS: "nas.example.ts.net.", ip: "peer.invalid", os: "linux")]
+    )
+    check(routedTestURL.url == "smb://peer.invalid/share" && routedTestURL.usesTailscaleAddress,
+          "remote SMB acceptance prefers a matching Tailscale peer address over local DNS")
+    check(validateMountPath("/Volumes/media") == nil, "absolute mount path is accepted")
+    check(validateMountPath("relative/media") != nil, "relative mount path is rejected")
+    check(validateMountPath("/Volumes/../private") != nil, "traversal mount path is rejected")
+    check(usesSystemManagedMountPoint(MountTarget(url: "smb://nas.local/media", mountPath: "/Volumes/media")),
+          "standard share mount path can be created by NetFS")
+    check(!usesSystemManagedMountPoint(MountTarget(url: "smb://nas.local/media", mountPath: "/Volumes/archive")),
+          "custom mount path is not delegated to the system")
+    check(!usesSystemManagedMountPoint(MountTarget(url: "smb://nas.local/media", mountPath: "/Volumes/nas/media")),
+          "nested mount path is not delegated to the system")
+    check(parseARPCacheOutput("? (192.0.2.1) at AA:BB:CC:DD:EE:FF on en0 ifscope [ethernet]", for: "192.0.2.1") == "aa:bb:cc:dd:ee:ff",
+          "interface-scoped ARP entry is parsed and normalized")
+    check(parseARPCacheOutput("? (192.0.2.1) at AA:BB:CC:DD:EE:FF on en1 ifscope", for: "192.0.2.1", interface: "en0") == nil,
+          "ARP lookup rejects a matching address on the wrong interface")
+    check(parseARPCacheOutput("? (192.0.2.10) at 00:11:22:33:44:55 on en0\n? (192.0.2.1) at (incomplete) on en0", for: "192.0.2.1") == nil,
+          "incomplete ARP entry is rejected")
+    check(parseARPCacheOutput("? (192.0.2.10) at 00:11:22:33:44:55 on en0", for: "192.0.2.1") == nil,
+          "ARP parser does not match a different IP")
+    let redacted = redactedSMBURL("smb://alice:secret@nas.local/share")
+    check(!redacted.contains("alice") && !redacted.contains("secret"), "SMB URL credentials are redacted")
+    let nonSMBRedacted = redactedSMBURL("https://alice:secret@host.invalid/path")
+    check(!nonSMBRedacted.contains("alice") && !nonSMBRedacted.contains("secret"),
+          "credentials are redacted from rejected non-SMB URLs")
+    let malformedURLRedacted = redactedSMBURL("smb://alice:sec ret@host.invalid/share")
+    check(!malformedURLRedacted.contains("alice") && !malformedURLRedacted.contains("sec ret"),
+          "credentials are redacted from malformed URLs")
+    let binaryURL = URL(fileURLWithPath: "/tmp/automount-test-binary")
+    let sourceURL = URL(fileURLWithPath: "/tmp/automount-test-source.swift")
+    check(launchAgentProgramArguments(binaryURL: binaryURL, sourceURL: sourceURL, preferSource: false) == [binaryURL.path],
+          "LaunchAgent falls back to the compiled binary when source launch is disabled")
+    check(launchAgentProgramArguments(binaryURL: binaryURL, sourceURL: sourceURL, preferSource: true) == ["/usr/bin/swift", sourceURL.path],
+          "first LaunchAgent install can select its staged Swift source")
+
+    let atomicWriteURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("automount-self-test-\(UUID().uuidString)")
+    var atomicWritePassed = false
+    do {
+        try atomicWrite(Data("test".utf8), to: atomicWriteURL, permissions: 0o600)
+        let mode = (try FileManager.default.attributesOfItem(atPath: atomicWriteURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        let contents = try String(contentsOf: atomicWriteURL, encoding: .utf8)
+        atomicWritePassed = mode == 0o600 && contents == "test"
+    } catch {
+        atomicWritePassed = false
+    }
+    try? FileManager.default.removeItem(at: atomicWriteURL)
+    check(atomicWritePassed, "atomic config writes preserve content and requested file permissions")
+
+    let transactionDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("automount-transaction-test-\(UUID().uuidString)")
+    let firstSourceURL = transactionDirectory.appendingPathComponent("first-new")
+    let firstDestinationURL = transactionDirectory.appendingPathComponent("first-destination")
+    let missingSourceURL = transactionDirectory.appendingPathComponent("missing-source")
+    let secondDestinationURL = transactionDirectory.appendingPathComponent("second-destination")
+    try? FileManager.default.createDirectory(at: transactionDirectory, withIntermediateDirectories: true)
+    try? Data("new".utf8).write(to: firstSourceURL)
+    try? Data("old".utf8).write(to: firstDestinationURL)
+    var transactionRolledBack = false
+    do {
+        try replaceFilesTransactionally([
+            StagedFileReplacement(sourceURL: firstSourceURL, destinationURL: firstDestinationURL, permissions: 0o600),
+            StagedFileReplacement(sourceURL: missingSourceURL, destinationURL: secondDestinationURL, permissions: 0o600)
+        ])
+    } catch {
+        transactionRolledBack = (try? String(contentsOf: firstDestinationURL, encoding: .utf8)) == "old"
+            && !FileManager.default.fileExists(atPath: secondDestinationURL.path)
+    }
+    check(transactionRolledBack, "multi-file deployment restores prior files when a replacement fails")
+
+    var activationRolledBack = false
+    do {
+        try replaceFilesTransactionally([
+            StagedFileReplacement(sourceURL: firstSourceURL, destinationURL: firstDestinationURL, permissions: 0o600)
+        ]) {
+            throw NSError(domain: "AutoMountTest", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "simulated activation failure"])
+        }
+    } catch {
+        activationRolledBack = (try? String(contentsOf: firstDestinationURL, encoding: .utf8)) == "old"
+    }
+    check(activationRolledBack, "failed service activation restores the prior file set")
+    try? FileManager.default.removeItem(at: transactionDirectory)
+
+    let pipeTest = runCommand(
+        executable: "/bin/sh",
+        arguments: ["-c", "/usr/bin/yes x | /usr/bin/head -c 131072 >&2; printf stdout"]
+    )
+    check(pipeTest.status == 0 && pipeTest.stdout == "stdout" && pipeTest.stderr.utf8.count == 131072,
+          "child stdout and large stderr are drained without deadlock")
+
+    let completedCommand = runCommandDiscardingOutputWithTimeout(
+        executable: "/usr/bin/true", arguments: [], timeout: 1.0
+    )
+    check(completedCommand.status == 0 && !completedCommand.timedOut && completedCommand.processStopped,
+          "bounded child runner reports a completed command")
+    let timedOutCommand = runCommandDiscardingOutputWithTimeout(
+        executable: "/bin/sleep", arguments: ["2"], timeout: 0.05
+    )
+    check(timedOutCommand.timedOut && timedOutCommand.processStopped,
+          "bounded child runner terminates and reaps a timed-out command")
+
+    let launchdSample = """
+    state = not running
+    last exit code = 1
+    """
+    check(firstRegexCapture(#"(?m)^\s*last exit code = (-?\d+)\s*$"#, in: launchdSample) == "1",
+          "launchd last exit code is parsed")
+
+    if includeNetworkChecks {
+        if let gateway = getPhysicalGatewayInfo() {
+            let scopedTable = runCommand(executable: "/usr/sbin/arp",
+                                         arguments: ["-n", "-i", gateway.interface, "-a"])
+            check(scopedTable.status == 0,
+                  "interface-scoped ARP table command completes for the current gateway")
+            if scopedTable.stdout.isEmpty {
+                let reason = "arp returned no entries in this run, so neighbor-cache behavior is unverified"
+                skip("gateway entry in the ARP table", reason: reason)
+                skip("ARP entry parsing and interface scope", reason: reason)
+                skip("gateway MAC cache lookup", reason: reason)
+                skip("application gateway MAC probe", reason: reason)
+            } else {
+                check(scopedTable.stdout.contains("(\(gateway.ip))"),
+                      "interface-scoped ARP table contains the current gateway address")
+                check(parseARPCacheOutput(scopedTable.stdout, for: gateway.ip, interface: gateway.interface) != nil,
+                      "interface-scoped ARP table includes a parseable entry for the current gateway")
+                check(queryARPCache(for: gateway.ip, interface: gateway.interface) != nil,
+                      "current gateway MAC is readable from the interface-scoped ARP entry")
+                check(getMACAddress(for: gateway.ip, interface: gateway.interface) != nil,
+                      "current gateway MAC can be resolved through the application probe")
+            }
+        } else {
+            check(false, "current physical gateway is detected")
+        }
+    }
+
+    print("Self-tests: \(passed) passed, \(skipped) skipped, \(failed) failed")
+    return failed == 0
 }
 
 struct GitHubReleaseInfo {
@@ -2294,38 +3661,36 @@ func fetchLatestReleaseInfo() -> ReleaseFetchResult {
     request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
 
     let semaphore = DispatchSemaphore(value: 0)
+    let resultLock = NSLock()
     var result: ReleaseFetchResult = .networkError
 
     let task = URLSession.shared.dataTask(with: request) { data, response, error in
-        defer { semaphore.signal() }
+        var fetchedResult: ReleaseFetchResult = .networkError
         if error != nil {
-            result = .networkError
-            return
+            fetchedResult = .networkError
+        } else if let httpRes = response as? HTTPURLResponse, httpRes.statusCode == 404 {
+            fetchedResult = .noReleasesFound
+        } else if let httpRes = response as? HTTPURLResponse, httpRes.statusCode == 200,
+                  let data,
+                  let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let tagName = json["tag_name"] as? String {
+            let name = (json["name"] as? String) ?? tagName
+            let body = (json["body"] as? String) ?? ""
+            let publishedAt = json["published_at"] as? String
+            fetchedResult = .success(GitHubReleaseInfo(tagName: tagName, name: name, body: body, publishedAt: publishedAt))
         }
-        guard let httpRes = response as? HTTPURLResponse else {
-            result = .networkError
-            return
-        }
-        if httpRes.statusCode == 404 {
-            result = .noReleasesFound
-            return
-        }
-        guard httpRes.statusCode == 200, let data = data else {
-            result = .networkError
-            return
-        }
-        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let tagName = json["tag_name"] as? String else {
-            result = .networkError
-            return
-        }
-        let name = (json["name"] as? String) ?? tagName
-        let body = (json["body"] as? String) ?? ""
-        let publishedAt = json["published_at"] as? String
-        result = .success(GitHubReleaseInfo(tagName: tagName, name: name, body: body, publishedAt: publishedAt))
+        resultLock.lock()
+        result = fetchedResult
+        resultLock.unlock()
+        semaphore.signal()
     }
     task.resume()
-    _ = semaphore.wait(timeout: .now() + 6.0)
+    guard semaphore.wait(timeout: .now() + 6.0) == .success else {
+        task.cancel()
+        return .networkError
+    }
+    resultLock.lock()
+    defer { resultLock.unlock() }
     return result
 }
 
@@ -2337,145 +3702,178 @@ func downloadLatestSource(tag: String) -> String? {
     request.setValue("AutoMount/\(autoMountVersion)", forHTTPHeaderField: "User-Agent")
 
     let semaphore = DispatchSemaphore(value: 0)
+    let contentLock = NSLock()
     var downloadedContent: String?
 
     let task = URLSession.shared.dataTask(with: request) { data, response, error in
-        defer { semaphore.signal() }
-        guard error == nil, let data = data,
-              let httpRes = response as? HTTPURLResponse, httpRes.statusCode == 200,
-              let text = String(data: data, encoding: .utf8), !text.isEmpty else {
-            return
+        var fetchedContent: String?
+        if error == nil, let data,
+           let httpRes = response as? HTTPURLResponse, httpRes.statusCode == 200,
+           let text = String(data: data, encoding: .utf8), !text.isEmpty {
+            fetchedContent = text
         }
-        downloadedContent = text
+        contentLock.lock()
+        downloadedContent = fetchedContent
+        contentLock.unlock()
+        semaphore.signal()
     }
     task.resume()
-    _ = semaphore.wait(timeout: .now() + 11.0)
+    guard semaphore.wait(timeout: .now() + 11.0) == .success else {
+        task.cancel()
+        return nil
+    }
+    contentLock.lock()
+    defer { contentLock.unlock() }
     return downloadedContent
 }
 
-func verifySwiftSyntax(sourceCode: String) -> Bool {
-    let tempDir = FileManager.default.temporaryDirectory
-    let tempFile = tempDir.appendingPathComponent("automount_check_\(UUID().uuidString).swift")
-    do {
-        try sourceCode.write(to: tempFile, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tempFile) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-        process.arguments = ["-parse", tempFile.path]
-        let errPipe = Pipe()
-        process.standardError = errPipe
-        process.standardOutput = Pipe()
-        try process.run()
-        process.waitUntilExit()
-        return process.terminationStatus == 0
-    } catch {
-        return false
-    }
-}
-
 func performSelfUpdate(newVersion: String, newContent: String, isSilent: Bool) -> Bool {
-    // 1. 本地语法分析预检
-    if !verifySwiftSyntax(sourceCode: newContent) {
-        let err = tr("✗ 新版本代码本地 Swift 语法预检失败，已自动终止更新，保护当前运行环境安全。",
-                     "✗ Swift syntax check failed for the new version. Aborted update to protect daemon.")
-        fputs("\(err)\n", stderr)
-        writeLog("Self-update aborted: syntax check failed for version \(newVersion)")
+    func fail(_ message: String) -> Bool {
+        fputs("✗ \(message)\n", stderr)
+        writeLog("Self-update failed for \(newVersion): \(message)")
         if !isSilent {
             showMacOSNotification(
                 title: tr("AutoMount 升级未完成", "AutoMount Update Incomplete"),
-                subtitle: tr("语法校验未通过", "Syntax Validation Failed"),
-                message: tr("下载的代码预检未通过，当前运行未受影响。", "Downloaded code failed syntax check. Current runtime unchanged.")
+                subtitle: tr("更新未完成", "Update Failed"),
+                message: message
             )
         }
         return false
     }
 
+    guard parseSemanticVersion(newVersion).count == 3 else {
+        return fail(tr("发布版本号无效。", "Release version is invalid."))
+    }
+    let versionPattern = #"let\s+autoMountVersion\s*=\s*"([^"]+)""#
+    guard let versionRegex = try? NSRegularExpression(pattern: versionPattern),
+          let versionMatch = versionRegex.firstMatch(in: newContent, range: NSRange(newContent.startIndex..., in: newContent)),
+          let versionRange = Range(versionMatch.range(at: 1), in: newContent),
+          parseSemanticVersion(String(newContent[versionRange])) == parseSemanticVersion(newVersion) else {
+        return fail(tr("下载源码中的版本号与发布版本不一致。", "Downloaded source version does not match the release tag."))
+    }
+
+    let tempDirectory = FileManager.default.temporaryDirectory
+    let stagedSourceURL = tempDirectory.appendingPathComponent("automount-update-\(UUID().uuidString).swift")
+    let stagedBinaryURL = tempDirectory.appendingPathComponent("automount-update-\(UUID().uuidString)")
+    var stagedConfigURLs: [URL] = []
+    defer {
+        try? FileManager.default.removeItem(at: stagedSourceURL)
+        try? FileManager.default.removeItem(at: stagedBinaryURL)
+        for url in stagedConfigURLs {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+    do {
+        try newContent.write(to: stagedSourceURL, atomically: true, encoding: .utf8)
+    } catch {
+        return fail(tr("无法暂存升级源码: \(error.localizedDescription)", "Could not stage update source: \(error.localizedDescription)"))
+    }
+    let compile = compileOptimizedSwiftSource(sourceURL: stagedSourceURL, outputURL: stagedBinaryURL)
+    guard compile.status == 0 else {
+        let details = compile.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        return fail(tr("新版本完整编译失败。\n\(details)", "The new version failed to compile.\n\(details)"))
+    }
+
     let installDir = getInstalledDir()
     let currentAppDir = getAppDir()
-    var updatedPaths: [String] = []
-
-    // 2. 更新运行目录 ~/Library/Application Support/AutoMount/auto_mount.swift
     let targetInstalledSwift = installDir.appendingPathComponent("auto_mount.swift")
-    if FileManager.default.fileExists(atPath: installDir.path) {
-        do {
-            try newContent.write(to: targetInstalledSwift, atomically: true, encoding: .utf8)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: targetInstalledSwift.path)
-            updatedPaths.append(targetInstalledSwift.path)
-        } catch {
-            fputs("✗ \(error.localizedDescription)\n", stderr)
-        }
-    }
-
-    // 2.1 若守护服务运行目录存在编译后的二进制 auto_mount，立即重新编译
     let installedBinary = installDir.appendingPathComponent("auto_mount")
-    if FileManager.default.fileExists(atPath: installedBinary.path) {
-        let compileRes = runCommand(executable: "/usr/bin/swiftc", arguments: ["-O", targetInstalledSwift.path, "-o", installedBinary.path])
-        if compileRes.status == 0 {
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedBinary.path)
-            updatedPaths.append(installedBinary.path)
-        }
-    }
-
-    // 3. 若当前处于工程工作区且存在 auto_mount.swift，一并同步工作区
     let localSwift = currentAppDir.appendingPathComponent("auto_mount.swift")
     let localBinary = currentAppDir.appendingPathComponent("auto_mount")
-    if FileManager.default.fileExists(atPath: localSwift.path) && localSwift.path != targetInstalledSwift.path {
-        do {
-            try newContent.write(to: localSwift, atomically: true, encoding: .utf8)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localSwift.path)
-            updatedPaths.append(localSwift.path)
-        } catch {
-            // 忽略非工作区权限写入限制
-        }
+    let installDirectoryExists = FileManager.default.fileExists(atPath: installDir.path)
+    let localDirectoryIsRuntime = currentAppDir.standardizedFileURL.path == installDir.standardizedFileURL.path
+    var updateWorkspace = !localDirectoryIsRuntime
+        && (FileManager.default.fileExists(atPath: localSwift.path)
+            || FileManager.default.fileExists(atPath: localBinary.path))
+    var skippedModifiedWorkspace = false
 
-        // 3.1 若工作区存在编译后的二进制 auto_mount，立即重新编译
+    if updateWorkspace && FileManager.default.fileExists(atPath: localSwift.path) {
+        let gitCheck = runCommand(
+            executable: "/usr/bin/git",
+            arguments: ["-C", currentAppDir.path, "status", "--porcelain", "--", "auto_mount.swift"]
+        )
+        if gitCheck.status == 0
+            && !gitCheck.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            updateWorkspace = false
+            skippedModifiedWorkspace = true
+            writeLog("Skipped updating the workspace because auto_mount.swift has local changes.")
+        }
+    }
+
+    guard installDirectoryExists || updateWorkspace else {
+        return fail(tr("没有找到可安全升级的程序目录。", "No safe program directory was found to update."))
+    }
+
+    var replacements: [StagedFileReplacement] = []
+    var updatedPaths: [String] = []
+    if installDirectoryExists {
+        replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: installedBinary, permissions: 0o755))
+        replacements.append(StagedFileReplacement(sourceURL: stagedSourceURL, destinationURL: targetInstalledSwift, permissions: 0o755))
+        updatedPaths.append(installedBinary.path)
+        updatedPaths.append(targetInstalledSwift.path)
+    }
+    if updateWorkspace {
         if FileManager.default.fileExists(atPath: localBinary.path) {
-            let compileRes = runCommand(executable: "/usr/bin/swiftc", arguments: ["-O", localSwift.path, "-o", localBinary.path])
-            if compileRes.status == 0 {
-                try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localBinary.path)
-                updatedPaths.append(localBinary.path)
-            }
+            replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: localBinary, permissions: 0o755))
+            updatedPaths.append(localBinary.path)
+        }
+        if FileManager.default.fileExists(atPath: localSwift.path) {
+            replacements.append(StagedFileReplacement(sourceURL: stagedSourceURL, destinationURL: localSwift, permissions: 0o755))
+            updatedPaths.append(localSwift.path)
         }
     }
 
-    // 4. 即时联动执行配置文件升舱 (Eager Config Migration)
-    let runnerInstalled = FileManager.default.fileExists(atPath: installedBinary.path) ? installedBinary.path : targetInstalledSwift.path
-    if FileManager.default.fileExists(atPath: runnerInstalled) {
-        _ = runCommand(executable: runnerInstalled, arguments: ["--migrate-only"])
-        let installedPlist = installDir.appendingPathComponent("auto_mount.plist")
-        if FileManager.default.fileExists(atPath: installedPlist.path) {
-            updatedPaths.append(installedPlist.path + tr(" (已即时升舱)", " (Eagerly migrated)"))
+    var configDestinations = Set<String>()
+    var candidateConfigs: [URL] = []
+    if installDirectoryExists {
+        candidateConfigs.append(installDir.appendingPathComponent("auto_mount.plist"))
+    }
+    if updateWorkspace {
+        candidateConfigs.append(currentAppDir.appendingPathComponent("auto_mount.plist"))
+    }
+
+    for configURL in candidateConfigs
+        where FileManager.default.fileExists(atPath: configURL.path)
+            && configDestinations.insert(configURL.standardizedFileURL.path).inserted {
+        let stagedConfigURL = tempDirectory.appendingPathComponent("automount-config-\(UUID().uuidString).plist")
+        stagedConfigURLs.append(stagedConfigURL)
+        do {
+            try atomicCopyFile(from: configURL, to: stagedConfigURL, permissions: 0o600)
+        } catch {
+            return fail(tr("无法暂存配置文件: \(error.localizedDescription)", "Could not stage config file: \(error.localizedDescription)"))
         }
-    }
-
-    if localSwift.path != targetInstalledSwift.path {
-        let runnerLocal = FileManager.default.fileExists(atPath: localBinary.path) ? localBinary.path : localSwift.path
-        if FileManager.default.fileExists(atPath: runnerLocal) {
-            _ = runCommand(executable: runnerLocal, arguments: ["--migrate-only"])
-            let localPlist = currentAppDir.appendingPathComponent("auto_mount.plist")
-            if FileManager.default.fileExists(atPath: localPlist.path) {
-                updatedPaths.append(localPlist.path + tr(" (已即时升舱)", " (Eagerly migrated)"))
-            }
+        let migration = runCommand(
+            executable: stagedBinaryURL.path,
+            arguments: ["--migrate-only", stagedConfigURL.path]
+        )
+        guard migration.status == 0 else {
+            return fail(tr("配置迁移失败，原配置未被替换: \(migration.stderr)",
+                           "Config migration failed; the original config was not replaced: \(migration.stderr)"))
         }
+        replacements.append(StagedFileReplacement(sourceURL: stagedConfigURL, destinationURL: configURL, permissions: 0o600))
+        updatedPaths.append(configURL.path + tr(" (已迁移)", " (migrated)"))
     }
 
-    // 5. 重载 LaunchAgent 守护服务
-    let uid = getuid()
-    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
-    let plistURL = getLaunchAgentPlistURL()
-    if FileManager.default.fileExists(atPath: plistURL.path) {
-        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
-        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootstrap", "gui/\(uid)", plistURL.path])
+    do {
+        try replaceFilesTransactionally(replacements)
+    } catch {
+        return fail(tr("写入升级文件失败，已尝试恢复原文件: \(error.localizedDescription)",
+                       "Could not install update files; rollback was attempted: \(error.localizedDescription)"))
     }
 
+    let launchAgentLoaded = FileManager.default.fileExists(atPath: getLaunchAgentPlistURL().path)
+        && getLaunchAgentDiagnostic().loaded
     writeLog("Self-update succeeded to \(newVersion). Updated files: \(updatedPaths.joined(separator: ", "))")
+    if skippedModifiedWorkspace {
+        writeLog("The updated runtime is current; the modified workspace was left untouched.")
+    }
 
     if isSilent {
         showMacOSNotification(
             title: tr("AutoMount 自动升级成功", "AutoMount Updated Successfully"),
-            subtitle: tr("已自动平滑热升级至 \(newVersion)", "Updated seamlessly to \(newVersion)"),
-            message: tr("网络挂载与守护服务已恢复最新就绪状态。", "Mount engine and daemon are updated and running.")
+            subtitle: tr("已部署版本 \(newVersion)", "Version \(newVersion) deployed"),
+            message: tr("守护进程会在配置变化触发或不超过 60 秒的下次启动时读取新版本。",
+                        "The daemon will read the new version when the config change triggers it or on the next launch within 60 seconds.")
         )
     } else {
         print(tr("✓ 软件已成功升级至 \(newVersion)！", "✓ Successfully updated to \(newVersion)!"))
@@ -2483,7 +3881,18 @@ func performSelfUpdate(newVersion: String, newContent: String, isSilent: Bool) -
             print(tr("  已同步更新组件:\n    \(updatedPaths.joined(separator: "\n    "))",
                      "  Synchronized components:\n    \(updatedPaths.joined(separator: "\n    "))"))
         }
-        print(tr("✓ 后台守护服务已自动完成热重载并就绪。", "✓ Background daemon reloaded and active."))
+        if skippedModifiedWorkspace {
+            print(tr("• 工作区源码有未提交修改，已保留；后台运行目录仍已更新。",
+                     "• The workspace has uncommitted source changes and was preserved; the daemon runtime was updated."))
+        }
+        print(tr(
+            launchAgentLoaded
+                ? "✓ 已部署新版本；守护进程将在配置变化触发或不超过 60 秒的下次启动时读取新文件。"
+                : "✓ 已部署新版本；未强制启动或重载 LaunchAgent。",
+            launchAgentLoaded
+                ? "✓ New files are deployed; the daemon will load them on a config-change trigger or its next launch within 60 seconds."
+                : "✓ New files are deployed; the LaunchAgent was not forcibly started or reloaded."
+        ))
     }
     return true
 }
@@ -2493,20 +3902,30 @@ func triggerBackgroundUpdateCheckIfNeeded(config: inout AutoMountConfig) {
     guard channel == "notify" || channel == "auto" else { return }
 
     let now = Date().timeIntervalSince1970
-    let cooldown: Double = 86400 // 24 小时冷却窗口
-
-    if let last = config.lastUpdateCheckTimestamp, (now - last) < cooldown {
-        return // 冷却中，跳过
-    }
-
-    // 记录本次检查时间并写回
-    config.lastUpdateCheckTimestamp = now
-    saveConfig(config)
+    guard shouldCheckForBackgroundUpdate(config: config, now: now) else { return }
 
     writeLog("Starting background update check (channel: \(channel))...")
-    guard case .success(let release) = fetchLatestReleaseInfo() else { return }
+    let fetchResult = fetchLatestReleaseInfo()
+    if case .networkError = fetchResult {
+        recordBackgroundUpdateFailure(config: &config, now: now)
+        _ = saveConfig(config)
+        writeLog("Background update check failed; retry scheduled after \(backgroundUpdateRetryDelay) seconds.")
+        return
+    }
+
+    // A successful response starts the normal cooldown. Failed downloads or
+    // deployments replace it with the shorter persisted retry deadline below.
+    config.lastUpdateCheckTimestamp = now
+    config.updateRetryAfterTimestamp = nil
+    guard case .success(let release) = fetchResult else {
+        _ = saveConfig(config)
+        return
+    }
     let remoteVersion = release.tagName
-    guard isNewerVersion(remoteVersion, than: autoMountVersion) else { return }
+    guard isNewerVersion(remoteVersion, than: autoMountVersion) else {
+        _ = saveConfig(config)
+        return
+    }
 
     writeLog("New version discovered: \(remoteVersion) (current: \(autoMountVersion)), channel: \(channel)")
 
@@ -2514,6 +3933,7 @@ func triggerBackgroundUpdateCheckIfNeeded(config: inout AutoMountConfig) {
         // 单版本仅提醒 1 次防打扰机制
         if config.lastNotifiedVersion == remoteVersion {
             writeLog("Update notification for \(remoteVersion) already presented once. Skipping.")
+            _ = saveConfig(config)
             return
         }
 
@@ -2528,8 +3948,20 @@ func triggerBackgroundUpdateCheckIfNeeded(config: inout AutoMountConfig) {
         config.lastNotifiedVersion = remoteVersion
         saveConfig(config)
     } else if channel == "auto" {
-        if let sourceCode = downloadLatestSource(tag: remoteVersion) {
-            _ = performSelfUpdate(newVersion: remoteVersion, newContent: sourceCode, isSilent: true)
+        // Persist the successful release check before attempting installation.
+        // If the process exits during deployment, the config still records the
+        // check and a failed attempt can replace the 24-hour cooldown.
+        _ = saveConfig(config)
+        guard let sourceCode = downloadLatestSource(tag: remoteVersion) else {
+            recordBackgroundUpdateFailure(config: &config, now: Date().timeIntervalSince1970)
+            _ = saveConfig(config)
+            writeLog("Update source download failed; retry scheduled after \(backgroundUpdateRetryDelay) seconds.")
+            return
+        }
+        if !performSelfUpdate(newVersion: remoteVersion, newContent: sourceCode, isSilent: true) {
+            recordBackgroundUpdateFailure(config: &config, now: Date().timeIntervalSince1970)
+            _ = saveConfig(config)
+            writeLog("Automatic deployment failed; retry scheduled after \(backgroundUpdateRetryDelay) seconds.")
         }
     }
 }
@@ -2567,25 +3999,52 @@ func syncCurrentToInstalledDaemon() -> Bool {
     let installDir = getInstalledDir()
     guard FileManager.default.fileExists(atPath: installDir.path) else { return false }
 
-    let filesToSync = ["auto_mount", "auto_mount.swift", "auto_mount.plist"]
-    for fileName in filesToSync {
-        let srcURL = currentAppDir.appendingPathComponent(fileName)
-        let dstURL = installDir.appendingPathComponent(fileName)
-        if FileManager.default.fileExists(atPath: srcURL.path) {
-            try? FileManager.default.removeItem(at: dstURL)
-            try? FileManager.default.copyItem(at: srcURL, to: dstURL)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dstURL.path)
-        }
+    let sourceURL = currentAppDir.appendingPathComponent("auto_mount.swift")
+    let sourceConfigURL = currentAppDir.appendingPathComponent("auto_mount.plist")
+    let sourceExists = FileManager.default.fileExists(atPath: sourceURL.path)
+    let installedSourceURL = installDir.appendingPathComponent("auto_mount.swift")
+    let installedBinaryURL = installDir.appendingPathComponent("auto_mount")
+    let installedConfigURL = installDir.appendingPathComponent("auto_mount.plist")
+    let shouldSeedRuntimeConfig = !FileManager.default.fileExists(atPath: installedConfigURL.path)
+    let stagedBinaryURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("automount-sync-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: stagedBinaryURL) }
+
+    if !shouldSeedRuntimeConfig && loadConfig(from: installedConfigURL) == nil {
+        fputs("✗ Existing daemon config is invalid or could not be migrated; runtime synchronization stopped.\n", stderr)
+        writeLog("Daemon synchronization aborted because the existing runtime config is invalid or could not be migrated")
+        return false
     }
 
-    let uid = getuid()
-    let serviceTarget = "gui/\(uid)/\(launchAgentLabel)"
-    let plistURL = getLaunchAgentPlistURL()
-    if FileManager.default.fileExists(atPath: plistURL.path) {
-        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootout", serviceTarget])
-        _ = runCommand(executable: "/bin/launchctl", arguments: ["bootstrap", "gui/\(uid)", plistURL.path])
+    var replacements: [StagedFileReplacement] = []
+    if sourceExists {
+        let compile = compileOptimizedSwiftSource(sourceURL: sourceURL, outputURL: stagedBinaryURL)
+        guard compile.status == 0 else {
+            fputs("✗ Swift source compilation failed; installed files were not replaced.\n", stderr)
+            fputs(compile.stderr, stderr)
+            writeLog("Daemon synchronization compilation failed: \(compile.stderr)")
+            return false
+        }
+        replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
+        replacements.append(StagedFileReplacement(sourceURL: sourceURL, destinationURL: installedSourceURL, permissions: 0o755))
+    } else {
+        let binaryURL = currentAppDir.appendingPathComponent("auto_mount")
+        guard FileManager.default.isExecutableFile(atPath: binaryURL.path) else { return false }
+        replacements.append(StagedFileReplacement(sourceURL: binaryURL, destinationURL: installedBinaryURL, permissions: 0o755))
     }
-    writeLog("Synchronized current workspace build to LaunchAgent runtime and reloaded daemon.")
+    if shouldSeedRuntimeConfig && FileManager.default.fileExists(atPath: sourceConfigURL.path) {
+        replacements.append(StagedFileReplacement(sourceURL: sourceConfigURL, destinationURL: installedConfigURL, permissions: 0o600))
+    }
+
+    do {
+        try replaceFilesTransactionally(replacements)
+    } catch {
+        fputs("✗ Failed to synchronize daemon files; rollback was attempted: \(error.localizedDescription)\n", stderr)
+        writeLog("Daemon synchronization failed and rollback was attempted: \(error.localizedDescription)")
+        return false
+    }
+
+    writeLog("Synchronized current workspace build to LaunchAgent runtime; existing daemon config was preserved. The new files will be read on a config-change trigger or the next launch within 60 seconds.")
     return true
 }
 
@@ -2606,8 +4065,8 @@ func checkAndSyncInstalledIfOutdated(currentVersion: String, installedVersion: S
     let confirm = (readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y")
     if confirm == "y" || confirm == "yes" || confirm.isEmpty {
         if syncCurrentToInstalledDaemon() {
-            print(tr("✓ 已成功将后台守护服务同步升级至 v\(currentVersion)，并已热重载生效！",
-                     "✓ Successfully updated and reloaded daemon service to v\(currentVersion)!"))
+            print(tr("✓ 已将后台守护服务文件同步至 v\(currentVersion)；配置变化触发或不超过 60 秒的下次启动时读取新文件。",
+                     "✓ Daemon files are synchronized to v\(currentVersion); the service will read them on a config-change trigger or its next launch within 60 seconds."))
         } else {
             print(tr("✗ 同步至后台守护服务失败，请尝试运行 './auto_mount --install'。",
                      "✗ Failed to sync daemon service. Try running './auto_mount --install' manually."))
@@ -2660,38 +4119,78 @@ func checkAndSyncWorkspaceFromInstalledDaemonIfNeeded() {
     let localSwiftURL = currentAppDir.appendingPathComponent("auto_mount.swift")
     guard FileManager.default.fileExists(atPath: installedSwiftURL.path) else { return }
 
-    do {
-        if FileManager.default.fileExists(atPath: localSwiftURL.path) {
-            try? FileManager.default.removeItem(at: localSwiftURL)
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+    let stagedSourceURL = temporaryDirectory.appendingPathComponent("automount-workspace-sync-\(UUID().uuidString).swift")
+    let stagedBinaryURL = temporaryDirectory.appendingPathComponent("automount-workspace-sync-\(UUID().uuidString)")
+    var stagedConfigURL: URL?
+    defer {
+        try? FileManager.default.removeItem(at: stagedSourceURL)
+        try? FileManager.default.removeItem(at: stagedBinaryURL)
+        if let stagedConfigURL {
+            try? FileManager.default.removeItem(at: stagedConfigURL)
         }
-        try FileManager.default.copyItem(at: installedSwiftURL, to: localSwiftURL)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localSwiftURL.path)
-    } catch {
-        fputs("✗ Failed to sync auto_mount.swift from daemon: \(error.localizedDescription)\n", stderr)
-        return
     }
 
-    // If local binary exists, recompile it
     let localBinaryURL = currentAppDir.appendingPathComponent("auto_mount")
-    if FileManager.default.fileExists(atPath: localBinaryURL.path) {
-        let compileRes = runCommand(executable: "/usr/bin/swiftc", arguments: ["-O", localSwiftURL.path, "-o", localBinaryURL.path])
-        if compileRes.status == 0 {
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localBinaryURL.path)
+    let shouldCompileBinary = FileManager.default.fileExists(atPath: localBinaryURL.path)
+    do {
+        try atomicCopyFile(from: installedSwiftURL, to: stagedSourceURL, permissions: 0o755)
+        let compileResult = compileOptimizedSwiftSource(sourceURL: stagedSourceURL, outputURL: stagedBinaryURL)
+        guard compileResult.status == 0 else {
+            fputs("✗ Could not compile the installed source for the workspace.\n", stderr)
+            fputs(compileResult.stderr, stderr)
+            writeLog("Workspace synchronization compilation failed: \(compileResult.stderr)")
+            return
         }
+    } catch {
+        fputs("✗ Failed to sync auto_mount.swift from daemon: \(error.localizedDescription)\n", stderr)
+        writeLog("Workspace source/binary synchronization failed: \(error.localizedDescription)")
+        return
     }
 
     // Sync or migrate config for workspace
     let installedPlistURL = installDir.appendingPathComponent("auto_mount.plist")
     let localPlistURL = currentAppDir.appendingPathComponent("auto_mount.plist")
-    if !FileManager.default.fileExists(atPath: localPlistURL.path) && FileManager.default.fileExists(atPath: installedPlistURL.path) {
-        try? FileManager.default.copyItem(at: installedPlistURL, to: localPlistURL)
+    let localConfigExists = FileManager.default.fileExists(atPath: localPlistURL.path)
+    let installedConfigExists = FileManager.default.fileExists(atPath: installedPlistURL.path)
+    let configSourceURL = localConfigExists ? localPlistURL : (installedConfigExists ? installedPlistURL : nil)
+    if let configSourceURL {
+        let stagedURL = temporaryDirectory.appendingPathComponent("automount-workspace-config-\(UUID().uuidString).plist")
+        stagedConfigURL = stagedURL
+        do {
+            try atomicCopyFile(from: configSourceURL, to: stagedURL, permissions: 0o600)
+        } catch {
+            fputs("✗ Could not stage the workspace config: \(error.localizedDescription)\n", stderr)
+            writeLog("Workspace config staging failed: \(error.localizedDescription)")
+            return
+        }
+        let migration = runCommand(executable: stagedBinaryURL.path, arguments: ["--migrate-only", stagedURL.path])
+        guard migration.status == 0 else {
+            fputs("✗ Workspace config migration failed; workspace files were not replaced: \(migration.stderr)\n", stderr)
+            writeLog("Workspace config migration failed before deployment: \(migration.stderr)")
+            return
+        }
     }
 
-    let runner = FileManager.default.fileExists(atPath: localBinaryURL.path) ? localBinaryURL.path : localSwiftURL.path
-    _ = runCommand(executable: runner, arguments: ["--migrate-only"])
+    var replacements = [
+        StagedFileReplacement(sourceURL: stagedSourceURL, destinationURL: localSwiftURL, permissions: 0o755)
+    ]
+    if shouldCompileBinary {
+        replacements.append(StagedFileReplacement(sourceURL: stagedBinaryURL, destinationURL: localBinaryURL, permissions: 0o755))
+    }
+    if let stagedConfigURL {
+        replacements.append(StagedFileReplacement(sourceURL: stagedConfigURL, destinationURL: localPlistURL, permissions: 0o600))
+    }
+    do {
+        try replaceFilesTransactionally(replacements)
+    } catch {
+        fputs("✗ Workspace synchronization failed; rollback was attempted: \(error.localizedDescription)\n", stderr)
+        writeLog("Workspace synchronization deployment failed and rollback was attempted: \(error.localizedDescription)")
+        return
+    }
 
-    print(tr("✓ 检测到后台守护服务已先一步升级至 v\(installedVersion)，已自动同步工作区，正在热重启...\n",
-             "✓ Daemon service was upgraded to v\(installedVersion), workspace synchronized, restarting...\n"))
+    print(tr("✓ 检测到后台守护服务已升级至 v\(installedVersion)，工作区程序与配置已同步，正在重启当前命令...\n",
+             "✓ Daemon service is at v\(installedVersion); the workspace program and config are synchronized. Restarting the current command...\n"))
 
     restartCurrentProcess()
 }
@@ -2776,8 +4275,10 @@ func handleManualUpdateCommand() {
         return
     }
 
-    print(tr("正在进行本地 Swift 语法预检...", "Performing local Swift syntax validation..."))
-    _ = performSelfUpdate(newVersion: remoteVersion, newContent: source, isSilent: false)
+    print(tr("正在完整编译并预检新版本...", "Compiling and validating the complete new version..."))
+    if !performSelfUpdate(newVersion: remoteVersion, newContent: source, isSilent: false) {
+        exit(1)
+    }
 }
 
 func printUsage() {
@@ -2790,7 +4291,8 @@ func printUsage() {
       ./auto_mount                正常执行 (评估网络策略并挂载匹配目标)
       ./auto_mount --init         初始化配置向导 (支持自动嗅探与复选框交互)
       ./auto_mount --config       日常配置管理 (增删目标、修改网关或远程节点、服务管理)
-      ./auto_mount --install      配置并启用自启动后台守护服务 (LaunchAgent)
+      ./auto_mount --install [--config-source workspace|runtime]
+                                  部署守护服务；指定工作区或守护配置来源
       ./auto_mount --uninstall    移除自启动配置与部署文件
       ./auto_mount --status       查看服务运行状态与挂载详情
       ./auto_mount --update       检查并升级软件至最新版本 (支持本地语法校验)
@@ -2809,10 +4311,13 @@ func printUsage() {
       ./auto_mount                Run normal evaluation and mount targets
       ./auto_mount --init         Interactive setup wizard (with device discovery)
       ./auto_mount --config       Daily configuration & daemon management menu
-      ./auto_mount --install      Deploy and enable background LaunchAgent daemon
+      ./auto_mount --install [--config-source workspace|runtime]
+                                  Deploy LaunchAgent and select config source
       ./auto_mount --uninstall    Remove LaunchAgent daemon and deployed files
       ./auto_mount --status       Show service status and active mount details
       ./auto_mount --update       Check and self-update to latest release
+      ./auto_mount --self-test [--network] [--remote-smb]
+                                  Run checks; optionally mount and clean up remote SMB targets
       ./auto_mount --version, -v  Show software version
       ./auto_mount --help, -h     Show this help message
 
@@ -2828,12 +4333,22 @@ func printUsage() {
 func main() {
     let args = CommandLine.arguments
 
-    // 内部参数：执行即时配置升舱与落盘
+    if args.count > 1 && args[1] == "--self-test" {
+        let passed = runSelfTests(includeNetworkChecks: args.contains("--network"))
+        let remotePassed = args.contains("--remote-smb") ? runRemoteSMBAcceptanceChecks() : true
+        exit(passed && remotePassed ? 0 : 1)
+    }
+
+    // Internal command: migrate the config and persist it.
     if args.count > 1 && args[1] == "--migrate-only" {
-        if let config = loadConfig() {
-            saveConfig(config)
-            writeLog("Eager migration executed for version \(autoMountVersion)")
+        let migrationConfigURL = args.count > 2
+            ? URL(fileURLWithPath: args[2])
+            : getConfigURL()
+        guard loadConfig(from: migrationConfigURL) != nil else {
+            writeLog("Config migration failed: no valid config at \(migrationConfigURL.path)")
+            exit(1)
         }
+        writeLog("Config migration executed for version \(autoMountVersion)")
         exit(0)
     }
 
@@ -2850,6 +4365,23 @@ func main() {
         }
     }
 
+    let architectureResult = runCommand(executable: "/usr/bin/uname", arguments: ["-m"])
+    let architecture = architectureResult.status == 0 ? architectureResult.stdout : "unknown"
+    let platformIssue = platformSupportIssue(
+        macOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+        architecture: architecture
+    )
+    if let platformIssue {
+        if platformIssue == "architecture" {
+            fputs(tr("✗ AutoMount 仅支持 Apple silicon（arm64）；当前架构：\(architecture)。\n",
+                     "✗ AutoMount supports Apple silicon (arm64) only; current architecture: \(architecture).\n"), stderr)
+        } else {
+            fputs(tr("✗ AutoMount 需要 macOS 27.0 或更高版本；当前系统：\(ProcessInfo.processInfo.operatingSystemVersionString)。\n",
+                     "✗ AutoMount requires macOS 27.0 or later; current system: \(ProcessInfo.processInfo.operatingSystemVersionString).\n"), stderr)
+        }
+        exit(1)
+    }
+
     // 工作区自愈嗅探：若发现后台守护服务先一步升级，自动反哺工作区并热重启
     checkAndSyncWorkspaceFromInstalledDaemonIfNeeded()
 
@@ -2863,7 +4395,23 @@ func main() {
             manageConfiguration()
             exit(0)
         case "--install":
-            installLaunchAgent()
+            var requestedConfigLocation: InstallConfigLocation?
+            if args.count == 2 {
+                requestedConfigLocation = nil
+            } else if args.count == 4 && args[2] == "--config-source" {
+                switch args[3] {
+                case "workspace": requestedConfigLocation = .workspace
+                case "runtime": requestedConfigLocation = .runtime
+                default:
+                    fputs(tr("✗ --config-source 只接受 workspace 或 runtime。\n", "✗ --config-source accepts only workspace or runtime.\n"), stderr)
+                    exit(2)
+                }
+            } else {
+                fputs(tr("✗ --install 参数无效。用法: ./auto_mount --install [--config-source workspace|runtime]\n",
+                         "✗ Invalid --install arguments. Usage: ./auto_mount --install [--config-source workspace|runtime]\n"), stderr)
+                exit(2)
+            }
+            installLaunchAgent(requestedConfigLocation: requestedConfigLocation)
             exit(0)
         case "--uninstall":
             uninstallLaunchAgent()
@@ -2899,7 +4447,7 @@ func main() {
     // 1. 采集物理网络信息
     print(tr("[1] 评估当前底层物理网络环境...", "[1] Evaluating network environment..."))
     let currentGateway = getPhysicalGatewayInfo()
-    let currentMAC = getCurrentNetworkFingerprint()
+    let currentMAC = currentGateway.flatMap { getMACAddress(for: $0.ip, interface: $0.interface) }
 
     if let gw = currentGateway {
         print(tr("  物理网关: \(gw.ip) (网卡: \(gw.interface))", "  Physical Gateway: \(gw.ip) on \(gw.interface)"))
@@ -2919,8 +4467,8 @@ func main() {
                  "  Checking [\(idx + 1)] '\(profile.id)' (\(profile.description ?? "")):"))
 
         if let excludes = profile.excludeGatewayIPs, let gwIP = currentGateway?.ip, excludes.contains(gwIP) {
-            print(tr("    ✗ 已跳过: 网关 IP \(gwIP) 处于排除名单中 (蜂窝热点流量保护)。",
-                     "    ✗ Skipped: Gateway IP \(gwIP) is excluded (Hotspot bypass)."))
+            print(tr("    ✗ 已跳过: 网关 IP \(gwIP) 处于该策略的用户排除名单中。",
+                     "    ✗ Skipped: Gateway IP \(gwIP) is excluded by this profile's user-configured list."))
             writeLog("Profile \(profile.id) skipped: Gateway IP \(gwIP) is in exclude_gateway_ips")
             continue
         }
@@ -2941,17 +4489,18 @@ func main() {
             }
 
         case "probe_host":
-            let retries = profile.match.retryCount ?? 3
-            let interval = profile.match.retryInterval ?? 1.0
-            print(tr("    正在探测主机 \(profile.match.value) (重试窗口: \(retries) 次, 间隔: \(interval) 秒)...",
-                     "    Probing \(profile.match.value) (Retry window: \(retries) attempts, interval: \(interval)s)..."))
+            let retries = min(max(profile.match.retryCount ?? 3, 1), 10)
+            let configuredInterval = profile.match.retryInterval ?? 1.0
+            let interval = configuredInterval.isFinite ? min(max(configuredInterval, 0), 10) : 1.0
+            print(tr("    正在探测 SMB 端口 445: \(profile.match.value) (重试窗口: \(retries) 次, 间隔: \(interval) 秒)...",
+                     "    Probing SMB TCP port 445 on \(profile.match.value) (Retry window: \(retries) attempts, interval: \(interval)s)..."))
             if probeHostWithRetries(host: profile.match.value, retries: retries, interval: interval) {
-                print(tr("    ✓ 策略命中！(主机 \(profile.match.value) 可达)",
-                         "    ✓ Matched! (Host \(profile.match.value) is reachable)"))
+                print(tr("    ✓ 策略命中！(SMB 端口 445 可连接)",
+                         "    ✓ Matched! (SMB TCP port 445 is reachable)"))
                 matchedProfile = profile
             } else {
-                print(tr("    ✗ 在 \(retries) 次尝试后主机 \(profile.match.value) 依然不可达。",
-                         "    ✗ Host \(profile.match.value) unreachable after \(retries) attempts."))
+                print(tr("    ✗ 在 \(retries) 次尝试后 SMB 端口 445 仍不可连接。",
+                         "    ✗ SMB TCP port 445 remained unreachable after \(retries) attempts."))
             }
 
         default:
@@ -2976,8 +4525,9 @@ func main() {
     writeLog("Executing profile: \(profile.id)")
 
     var mountedCount = 0
+    var failedCount = 0
     for target in profile.targets {
-        print(tr("  目标: \(target.mountPath) (\(target.url))", "  Target: \(target.mountPath) (\(target.url))"))
+        print(tr("  目标: \(target.mountPath) (\(redactedSMBURL(target.url)))", "  Target: \(target.mountPath) (\(redactedSMBURL(target.url)))"))
 
         let status = ensureMountPointReady(target: target)
         switch status {
@@ -2988,15 +4538,18 @@ func main() {
 
         case .readyToMount:
             print(tr("    正在通过 NetFS 系统框架静默挂载...", "    Mounting volume via NetFS..."))
-            if silentMount(urlString: target.url) {
+            if silentMount(urlString: target.url, mountPath: target.mountPath) {
                 mountedCount += 1
                 if profile.preventSpotlightIndex ?? true {
                     disableSpotlightIndex(at: target.mountPath)
                 }
+            } else {
+                failedCount += 1
             }
 
         case .unmountFailed:
             print(tr("    ✗ 挂载点繁忙或无法清除，跳过此目标。", "    ✗ Mount point busy or cannot be cleared, skipping."))
+            failedCount += 1
         }
     }
 
@@ -3004,6 +4557,10 @@ func main() {
              "\n[DONE] \(mountedCount)/\(profile.targets.count) volumes mounted under '\(profile.id)'."))
     writeLog("Finished execution of '\(profile.id)': \(mountedCount)/\(profile.targets.count) mounted.")
     triggerBackgroundUpdateCheckIfNeeded(config: &config)
+    if failedCount > 0 {
+        writeLog("Mount evaluation failed for \(failedCount) configured target(s).")
+        exit(2)
+    }
 }
 
 main()

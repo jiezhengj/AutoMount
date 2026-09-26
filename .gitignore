@@ -6,6 +6,9 @@ auto_mount.log
 # config (local only - contains sensitive data)
 auto_mount.plist
 
+# Spec Kit governance runtime evidence
+.spec-kit-governance/
+
 # macOS
 .DS_Store
 ._*
