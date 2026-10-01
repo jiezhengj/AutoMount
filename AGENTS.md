@@ -36,36 +36,91 @@
   - **发布前强制本地构建与二进制同步**：在执行 Git 提交、推送与创建 GitHub Release 之前，必须在 macOS 27 环境下使用当前最新源码通过最高优化参数重新编译生成 `auto_mount` 可执行二进制（`/usr/bin/swiftc -O -sdk ...`），并通过全部内置自测（`--self-test`）。严禁仅更新源码而未重新构建可执行程序，Release 资源中必须包含与源码版本严格一致的预编译二进制。用户环境默认且只能基于预编译二进制运行、部署守护进程与同步，严禁在用户机器上现场动态编译源码。
   - 代码推送至 `main` 之后，必须紧随执行 `gh release create vx.y.z` 打上正式发布 Tag 并附带 Release Notes，完成终端用户自动升级的闭环。
 
+# 沟通对象与表达要求
+
+- 项目维护者不写代码、不读代码，但熟悉产品逻辑和常见技术概念（网络、MAC 地址、SMB、共享盘、Homebrew、Tailscale 等），这些词按常规使用即可，不必替换成日常比喻。
+- 面向维护者说明问题时，先讲“用户在产品运行时会看到什么现象”，再按需补充实现细节。
+- 只有实现层概念（具体函数、锁文件实现、编译参数、内部状态机等）首次出现时才用一句话解释；不要反复解释常见概念，避免为了“通俗”而降低沟通效率。
+- 需要维护者做决定时，给出现象和影响，再给出可选做法，并逐条说明每种做法的用户可见变化与风险，而不是只列技术方案名称。
+- 未实际验证或无法确认的内容必须明确标注“未验证/待确认”，不得把推断表述为结论。
+
 <!-- PROJECT-SPEC-KIT-GOVERNANCE:START -->
+# Spec Kit 项目规则
 
-# Spec Kit Governance
+## 项目规则和文件的权威来源
 
-This repository uses the committed project-local Spec Kit governance package.
+本项目使用官方 Spec Kit CLI、当前 Agent 的官方原生集成及其技能。此规则块与项目提交的 `.specify/**`、`specs/**` 和官方集成文件共同构成本项目的 Spec Kit 工作基线。目标项目 Agent 不需要也不得依赖个人全局规则或中央 Reference。
 
-Read `docs/spec-kit/START_HERE.md` before substantive engineering work.
+- `.specify/**` 和 Agent 集成文件由官方 CLI 管理；`specs/**` 中的流程产物由官方技能生成。不要重新初始化已有 `.specify/` 的项目，也不要手工覆盖 CLI 托管文件。
+- 细节以本项目当前 CLI 的实际帮助和已安装官方技能为准。若它们与本规则存在差异，先说明受影响的步骤，再按当前工具实际支持的操作处理；不得臆造替代命令或以本地仿制品替代官方能力。
 
-A conversational approval such as `the plan is acceptable` advances a direction into the upstream Spec Kit workflow; it does not authorize direct application-code edits before the current Spec Kit artifacts are aligned.
+## Spec Kit 文档语言
 
-The governance package does not edit `.specify/**`, `specs/**`, or native Agent-generated integration files.
+- 本项目 Spec Kit 流程文档语言：中文。
+- Constitution、Feature SDD、Bug Fix 和 Assessment 流程产生的新文档或实质性改写内容均使用中文；命令、路径、代码标识符、产品名和官方术语保留原文。
+- 用户在单项任务中明确指定其他语言时，按该次要求处理；用户明确更改项目默认语言时，更新本规则。
 
-Do not replace the project baseline with personal global rules or a local Reference.
+## 每个新会话的入口
 
-Project documentation language: `zh`.
+项目存在 `.specify/` 时，Agent 在首次实质性操作前只读取 `.agent-state/spec_kit_component_update_cache.json` 中的 `last_full_check`：
 
-Write new and substantively rewritten project documentation, including Spec Kit artifacts, in this language unless an explicit user or more specific project instruction overrides it. Do not translate existing documentation solely because this setting was selected.
+- 若 `status` 为 `success`，且 `checked_at_utc` 距当前不足 7×24 小时，Agent 不运行更新助手，直接开始用户任务。
+- 若记录缺失、已过期、状态不是 `success`、时间在未来或无法解析，Agent 才运行更新助手：
 
+~~~text
+Windows：python .agent-support\spec_kit_component_updater.py
+macOS/Linux：python3 .agent-support/spec_kit_component_updater.py
+~~~
+
+- 用户明确要求立即检查时，Agent 运行更新助手并加 `--recheck`。这会重新检查远端版本，不会强制覆盖文件。
+- 更新助手只在整轮检查没有失败或未知状态时写入成功时间。发现 CLI 更新但需用户批准仍视为检查完成；Agent 本次会话说明候选版本。用户批准并完成 CLI 升级后，Agent 立即再运行一次助手以检查新 CLI 对应的组件。助手无法启动或退出非零时，Agent 说明原因。
+- 若本机找不到 `specify`，Agent 询问用户是否从官方来源安装；用户拒绝时返回 `HANDOFF_TO_AGENT`。若 Python 低于 3.10 或更新助手缺失，Agent 说明检查未完成，不假称已检查。
+- 更新助手的组件范围、官方来源校验、失败处理和 CLI 交互由脚本执行；Agent 按脚本报告处理需要用户决定的事项。
+- 当前任务需要的官方集成或扩展缺失时，Agent 先询问用户是否安装；只使用当前 Agent 可用的官方原生集成，不改用 `generic`。Bug Fix 需要 `bug` 时，或用户选择 Assessment 且缺少 `assess` 时，Agent 询问是否运行对应的 `specify extension add` 命令。
+
+## 选择工作流程
+
+先按用户要达成的结果选择入口，不因任务发生在代码仓库中就自动启动 Feature SDD：
+
+| 工作目标 | 采用的流程 |
+| --- | --- |
+| 问答、只读调查、代码审查、常规维护，或不改变预期技术行为的修改 | 不启动 Spec Kit 流程，按用户要求和项目规则处理。 |
+| 用户尚未决定一个想法是否值得投入 | 可询问是否使用独立的 Assessment；它不实现代码，也不自动启动 Feature SDD。 |
+| 已有行为违反既定预期 | 使用独立的 Bug Fix 流程；不要求先运行 Feature SDD 或 Constitution。 |
+| 需要新增或明显改变预期技术能力、用户可观察行为 | 使用 Feature SDD；按下面的影响和风险标准选择短路径或完整路径。 |
+
+若缺陷修复与新增行为可以拆开，分别处理。若不能拆开，先澄清交付目标和行为预期；不得把新增行为当作缺陷修复。
+
+## Feature SDD：两种路径
+
+每个项目在首次开始 Feature SDD 前建立一次 Constitution；它是两种路径共用的项目级前置步骤，不必为每个 Feature 重做。之后每个 Feature 选择以下一条路径：
+
+| 路径 | 适用情况 | 每个 Feature 的步骤 |
+| --- | --- | --- |
+| 短路径 | 范围较小、需求清楚、风险低，且不改变外部接口、持久化数据格式、安全边界或核心架构。 | `specify → plan → tasks → implement → converge` |
+| 完整路径 | 生产级功能，或影响 API、数据格式、架构、安全、隐私，涉及多个组件，或难以回退。 | `specify → clarify → plan → checklist → tasks → analyze → implement → converge` |
+
+风险无法判断时先澄清；仍不确定时采用完整路径。每次只调用一个当前集成提供的官方技能，审阅该阶段结果后再继续。具体技能调用方式以当前 Agent 的原生集成为准。
+
+## Bug Fix：诊断、修复、验证
+
+当已有行为不符合明确的预期时，按 `assess → fix → test` 顺序使用官方 Bug Fix 技能，并在进入下一阶段前审阅当前产物。
+
+- `assess` 记录症状、复现证据、预期行为、诊断和建议修复范围；此阶段不修改源代码。诊断没有证据支持或问题并非缺陷时，不进入 `fix`。
+- `fix` 按已审阅的诊断实施修复并记录变更；这是此流程中实施源码修复的阶段。若新证据要求扩大范围，先说明并审阅偏差。
+- `test` 重做原始复现并记录验证结果；此阶段不通过修改源代码来掩盖失败。仅测试套件通过、但没有重做原始复现，不足以证明缺陷已修复。
+
+## Assessment：决定是否投入
+
+当用户尚未决定一个想法是否值得投入、且选择了评估流程时，按 `intake → research → define → shape → decide` 顺序使用官方 Assessment 技能，并逐阶段审阅证据和产物。
+
+Assessment 可以用于软件或非软件想法，不要求已有源代码，不修改源代码。`go`、`needs-clarification` 和 `kill` 都是有效结果；`go` 只表示可继续考虑，是否实施仍由用户决定。用户决定实现软件想法后，再把评估结论交给 Feature SDD；如项目尚未建立 Constitution，应在首次 Feature SDD 前建立。
+
+## 共同执行边界
+
+- Feature SDD、Bug Fix、Assessment 是三类不同工作入口；短路径和完整路径是 Feature SDD 内的两种模式。不得把三类入口串成一条强制流程。
+- 按官方 CLI 安装需要的官方集成或扩展；每个阶段使用当前集成提供的官方技能。官方能力不可用时，说明缺失内容和受影响步骤，不安装本地替代品。
+- 官方目录列出某个工作流不代表维护者审计了其 shell 内容。首次运行或更新后的首次运行前，Agent 必须检查 `.specify/workflows/<id>/workflow.yml` 中 shell 步骤的 `run` 字段；不得仅凭目录来源认定工作流安全。
+- 不增加本地自建生命周期、工作流、预设、Bundle、额外 Discovery 阶段、审批台账或任务状态机。
+- 不把未运行的 CLI 检查、技能或扩展报告为已完成；操作结果、阶段产物和验证证据须如实汇报。
 <!-- PROJECT-SPEC-KIT-GOVERNANCE:END -->
-
-<!-- PROJECT-SPEC-KIT-REFERENCE-UPDATE-CHECK:START version=1 -->
-
-# Spec Kit Reference update check
-
-This check is active only when the current Agent has loaded the global Spec Kit Policy and that Policy provides a readable `SPEC_KIT_GOVERNANCE_SOURCE` absolute path.
-
-When `.specify/` and the committed project governance package are present, run the local governance manager's read-only `check-update --source <central-reference-path>` once before the first substantive task in a new Agent session. If the Policy or source locator is absent, skip this check silently; do not scan the computer for a Reference directory.
-
-If a verified Reference update is available, run the exact hash-bound `auto-upgrade` operation without waiting for project-owner approval. The sync may update only Reference-owned governance files and this managed block; it must never edit `.specify/**`, `specs/**`, native Agent files, or business code. After the governance sync, let the upstream Spec Kit workflow decide whether any specification, plan, or task artifacts need updating.
-
-A missing source, unclean source, invalid verification, offline check, or timeout is non-blocking in normal project work and must not be presented as an available update.
-
-<!-- PROJECT-SPEC-KIT-REFERENCE-UPDATE-CHECK:END -->

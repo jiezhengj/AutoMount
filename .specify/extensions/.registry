@@ -23,7 +23,7 @@
         "speckit-assess-shape",
         "speckit-assess-decide"
       ],
-      "installed_at": "2026-09-26T10:25:13.043688+00:00"
+      "installed_at": "2026-09-28T09:03:47.362119+00:00"
     },
     "bug": {
       "version": "1.0.0",
@@ -43,24 +43,7 @@
         "speckit-bug-fix",
         "speckit-bug-test"
       ],
-      "installed_at": "2026-09-26T10:26:15.536536+00:00"
-    },
-    "governance-discovery": {
-      "version": "2.0.0",
-      "source": "local",
-      "manifest_hash": "sha256:769ef423d2f87ad2359d98d994e0e55e8550883e21b9416bb04184f48dc04395",
-      "enabled": true,
-      "priority": 10,
-      "registered_commands": {
-        "codex": [
-          "speckit.governance-discovery.discovery",
-          "speckit.governance-discovery.task-readiness",
-          "speckit.governance-discovery.cold-start-review",
-          "speckit.governance-discovery.validate"
-        ]
-      },
-      "registered_skills": [],
-      "installed_at": "2026-09-26T19:39:08.945920+00:00"
+      "installed_at": "2026-09-28T09:03:48.443966+00:00"
     }
   }
 }
