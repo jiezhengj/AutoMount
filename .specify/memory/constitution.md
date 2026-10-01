@@ -1,9 +1,10 @@
 <!-- Sync Impact Report
-Version change: placeholder scaffold → 1.0.0 (initial project constitution)
-Modified principles: all five principle placeholders were replaced with project rules.
-Added sections: Project Constraints; Development and Release Workflow.
-Removed sections: none.
-Follow-up: project maintainers must confirm the original ratification date.
+Version change: 1.0.0 → 1.1.0（MINOR：删除“分发渠道”约束）
+Modified principles: 无；五条核心原则未改动
+Added sections: 无
+Removed sections: 项目约束 → 分发渠道
+Rationale: 维护者于 2026-10-02 决定回滚既有的包管理器分发改造；宪法不再指定具体安装入口，分发方式及其更新所有者由引入该分发方式的 Feature 规格自行明确。
+Follow-up: 维护者需确认 Constitution 的首次批准日期。
 -->
 
 # 核心原则
@@ -38,10 +39,6 @@ AutoMount 面向 Apple silicon（arm64）设备和 macOS 27.0 或更高版本。
 
 SMB 凭据由 macOS 钥匙串管理；程序不得把密码写入配置或日志。自动更新默认关闭，`off` 模式不得发起后台版本检查。`notify` 和 `auto` 必须由用户明确选择，并保留清晰的失败记录和重试边界。
 
-## 分发渠道
-
-Homebrew 是主要安装入口。Homebrew 安装的文件由 Homebrew 管理；程序的更新策略不得绕过 Homebrew 直接改写其安装路径。其他分发方式及其更新所有者必须在对应 Feature 规格中明确。
-
 # 开发与发布流程
 
 ## Spec Kit 工作流
@@ -60,4 +57,4 @@ Homebrew 是主要安装入口。Homebrew 安装的文件由 Homebrew 管理；�
 
 本 Constitution 是项目持续适用的工程原则。维护者修改原则或约束时，必须说明变更范围和理由，并按 SemVer 规则递增 Constitution 版本。Feature 规格不得静默改变项目默认治理配置。产品、安全、隐私、数据保留和发布决定必须由用户明确给出，或标为待确认，不得用未声明的行业默认值替代。
 
-**版本**：1.0.0 | **批准日期**：TODO(RATIFICATION_DATE): 由维护者确认首次批准日期 | **最后修订**：2026-09-27
+**版本**：1.1.0 | **批准日期**：TODO(RATIFICATION_DATE): 由维护者确认首次批准日期 | **最后修订**：2026-10-02
