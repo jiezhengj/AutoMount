@@ -1,406 +1,154 @@
 # 产品定位
 
-AutoMount 是专为 macOS 设计的原生轻量级 SMB 自动挂载工具，支持按物理网关 MAC 和远程 SMB 服务可达性匹配网络策略。程序通过 macOS NetFS 挂载共享；已有可用钥匙串凭据时无需交互输入密码，挂载失败会返回错误并记录诊断信息。
+automnt 是专为 macOS 设计的原生轻量级 SMB 自动挂载工具，基于目标主机 TCP 445 端口可达性自动匹配网络策略并挂载共享卷宗。程序通过 macOS 原生 NetFS 框架执行挂载；已有系统钥匙串凭据时无需交互输入密码，挂载失败返回明确状态并记录诊断日志。
 
 # 核心特性
 
-- **静默后台挂载**：基于 macOS 原生 NetFS 深度系统框架调用，全后台运行，挂载过程不弹出任何 Finder 窗口，不干扰日常桌面操作。
-- **多策略优先级路由 (Profiles)**：按配置顺序检查网络策略。匹配局域网策略时使用局域网 SMB 地址；未匹配时继续检查远程 SMB 服务。
-- **物理网关 MAC 指纹识别**：程序优先从物理默认路由或 DHCP 信息确定网关与接口，再查询该接口作用域内的 ARP 邻居项。识别结果取决于 macOS 当前公开的路由和邻居信息。
-- **断网失效挂载的有界清理**：采用 Darwin 内核 `MNT_NOWAIT` 非阻塞挂载表快照。程序只切换或卸载 SMB 挂载，不会卸载占用挂载点的其他文件系统；清理使用有总时限的 `diskutil` 与 `umount -f` 子进程，无法确认前一进程退出时不会并发卸载。
-- **远程 SMB 就绪重试**：远程策略通过 TCP 445 探测 SMB 服务，并支持重试窗口（默认 3 次、间隔 1 秒），覆盖网络切换或唤醒后的短暂不可达状态。此探测检查 SMB 端口，不直接读取 Tailscale 握手状态。
-- **Spotlight 索引防护与网关排除规则**：可为策略设置用户指定的物理网关排除 IP。挂载后程序调用 `mdutil -i off` 并写入 `.metadata_never_index`，同时记录系统是否确认关闭索引。
-- **自升级与自动更新信道 (Auto-Update Channel)**：支持安全自升级机制（`--update`），通过语义化版本比对已发布的 GitHub Release。支持三种策略：`off`（默认关闭）、`notify`（每个版本提醒一次）、`auto`（自动下载并升级）。升级前完整编译源码，并在临时位置迁移配置；部署失败会恢复原文件，自动更新失败会在 15 分钟后重试。
-- **现代化终端交互向导**：基于纯原生 ANSI Raw Mode 终端交互，支持方向键移动、空格勾选、回车提交；`--init` 阶段全自动动态扫描内核已挂载 SMB 共享与 Tailscale 在线节点，支持 MagicDNS 自动映射。
-- **日常配置管理 (`--config`)**：提供一站式交互式控制中心，在同一界面内展示后台守护服务运行状态与自动更新策略，支持增删挂载目标、更新网关 MAC 与远程节点、管理更新信道，并提供自启动守护的一键安装、重载与卸载。已安装守护配置时，菜单直接读取并编辑应用程序支持目录里的配置；状态页同时显示 LaunchAgent 是否已加载和程序最近一次运行结果。
-- **终端中英双语自适应 (i18n)**：基于 macOS 系统首选语言自适应中英双语界面，并支持通过环境变量 `AUTO_MOUNT_LANG=zh|en` 显式指定语言。
-- **严格参数校验与帮助规范**：内置标准 `--help` / `-h` 帮助说明，严格拦截未知参数并给出错误提示，杜绝误操作。
-- **免 Sudo 与零外部依赖**：纯原生 Swift 语言编写，通过 macOS 自带的 Swift 运行时直接执行，无需编译配置，日常运行无需 Root/Sudo 提权。
+- **静默后台挂载**：基于 macOS 原生 NetFS 系统框架调用，全后台静默执行，挂载过程不弹出任何 Finder 窗口，不干扰日常桌面操作。
+- **目标服务可达性路由**：全面基于主机 TCP 445 端口探测（`HostReachabilityProbe`）判定网络环境，无需依赖不稳定的链路层 MAC 地址或 ARP 缓存。
+- **单用户标准安装与 CLI 自动注入**：规范安装于 `~/Library/Application Support/automnt/bin/automnt`，自动向当前用户的 Shell 配置文件（如 `.zshrc`、`.bash_profile`）注入 CLI 路径，打开终端即可全局使用 `automnt` 命令。
+- **事件驱动响应式守护**：LaunchAgent 由 macOS 系统网络配置变更事件（`WatchPaths`）触发，严格杜绝定时器（`StartInterval`）轮询，空闲时零 CPU 与能耗占用。单轮网络评估引入有限重试机制（`EvaluationRetryRunner`），从容应对网络握手延迟。
+- **断网失效挂载的有界清理**：采用 Darwin 内核 `MNT_NOWAIT` 非阻塞挂载表快照查询，杜绝 `stat()` 阻塞与系统彩虹球假死；仅对目标 SMB 挂载执行有时限的 `diskutil` 与 `umount -f` 强制清理。
+- **单一活动配置契约**：系统统一使用 `~/Library/Application Support/automnt/automnt.plist` 作为唯一的运行时配置，严格采用 `0600` 权限安全原子写入。
+- **Spotlight 索引防护**：挂载成功后自动请求 `mdutil -i off` 并尝试创建 `.metadata_never_index` 防护文件，避免网络卷宗被 Spotlight 建立索引导致性能下降。
+- **免编译预编译升级**：通过官方 GitHub Release 直接下载对应版本的预编译二进制程序，在沙箱中完成签名与版本自验后原子替换，用户系统无需安装 Xcode 或 Swift 编译工具链。
+- **安装完整性自检与自愈**：主程序启动时自动检测可执行文件、Shell 入口与守护服务状态，发现配置缺失或异常时自动触发原地自愈。
+- **纯原生零依赖**：采用纯原生 Swift 编写，构建为针对 Apple silicon 原生优化的独立二进制可执行文件，无第三方运行时依赖。
 
 # 快速上手
 
-## 运行方式
+## 系统要求
 
-项目仅支持 macOS 27.0 或更高版本的 Apple silicon（arm64），不支持 Intel Mac。仓库包含 Swift 源码 [auto_mount.swift](auto_mount.swift) 和 arm64 预编译程序 [auto_mount](auto_mount)；运行和安装守护服务都会检查系统版本与 CPU 架构。`--install` 直接部署发布包中经过最高优化编译的原生可执行二进制 `auto_mount`，无需在用户电脑上安装 Xcode 或 Command Line Tools：
+- 架构：Apple silicon（arm64）
+- 操作系统：macOS 27.0 或更高版本
 
-```bash
-cd /path/to/AutoMount
-chmod +x auto_mount
-./auto_mount
-```
+## 安装与首次运行
 
-源码运行方式：
+从 GitHub Release 下载预编译二进制 `automnt` 并运行：
 
 ```bash
-swift auto_mount.swift
+chmod +x automnt
+./automnt
 ```
 
-## 首次初始化配置 (`--init`)
+程序首次在临时或下载目录运行时，将自动执行自搬迁与环境初始化：
+1. 规范安装至 `~/Library/Application Support/automnt/bin/automnt`；
+2. 清理原下载临时文件；
+3. 向当前用户的 Shell 配置注入路径；
+4. 提示在新终端窗口中直接运行 `automnt`。
 
-首次使用时，请确保已在 Finder 中通过“连接服务器 (`Cmd + K`)”成功连接过目标 NAS 卷宗并勾选了“在钥匙串中记住密码”。
+## 从旧版本 (2.7.4) 升级
 
-连接家庭网络后，运行初始化命令。只有工作区和守护目录都没有可用配置时才会启动向导；已有可用配置会被保留：
+3.0.0 采用全新的单活动配置与事件驱动架构，不提供从 2.7.4 旧形态的原地升级路径。既有旧版本使用者请按以下步骤迁移：
+
+1. 在旧环境中使用 2.7.4 原程序提供的卸载命令执行完整清理：
+   ```bash
+   ./<旧版程序> --uninstall
+   ```
+2. 下载 3.0.0 预编译程序并运行首次安装：
+   ```bash
+   chmod +x automnt
+   ./automnt
+   ```
+3. 运行初始化向导重新生成规范配置：
+   ```bash
+   automnt --init
+   ```
+
+> [!NOTE]
+> 3.0.0 遵循纯粹单一模型架构，旧配置不会被沿用，请在向导中重新勾选或录入当前挂载目标。
+
+## 初始化配置 (`automnt --init`)
+
+首次使用前，请确保已在 Finder 中通过“连接服务器 (`Cmd + K`)”成功连接过目标 NAS 共享卷宗，并在提示时勾选了“在钥匙串中记住此密码”。
+
+运行交互式初始化向导：
 
 ```bash
-./auto_mount --init
+automnt --init
 ```
 
-向导分五步完成首次配置：
-
-1. **[1/5] 自动提取物理网关 MAC 地址**：显示当前路由器的物理指纹供确认，允许输入自定义 MAC 覆盖（不可留空，作为网络环境匹配条件）。
-2. **[2/5] 动态扫描当前 SMB 挂载卷宗**：内核检测到已挂载的 SMB 卷宗后，呈现 ANSI 复选框供上下移动（`↑`/`↓` 或 `k`/`j`）与空格（`Space`）多选；**允许直接按回车留空跳过**（即在局域网内不自动挂载任何卷宗，仅以此局域网作为外出判定的排他条件）；若进行手动录入，本地挂载路径支持按回车自动采纳推导默认值（如 `/Volumes/<共享名>`）。
-3. **[3/5] 动态探测 Tailscale 在线节点**：自动调用 `tailscale status --json` 获取节点列表并展示单选列表；若未检测到在线节点直接友好跳过；若选中目标设备，支持自动映射局域网共享、或一键勾选已挂载项、或输入共享名由系统自动组装并推导挂载路径。
-4. **[4/5] 软件更新策略配置 (Auto-Update Policy)**：选择自动更新信道（`1. off` 默认、`2. notify`、`3. auto`），直接按回车自动选择 `off`，零外部网络请求。
-5. **[5/5] 保存配置并部署后台守护**：生成 `auto_mount.plist`，并询问是否注册 LaunchAgent（默认 `Y`，按回车部署并启动）。
-
-交互式终端复选框操作说明：
-- `↑` / `k`：向上移动光标
-- `↓` / `j`：向下移动光标
-- `Space`：翻转当前选项选择状态 (`[●]` / `[ ]`)
-- `a`：全选 / 取消全选
-- `Enter`：提交当前选择（或直接回车跳过）
-- `Ctrl + C`：优雅退出并恢复终端状态
+向导包含以下步骤：
+1. **[1/4] 动态扫描当前系统已挂载的 SMB 卷宗**：内核检测到活动挂载后，呈现终端交互式复选框供空格（`Space`）多选；系统将自动从选中的目标提取主机名作为策略探测目标。
+2. **[2/4] 动态探测 Tailscale 在线节点**：若系统运行 Tailscale，将自动列出在线节点供选择，便于配置异地远程互联访问。
+3. **[3/4] 软件更新策略设置**：选择自动更新信道（`off` 手动更新、`notify` 仅通知、`auto` 后台自动升级），默认推荐 `off`。
+4. **[4/4] 保存配置并部署后台守护服务**：生成 `automnt.plist`，并自动注册基于网络事件驱动的 LaunchAgent 后台守护服务。
 
 > [!IMPORTANT]
 > **注意：`--init` 默认保护现有配置**
-> - 若工作区或守护目录中已有可用配置，`--init` 会保留配置并提示使用 `--config` 或 `--install`；不会悄悄启动全新向导。
-> - 只有明确运行 `./auto_mount --init --reset` 才会从头重建工作区配置。写入前会在原目录创建权限为 `0600` 的时间戳备份。
-> - 在“选择家庭局域网挂载目标”步骤中，若直接按回车跳过，代表**将该策略的挂载目标设为空列表；策略命中后本轮评估会结束，且原有挂载目标不会被保留**。
-> - 若已有配置且仅需保留原有挂载项目并增删目标、更新网关 MAC 或调整远程节点，请使用 `./auto_mount --config`。
+> - 若已有可用配置，`automnt --init` 会自动保留现有配置。
+> - 若需清空并从头重建配置，请明确执行 `automnt --init --reset`。写入前系统会自动生成带时间戳的 `.bak` 备份。
 
-## 日常配置管理 (`--config`)
+## 日常配置管理 (`automnt --config`)
 
-日常如需新增挂载目录、删除已停用卷宗、或更换了家庭路由器，直接运行日常配置管理命令即可在保留既有配置的基础上进行维护。已有可用配置时，`--init` 默认不会覆盖它：
+日常如需新增共享挂载点、调整探测主机或修改更新信道，运行配置管理菜单：
 
 ```bash
-./auto_mount --config
+automnt --config
 ```
 
-终端将弹出交互式一站式控制中心：
+终端将弹出交互式控制台，支持：
+- 📁 **挂载目标管理**：批量导入活动挂载、手动录入 SMB 地址与本地挂载路径、勾选删除现有目标；
+- 🚦 **网络策略管理**：调整策略优先级、修改探测主机与端口、设置重试策略；
+- ⚙️ **守护服务管理**：查看 LaunchAgent 加载状态与日志、一键重新加载服务；
+- 🔄 **自动更新设置**：切换更新信道、立即检查最新版本。
 
-普通工作区命令读取可执行文件旁的配置。LaunchAgent 已安装时，`--config` 管理它实际使用的 `~/Library/Application Support/AutoMount/auto_mount.plist`，即使服务当前未运行。如果该配置缺失或损坏而工作区配置有效，程序会先备份不可用文件，再恢复守护配置；两边都没有可用配置时会进入交互式向导。两份配置都有效但内容不同，`--config` 保留并管理守护配置，同时提示差异。首次安装时，`--install` 从工作区初始化守护配置；重装时若两份有效配置不同，交互运行询问来源，非交互运行默认保留守护配置。明确选择 `--config-source workspace` 会在覆盖前备份守护配置。配置恢复写入前会重新核对来源和目标文件快照，避免静默覆盖并发改动。版本高于当前程序的配置不会自动覆盖；文件无法读取或备份时，安装会停止且不注册服务。
+# 命令行接口规范
 
 ```text
-Auto Mount Tool - 日常配置管理 (v2.7.2)
-====================================
+使用方法:
+  automnt                     评估网络策略并挂载匹配目标
+  automnt --init              安全初始化；已有可用配置时不覆盖
+  automnt --init --reset      备份现有配置并从头重建向导
+  automnt --config            日常交互式配置管理控制台
+  automnt --install           部署/修复后台挂载守护服务与 CLI 入口
+  automnt --uninstall         移除后台守护服务与 CLI 入口（保留用户配置）
+  automnt --uninstall --purge 全量卸载清理（包括守护、CLI、配置文件与日志）
+  automnt --status            查看服务运行状态与当前挂载详情
+  automnt --update            检查并升级软件至最新版本（下载预编译二进制）
+  automnt --self-test         运行完整自动化测试套件
+  automnt --version, -v       查看当前软件版本号
+  automnt --help, -h          显示帮助说明
 
-当前已配置策略流水线 (自顶向下顺序评估，首次命中即执行)：
-  [1] [局域网] local_lan (本地局域网高速直连) - 0 个挂载目标 (命中后结束策略评估)
-  [2] [远程] remote_network (远程互联 (NAS)) - 2 个挂载目标
-      • /Volumes/documents <- smb://nas.example.ts.net/documents
-      • /Volumes/media <- smb://nas.example.ts.net/media
-
-软件版本: v2.7.2 | 自动更新信道: auto (后台静默自动升级)
-后台守护服务状态: 已加载，当前空闲等待触发；守护配置存在 (gui/<uid>)
-
-请选择操作模块：
-  [●] 📁 挂载目标管理 (批量导入活动挂载、手动添加目标、批量勾选删除)
-  [ ] 🚦 网络策略管理 (调整优先级顺序、新建策略、修改触发规则、删除策略)
-  [ ] ⚙️ 守护服务管理 (部署自启动守护、查看详细运行状态、卸载服务)
-  [ ] 🔄 自动更新设置 (切换自动更新策略、立即检查并升级)
-  [ ] 🚪 退出配置管理
-(↑/↓ 移动光标，Enter 选定确认，Esc 取消)
-```
-
-每次配置修改都会原子写入当前配置文件；已安装 LaunchAgent 时，程序会尝试同步到其运行目录。若同步失败，程序会报告错误，守护服务继续使用运行目录中已有的配置。
-
-## 部署开机与切网自动守护 (`--install`)
-
-如果未在 `--init` 向导结尾部署守护，或需要单独管理后台服务，可使用以下独立命令（也可直接在 `./auto_mount --config` 菜单选项 `[5]` 中操作）：
-
-```bash
-# 一键安装并启用 LaunchAgent 守护服务 (免 sudo)
-./auto_mount --install
-
-# 查看自启动服务状态与卷宗挂载情况
-./auto_mount --status
-
-# 检查并升级软件至最新版本 (完整编译预检)
-./auto_mount --update
-
-# 移除自启动服务与部署文件
-./auto_mount --uninstall
-
-# 查看命令行帮助与环境变量说明
-./auto_mount --help
-```
-
-`--install` 直接将工作区中已编译好的命令行程序 `auto_mount`（以及可选的源码 `auto_mount.swift`）原子部署至 `~/Library/Application Support/AutoMount`。首次安装时从工作区复制配置；两份都没有有效配置时，交互式安装会先运行配置向导，再继续安装，非交互安装会在注册服务前失败。重装时比较配置内容（忽略版本号和守护更新检查状态）；两份有效配置不同时，交互安装询问来源，非交互安装默认保留守护配置。若守护配置损坏且工作区配置有效，程序会先将损坏文件备份，再恢复配置并继续安装。`--install --config-source workspace` 可明确用工作区配置替换守护配置，替换前会备份原文件；`--install --config-source runtime` 明确选择守护配置。高于当前程序版本的配置不会被自动降级覆盖，无法读取或备份配置时也不会重载或注册服务。LaunchAgent 直接执行已部署的原生二进制 `auto_mount`。登录、网络配置变化、守护配置变化和每 60 秒间隔都会触发一次策略评估，以便网络就绪较晚时重试。
-
-要运行网络验收，可执行 `./auto_mount --self-test --network --remote-smb`。`--remote-smb` 会读取当前配置的远程策略；若 Tailscale 状态中存在匹配节点，它会用该节点的 Tailscale 地址进行实挂测试，避免家中 DNS 把测试流量送回局域网。每个 SMB 共享都会临时挂载到用户缓存目录，核对挂载源后卸载。自测会把当前进程拿不到 ARP 输出的检查标记为 `SKIP`，不会算作通过。
-
-# 配置规范
-
-配置文件位于 `auto_mount.plist`，采用标准 Apple 属性列表（XML）格式。多策略路由结构示例如下：
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>version</key>
-    <string>2.7.2</string>
-    <key>update_channel</key>
-    <string>off</string>
-    <key>profiles</key>
-    <array>
-        <!-- 策略 1: 本地局域网直连 (基于物理网关 MAC 指纹) -->
-        <dict>
-            <key>id</key>
-            <string>local_lan</string>
-            <key>description</key>
-            <string>本地局域网高速直连</string>
-            <key>match</key>
-            <dict>
-                <key>type</key>
-                <string>gateway_mac</string>
-                <key>value</key>
-                <string>00:11:22:33:44:55</string>
-            </dict>
-            <key>prevent_spotlight_index</key>
-            <true/>
-            <key>targets</key>
-            <array>
-                <dict>
-                    <key>mount_path</key>
-                    <string>/Volumes/documents</string>
-                    <key>url</key>
-                    <string>smb://nas.local/documents</string>
-                </dict>
-                <dict>
-                    <key>mount_path</key>
-                    <string>/Volumes/media</string>
-                    <key>url</key>
-                    <string>smb://nas.local/media</string>
-                </dict>
-            </array>
-        </dict>
-
-        <!-- 策略 2: 远程异地互联 (Tailscale / WireGuard / 动态域名 / IP) -->
-        <dict>
-            <key>id</key>
-            <string>remote_network</string>
-            <key>description</key>
-            <string>远程异地互联通道</string>
-            <key>match</key>
-            <dict>
-                <key>type</key>
-                <string>probe_host</string>
-                <key>value</key>
-                <string>nas.example.ts.net</string>
-                <key>retry_count</key>
-                <integer>3</integer>
-                <key>retry_interval</key>
-                <real>1.0</real>
-            </dict>
-            <!-- 示例地址仅用于说明字段格式，请输入用户实际要排除的网关 IP -->
-            <key>exclude_gateway_ips</key>
-            <array>
-                <string>192.0.2.1</string>
-            </array>
-            <key>prevent_spotlight_index</key>
-            <true/>
-            <key>targets</key>
-            <array>
-                <dict>
-                    <key>mount_path</key>
-                    <string>/Volumes/documents</string>
-                    <key>url</key>
-                    <string>smb://nas.example.ts.net/documents</string>
-                </dict>
-                <dict>
-                    <key>mount_path</key>
-                    <string>/Volumes/media</string>
-                    <key>url</key>
-                    <string>smb://nas.example.ts.net/media</string>
-                </dict>
-            </array>
-        </dict>
-    </array>
-</dict>
-</plist>
-```
-
-### 字段释义表
-
-| 字段 | 类型 | 说明 |
-| :--- | :--- | :--- |
-| `version` | String | 规范版本号，与软件版本保持全局严格对齐（如 `2.7.2`）。程序读取配置时会自动升级配置并写回。 |
-| `update_channel` | String | 软件自动更新策略，可选值为 `off`（关闭，默认）、`notify`（通知提醒）、`auto`（自动静默热升级）。 |
-| `last_update_check_timestamp` | Real | 最近一次更新检查尝试的 Unix 时间戳；无失败重试时，常规检查间隔为 24 小时。 |
-| `update_retry_after_timestamp` | Real | 后台检查或自动部署失败后的重试时间；到期后会绕过 24 小时正常间隔重新尝试。 |
-| `last_notified_version` | String | 已发送通知的最新远端版本号，确保同一版本最多仅提醒 1 次防打扰。 |
-| `profiles` | Array | 策略规则列表。按数组先后顺序从上至下进行优先级匹配，一旦首个策略命中并执行，立即终止后续检查。 |
-| `id` | String | 策略唯一标识（如 `local_lan`, `remote_network`）。读取配置时，程序会将已支持的旧 ID（`home_lan`, `tailscale_remote`）迁移为当前名称。 |
-| `description` | String | 策略的人类可读描述信息。 |
-| `match.type` | String | 匹配类型：`gateway_mac`（物理网关 MAC 匹配）或 `probe_host`（探测 SMB TCP 端口 445）。 |
-| `match.value` | String | 匹配目标：网关 MAC 地址（不区分大小写）或探测的主机名/MagicDNS 域名/IP。 |
-| `match.retry_count` | Integer | `probe_host` 模式下的重试次数（默认 3 次）。 |
-| `match.retry_interval` | Real | `probe_host` 模式下每次探测的间隔秒数（默认 1.0 秒）。 |
-| `exclude_gateway_ips` | Array | 用户指定的物理网关 IP 列表。若当前物理网关命中该列表，程序跳过该策略；默认不排除任何网关。 |
-| `prevent_spotlight_index` | Boolean | 挂载成功后是否自动阻断 Spotlight 建立索引（默认为 `true`）。 |
-| `targets` | Array | 该策略下需要挂载的 SMB 卷宗列表。 |
-| `targets[].url` | String | SMB 协议完整连接串（如 `smb://nas.local/share`）。 |
-| `targets[].mount_path` | String | 本地预期挂载点绝对路径（如 `/Volumes/share`）。 |
-
-# 日常维护
-
-## 查看运行状态与挂载详情
-
-随时可通过 `--status` 选项查看当前网络环境识别结果、底层物理网关详情与各策略挂载状态：
-
-```bash
-./auto_mount --status
-```
-
-输出内容包括：
-- 当前活跃物理网络接口与网关 IP/MAC
-- LaunchAgent 守护服务运行状态
-- 各 Profiles 策略的匹配规则与挂载点挂载来源
-- 软件版本与当前自动更新信道
-
-## 软件检查与自升级 (`--update`)
-
-随时可以通过 `--update` 子命令主动检查并升级 AutoMount：
-
-```bash
-./auto_mount --update
-```
-
-升级流程包含以下检查和更新步骤：
-1. **Release 与版本检查**：只查询 GitHub 已发布的最新 Release；单纯推送 commit 不会触发用户更新。Release 版本必须高于当前版本，且 tag 下的源码内版本号必须与 Release tag 一致。
-2. **工作区与运行目录版本同步**：
-   - **工作区到运行目录**：从工作区执行 `--update` 时，程序更新已有的工作区和运行目录文件；已加载的 LaunchAgent 保持运行，并在配置变化触发或不超过 60 秒的下次启动时读取新文件；
-   - **运行目录到工作区**：工作区命令检测到已安装版本更新时，会在工作区允许同步的情况下同步程序、更新源码并迁移配置。
-3. **配置迁移**：配置先复制到临时文件，再由新程序迁移。只有程序和所有目标配置均准备成功后才部署；迁移失败时原文件不变。
-4. **完整编译与回滚**：下载源码先完整编译。程序、源码和配置作为一组替换；任一文件替换失败时会恢复已替换的文件。
-5. **守护进程继续运行**：升级不会从当前守护进程中调用 `launchctl bootout`。LaunchAgent 使用固定的运行目录路径，新的程序文件会在配置变化触发或不超过 60 秒的下次启动时生效；升级不会强制启动原本未加载的服务。
-
-## 查看软件版本 (`--version`, `-v`)
-
-通过 `--version` 或 `-v` 选项可直接输出纯文本版本号，适用于脚本自动化集成与环境检查：
-
-```bash
-./auto_mount --version
-```
-
-
-## 审计日志
-
-程序运行记录保存在可执行文件所在目录下的 `auto_mount.log` 中。仅记录网络匹配变更、挂载状态切换与异常错误，避免日志冗余：
-
-```bash
-tail -f ~/Library/Application\ Support/AutoMount/auto_mount.log
-```
-
-## LaunchAgent 维护命令
-
-如需手动控制系统的 `launchd` 守护服务，可使用以下原生命令：
-
-```bash
-# 检查服务是否已加载注册
-launchctl list | grep auto-mount
-
-# 手动触发一次挂载评估
-launchctl start com.user.auto-mount
-
-# 停止服务
-launchctl stop com.user.auto-mount
+环境变量:
+  AUTOMNT_LANG=zh|en          显式指定终端界面语言（默认自适应系统语言）
 ```
 
 # 技术原理
 
-## 1. 物理层网络指纹探测
+## 主机服务端口探测 (HostReachabilityProbe)
 
-AutoMount 不读取 Wi-Fi SSID。它优先从系统 IPv4 默认路由中选择物理以太网接口；如果当前默认路由走虚拟接口，则尝试从物理接口的 DHCP 信息读取网关，再查询该接口作用域内的 ARP 邻居项。识别结果依赖 macOS 当前提供的路由、DHCP 和 ARP 信息，网络服务或 VPN 配置可能影响探测结果。
+系统采用非阻塞式 TCP Socket 连接探测指定目标主机（如 NAS 或服务器）的 445 端口：
+- 对局域网或远程节点发送连接请求并设定有界超时（默认 1000 毫秒）；
+- 端口可连接即判定该策略处于可达网络环境中；
+- 连接被拒绝、主机不可达或超时即判定该网络策略未命中，继续向下评估下一策略。
 
-## 2. 内核非阻塞查询与超时强制清理机制
+## 事件驱动守护与自愈
 
-网络切换或唤醒后，已有 SMB 挂载可能暂时无响应。程序通过 Darwin `getmntinfo(..., MNT_NOWAIT)` 检查内核挂载表，避免为该次检查主动访问远程文件系统。
+- **网络事件监听**：LaunchAgent 配置文件注册 `WatchPaths` 监听 `/Library/Preferences/SystemConfiguration`，当网络发生切换（如从 Wi-Fi 切换到有线、连接/断开 VPN 等）时由 launchd 唤起执行。
+- **重试调度**：唤起后通过 `EvaluationRetryRunner` 在指定时间窗口内进行有限重试，当网络握手建立后立即执行挂载；若重试窗口结束仍无任何策略命中，以退出码 `2` 静默退出，杜绝无限空转。
+- **自动自愈**：主程序启动时读取 `InstallState`，若发现 LaunchAgent 缺失、配置失效或 Shell 入口被清理，自动进行无感自愈修复。
 
-AutoMount 采用以下两级防护：
-1. **非阻塞挂载表检查**：使用 `getmntinfo(..., MNT_NOWAIT)` 读取内核挂载表快照，避免为此检查向远端文件系统发起文件操作。
-2. **有总时限的 SMB 清理**：若配置路径上的 SMB 来源失效或与目标共享不同，程序先执行 `diskutil unmount force <mountPath>`，失败时在剩余时限内尝试 `umount -f <mountPath>`。程序会终止超时子进程；无法确认前一进程已退出时，不会并发启动下一种卸载操作。其他类型的挂载会保留并报告冲突。
+## 内核挂载表非阻塞扫描
 
-## 3. NetFS 静默挂载核心
-
-程序调用 macOS 内部核心框架 `NetFS.framework` 中的 `NetFSMountURLSync` API：
+为杜绝网络中断时标准文件系统调用 `stat()` 或 `FileManager` 造成的进程阻塞假死，automnt 采用 Darwin 原生内核接口：
 
 ```swift
-var mountPoints: Unmanaged<CFArray>?
-let openOptions = NSMutableDictionary()
-openOptions[kNAUIOptionKey as String] = kNAUIOptionNoUI as String
-let mountOptions = NSMutableDictionary()
-if mountpointURL != nil {
-    mountOptions[kNetFSMountAtMountDirKey as String] = true
-}
-let status = NetFSMountURLSync(
-    url as CFURL,
-    mountpointURL,
-    nil,
-    nil,
-    openOptions as CFMutableDictionary,
-    mountOptions.count > 0 ? mountOptions as CFMutableDictionary : nil,
-    &mountPoints
-)
+let count = getfsstat(nil, 0, MNT_NOWAIT)
 ```
 
-片段中的 `url` 和 `mountpointURL` 是经过校验的输入。标准 `/Volumes/<共享名>` 路径尚不存在时，`mountpointURL` 为 `nil`，由 NetFS 创建挂载目录；其他目标传入指定路径，并设置 `kNetFSMountAtMountDirKey`，避免 NetFS 把共享放在目标目录的子目录中。程序将用户名与密码参数留空，并设置 NetAuth 无交互选项。macOS 可使用当前用户已有的钥匙串 SMB 凭据；如果没有可用凭据，挂载会失败并记录诊断信息，不会弹出凭据输入框。
+使用 `MNT_NOWAIT` 标志位直接从内核缓存中读取挂载快照，无论底层网络是否断开，调用均在微秒级立即返回。
 
-# 常见问题
+## 卸载与清理
 
-### Q: 开启 Clash 等代理的 TUN 模式后提示无法解析或连接失败？
+- 常规卸载：
+  ```bash
+  automnt --uninstall
+  ```
+  停止并注销 LaunchAgent 守护服务，从当前 Shell 配置文件中移除注入的 PATH 片段。用户的 `automnt.plist` 配置文件及日志目录被完整保留。
 
-启用代理 TUN 后，系统默认路由可能经过虚拟接口。AutoMount 会尝试回退到物理接口的 DHCP 网关信息，但该信息不可用时，状态页会显示网关或 MAC 未检测到。远程 SMB 连接失败时，也请检查代理规则和目标主机的 DNS 解析。
-
-**解决方案**：在代理客户端的配置文件规则中，将 NAS 的域名（如 `*.local` 或特定的内网主机名）加入直连规则（Direct / Bypass）。例如添加规则：`DOMAIN-SUFFIX,local,DIRECT`。
-
-### Q: 为什么使用 Tailscale 时推荐 MagicDNS 域名而非虚拟 IP？
-
-Tailscale MagicDNS 域名（如 `nas.example.ts.net`）可提供稳定的主机名，便于多个网络环境复用同一 SMB 地址和对应的钥匙串条目。域名解析仍依赖 Tailscale 与系统 DNS 当前状态。
-
-### Q: 提示挂载失败或没有权限？
-
-1. 请先在 Finder 中按下快捷键 `Cmd + K`，输入目标 SMB 完整地址（例如 `smb://nas.local/share`），在弹出的凭据认证窗口中输入用户名和密码，并务必勾选**“在我的钥匙串中记住此密码”**。
-2. 确保在 Finder 中能够正常浏览该卷宗内容后，AutoMount 即可在后台静默完成免密挂载。
-
-### Q: 更换了家里的路由器或光猫后无法自动挂载？
-
-由于路由器的物理 MAC 地址发生了改变，只需在家庭网络下运行一次配置更新命令即可：
-
-```bash
-./auto_mount --config
-```
-
-在菜单中选择 `[4] 更新家庭网关 MAC`，程序将自动捕获新网关的 MAC 指纹并保存生效。
-
-### Q: 运行 `--init` 与 `--config` 有何本质区别？在 `--init` 中直接按回车跳过挂载目标会发生什么？
-
-- **`--init`（安全初始化）**：没有可用配置时启动向导；已存在可用配置时保留它并提示下一步。需要从零重建工作区配置时运行 `./auto_mount --init --reset`，程序会先备份旧文件。挂载目标步骤直接按回车会把该策略的目标列表设为空（`targets: []`），策略命中后本轮评估会结束且不执行挂载。
-- **`--config`（日常增量维护）**：用于日常配置维护。它会首先完整载入并保留当前系统的有效配置，支持增量添加新挂载项、选择性删除指定挂载项、重新探测网关 MAC 或更新远程节点，修改完成后才写回磁盘并自动热同步至后台守护进程。日常维护务必使用 `--config`。
-
-### Q: 更新了工作区代码后，后台运行的守护服务如何同步更新？
-
-当您在本地拉取了 Git 最新代码或手动修改了工作区文件后，有两种方式让后台守护服务同步生效：
-1. 运行 `./auto_mount --install`：程序会部署工作区最新代码。首次安装会从工作区初始化守护配置；重装时若配置不同，交互运行会询问来源，非交互运行默认保留守护配置。需要覆盖时运行 `./auto_mount --install --config-source workspace`。
-2. 若启用了自动更新信道（`auto`）或运行了 `./auto_mount --update`：升级器会先验证源码和配置，再更新程序与配置；后台服务会在配置变化触发或不超过 60 秒的下次启动时读取新版本。
-
-### Q: 软件更新是否会产生未经授权的后台网络请求？
-
-AutoMount 遵循严格的隐私保护与确定性原则：
-- **默认策略为 `off`**：后台不会自动检查版本；需要检查时，可运行 `./auto_mount --update`。
-- **通知与自动模式的检查间隔**：成功查询后，常规检查间隔为 24 小时。网络、下载或部署失败会保存 15 分钟后的重试时间，避免每分钟重复请求，也不会因一次失败停更 24 小时。
-
-### Q: `notify` 模式的提醒频次和上限是怎样的？是否会频繁弹窗打扰？
-
-`notify` 模式具备双重防打扰与限频设计：
-1. **常规检查间隔**：成功检查后 24 小时内不重复查询；检查失败时 15 分钟后重试；
-2. **单版本仅提醒 1 次**：配置文件中持久化记录 `last_notified_version`。发现新版本并发送 1 次系统通知横幅后，该版本将不再重复提醒，绝不疲劳轰炸，直到官方发布了更新的版本才会再次提醒。
-
-### Q: 升级软件后配置文件是否需要手动修改？是否需要重新运行 `--init`？
-
-已有配置仍可使用，无需仅为软件升级重新运行 `--init`。程序在启动时会自动扫描并分别升级所有可见配置文件（包括工作区与守护运行目录配置），更新配置版本、填入默认值、迁移支持的策略 ID 与描述，并保留配置中未识别的扩展字段与各自原有设置。安装守护服务后，`--config` 会读取并编辑应用程序支持目录中的运行配置。
-
-# 许可证
-
-MIT License
+- 全量清理：
+  ```bash
+  automnt --uninstall --purge
+  ```
+  在常规卸载的基础上，彻底删除 `~/Library/Application Support/automnt` 及 `~/Library/Logs/automnt` 目录。

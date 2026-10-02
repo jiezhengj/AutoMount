@@ -1,10 +1,10 @@
 # logs
-auto_mount.log
+automnt.log
 *.log
 *.bak
 
 # config (local only - contains sensitive data)
-auto_mount.plist
+automnt.plist
 
 # macOS
 .DS_Store
