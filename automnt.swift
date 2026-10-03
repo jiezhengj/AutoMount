@@ -47,6 +47,14 @@ func tr(_ zh: String, _ en: String) -> String {
 }
 
 var configURLOverride: URL?
+var isTTYOverride: Bool?
+
+func isInteractiveTerminal() -> Bool {
+    if let override = isTTYOverride {
+        return override
+    }
+    return isatty(STDIN_FILENO) != 0
+}
 
 func getActiveInstalledDir() -> URL {
     let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -209,7 +217,7 @@ func runCommandDiscardingOutputWithTimeout(
 
 // MARK: - 版本与数据结构定义
 
-let automntVersion = "3.0.0"
+let automntVersion = "3.1.0"
 let minimumSupportedMacOSMajorVersion = 27
 let minimumSupportedMacOSVersion = "\(minimumSupportedMacOSMajorVersion).0"
 let githubRepo = "jiezhengj/automnt"
@@ -239,6 +247,126 @@ struct RetryPolicy: Codable, Equatable {
         case maxAttempts = "max_attempts"
         case intervalMs = "interval_ms"
         case maxTotalWindowMs = "max_total_window_ms"
+    }
+}
+
+// MARK: - SMB URL 与标准挂载点推导 (SSOT)
+
+func extractShareName(from urlString: String) -> String? {
+    let clean = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+    let componentInput = clean.hasPrefix("//") ? "smb:\(clean)" : clean
+    guard let components = URLComponents(string: componentInput),
+          let host = components.host, !host.isEmpty else {
+        return nil
+    }
+    let rawPath = components.percentEncodedPath
+    let segments = rawPath.split(separator: "/").filter { !$0.isEmpty }
+    guard let share = segments.first else { return nil }
+    let decoded = String(share).removingPercentEncoding ?? String(share)
+    return decoded.isEmpty ? nil : decoded
+}
+
+func deriveStandardMountPoint(from urlString: String) -> String? {
+    guard let shareName = extractShareName(from: urlString) else { return nil }
+    return "/Volumes/\(shareName)"
+}
+
+// MARK: - 核心配置实体 (v3.1.0 规范与向下兼容桥接)
+
+struct SMBShareConfig: Codable, Equatable {
+    var name: String
+    var smbURL: String
+    var mountPoint: String
+    var enabled: Bool = true
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case smbURL = "smb_url"
+        case mountPoint = "mount_point"
+        case enabled
+    }
+
+    init(name: String, smbURL: String, mountPoint: String, enabled: Bool = true) {
+        self.name = name
+        self.smbURL = smbURL
+        self.mountPoint = mountPoint
+        self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.smbURL = try container.decode(String.self, forKey: .smbURL)
+        self.mountPoint = try container.decode(String.self, forKey: .mountPoint)
+        self.enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(smbURL, forKey: .smbURL)
+        try container.encode(mountPoint, forKey: .mountPoint)
+        try container.encode(enabled, forKey: .enabled)
+    }
+}
+
+struct HostConfig: Codable, Equatable {
+    var host: String
+    var alias: String?
+    var port: Int = 445
+    var timeoutMs: Int = 1000
+    var preventSpotlightIndex: Bool = true
+    var enabled: Bool = true
+    var shares: [SMBShareConfig] = []
+
+    enum CodingKeys: String, CodingKey {
+        case host
+        case alias
+        case port
+        case timeoutMs = "timeout_ms"
+        case preventSpotlightIndex = "prevent_spotlight_index"
+        case enabled
+        case shares
+    }
+
+    init(
+        host: String,
+        alias: String? = nil,
+        port: Int = 445,
+        timeoutMs: Int = 1000,
+        preventSpotlightIndex: Bool = true,
+        enabled: Bool = true,
+        shares: [SMBShareConfig] = []
+    ) {
+        self.host = host
+        self.alias = alias
+        self.port = port
+        self.timeoutMs = timeoutMs
+        self.preventSpotlightIndex = preventSpotlightIndex
+        self.enabled = enabled
+        self.shares = shares
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.host = try container.decode(String.self, forKey: .host)
+        self.alias = try container.decodeIfPresent(String.self, forKey: .alias)
+        self.port = try container.decodeIfPresent(Int.self, forKey: .port) ?? 445
+        self.timeoutMs = try container.decodeIfPresent(Int.self, forKey: .timeoutMs) ?? 1000
+        self.preventSpotlightIndex = try container.decodeIfPresent(Bool.self, forKey: .preventSpotlightIndex) ?? true
+        self.enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.shares = try container.decodeIfPresent([SMBShareConfig].self, forKey: .shares) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(host, forKey: .host)
+        try container.encodeIfPresent(alias, forKey: .alias)
+        try container.encode(port, forKey: .port)
+        try container.encode(timeoutMs, forKey: .timeoutMs)
+        try container.encode(preventSpotlightIndex, forKey: .preventSpotlightIndex)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(shares, forKey: .shares)
     }
 }
 
@@ -342,7 +470,8 @@ struct AutomntConfig: Codable, Equatable {
     var lastUpdateCheckTimestamp: Double?     // 更新检查最近一次尝试时间戳
     var updateRetryAfterTimestamp: Double? = nil
     var lastNotifiedVersion: String?          // 单版本仅提醒 1 次防打扰
-    var profiles: [NetworkProfile]
+    var hosts: [HostConfig] = []
+    var profiles: [NetworkProfile] = []
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -351,7 +480,54 @@ struct AutomntConfig: Codable, Equatable {
         case lastUpdateCheckTimestamp = "last_update_check_timestamp"
         case updateRetryAfterTimestamp = "update_retry_after_timestamp"
         case lastNotifiedVersion = "last_notified_version"
+        case hosts
         case profiles
+    }
+
+    init(
+        version: String = automntVersion,
+        updateChannel: String? = "off",
+        retryPolicy: RetryPolicy? = RetryPolicy(),
+        lastUpdateCheckTimestamp: Double? = nil,
+        updateRetryAfterTimestamp: Double? = nil,
+        lastNotifiedVersion: String? = nil,
+        hosts: [HostConfig] = [],
+        profiles: [NetworkProfile] = []
+    ) {
+        self.version = version
+        self.updateChannel = updateChannel
+        self.retryPolicy = retryPolicy
+        self.lastUpdateCheckTimestamp = lastUpdateCheckTimestamp
+        self.updateRetryAfterTimestamp = updateRetryAfterTimestamp
+        self.lastNotifiedVersion = lastNotifiedVersion
+        self.hosts = hosts
+        self.profiles = profiles
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.version = try container.decode(String.self, forKey: .version)
+        self.updateChannel = try container.decodeIfPresent(String.self, forKey: .updateChannel)
+        self.retryPolicy = try container.decodeIfPresent(RetryPolicy.self, forKey: .retryPolicy)
+        self.lastUpdateCheckTimestamp = try container.decodeIfPresent(Double.self, forKey: .lastUpdateCheckTimestamp)
+        self.updateRetryAfterTimestamp = try container.decodeIfPresent(Double.self, forKey: .updateRetryAfterTimestamp)
+        self.lastNotifiedVersion = try container.decodeIfPresent(String.self, forKey: .lastNotifiedVersion)
+        self.hosts = try container.decodeIfPresent([HostConfig].self, forKey: .hosts) ?? []
+        self.profiles = try container.decodeIfPresent([NetworkProfile].self, forKey: .profiles) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encodeIfPresent(updateChannel, forKey: .updateChannel)
+        try container.encodeIfPresent(retryPolicy, forKey: .retryPolicy)
+        try container.encodeIfPresent(lastUpdateCheckTimestamp, forKey: .lastUpdateCheckTimestamp)
+        try container.encodeIfPresent(updateRetryAfterTimestamp, forKey: .updateRetryAfterTimestamp)
+        try container.encodeIfPresent(lastNotifiedVersion, forKey: .lastNotifiedVersion)
+        try container.encode(hosts, forKey: .hosts)
+        if !profiles.isEmpty {
+            try container.encode(profiles, forKey: .profiles)
+        }
     }
 }
 
@@ -397,10 +573,9 @@ func inspectConfigFile(at url: URL) -> ConfigFileInspection {
     }
 
     guard var config = try? PropertyListDecoder().decode(AutomntConfig.self, from: data),
-          !config.profiles.isEmpty,
           !parseSemanticVersion(config.version).isEmpty else {
         return ConfigFileInspection(url: url, state: .invalid, config: nil, contents: data,
-                                    diagnostic: "Configuration is malformed or has no profiles")
+                                    diagnostic: "Configuration is malformed")
     }
     guard !isNewerVersion(config.version, than: automntVersion) else {
         return ConfigFileInspection(url: url, state: .futureVersion(config.version), config: config,
@@ -525,12 +700,12 @@ func configVersionCanBeMigrated(_ configVersion: String) -> Bool {
 func configNeedsMigration(_ config: AutomntConfig) -> Bool {
     if config.version != automntVersion { return true }
     if config.updateChannel == nil { return true }
-    for profile in config.profiles {
-        if profile.id == "home_lan" || profile.id == "tailscale_remote" {
-            return true
-        }
-        if let desc = profile.description, (desc.contains("家庭局域网") || desc.contains("Tailscale 异地互联")) {
-            return true
+    if !config.profiles.isEmpty { return true }
+    for host in config.hosts {
+        for share in host.shares {
+            if let cleanMount = deriveStandardMountPoint(from: share.smbURL), cleanMount != share.mountPoint {
+                return true
+            }
         }
     }
     return false
@@ -561,26 +736,51 @@ func migrateConfigIfNeeded(config: inout AutomntConfig, at configURL: URL) -> Bo
         config.updateChannel = "off"
         modified = true
     }
-    for i in 0..<config.profiles.count {
-        if config.profiles[i].id == "home_lan" {
-            config.profiles[i].id = "local_lan"
-            modified = true
+
+    // 存量 profiles 升舱为 hosts (US6) 并深度清洗历史挂载路径
+    if !config.profiles.isEmpty {
+        var migratedHosts: [HostConfig] = config.hosts
+        for p in config.profiles {
+            var shares: [SMBShareConfig] = []
+            for t in p.targets {
+                let cleanMount = deriveStandardMountPoint(from: t.url) ?? t.mountPath
+                let sName = extractShareName(from: t.url) ?? "share"
+                shares.append(SMBShareConfig(
+                    name: sName,
+                    smbURL: t.url,
+                    mountPoint: cleanMount,
+                    enabled: true
+                ))
+            }
+            let hostConfig = HostConfig(
+                host: p.host,
+                alias: p.description,
+                port: p.port ?? 445,
+                timeoutMs: p.timeoutMs ?? 1000,
+                preventSpotlightIndex: p.preventSpotlightIndex ?? true,
+                enabled: true,
+                shares: shares
+            )
+            if !migratedHosts.contains(where: { $0.host == hostConfig.host }) {
+                migratedHosts.append(hostConfig)
+            }
         }
-        if let desc = config.profiles[i].description, (desc.contains("家庭局域网") || desc.contains("Home LAN")) {
-            config.profiles[i].description = tr("本地局域网高速直连", "Local LAN High-Speed Direct Connection")
-            modified = true
-        }
-        if config.profiles[i].id == "tailscale_remote" {
-            config.profiles[i].id = "remote_network"
-            modified = true
-        }
-        if let desc = config.profiles[i].description, (desc.contains("Tailscale 异地互联") || desc.contains("Tailscale Remote")) {
-            let updated = desc.replacingOccurrences(of: "Tailscale 异地互联", with: "远程互联")
-                              .replacingOccurrences(of: "Tailscale Remote", with: "Remote Network")
-            config.profiles[i].description = updated
-            modified = true
+        config.hosts = migratedHosts
+        config.profiles = []
+        modified = true
+    }
+
+    // 检查并清洗现有 hosts 中的历史挂载点路径（防止历史 -1 污染残留）
+    for hIdx in 0..<config.hosts.count {
+        for sIdx in 0..<config.hosts[hIdx].shares.count {
+            let share = config.hosts[hIdx].shares[sIdx]
+            if let cleanMount = deriveStandardMountPoint(from: share.smbURL), cleanMount != share.mountPoint {
+                config.hosts[hIdx].shares[sIdx].mountPoint = cleanMount
+                modified = true
+            }
         }
     }
+
     guard modified else { return true }
     guard saveConfig(config, to: configURL) else {
         fputs(tr("✗ 配置已迁移到内存，但未能完整写入配置文件。\n",
@@ -620,6 +820,10 @@ enum ConfigPlistContext: Equatable {
     case profile
     case targets
     case target
+    case hosts
+    case host
+    case shares
+    case share
     case other
 }
 
@@ -635,13 +839,17 @@ func managedConfigKeys(for context: ConfigPlistContext) -> Set<String> {
     switch context {
     case .root:
         return ["version", "update_channel", "retry_policy", "last_update_check_timestamp",
-                "update_retry_after_timestamp", "last_notified_version", "profiles"]
+                "update_retry_after_timestamp", "last_notified_version", "hosts", "profiles"]
     case .profile:
         return ["id", "description", "host", "port", "timeout_ms",
                 "prevent_spotlight_index", "targets"]
     case .target:
         return ["url", "mount_path"]
-    case .profiles, .targets, .other:
+    case .host:
+        return ["host", "alias", "port", "timeout_ms", "prevent_spotlight_index", "enabled", "shares"]
+    case .share:
+        return ["name", "smb_url", "mount_point", "enabled"]
+    case .profiles, .targets, .hosts, .shares, .other:
         return []
     }
 }
@@ -650,6 +858,8 @@ func childConfigPlistContext(parent: ConfigPlistContext, key: String) -> ConfigP
     switch (parent, key) {
     case (.root, "profiles"): return .profiles
     case (.profile, "targets"): return .targets
+    case (.root, "hosts"): return .hosts
+    case (.host, "shares"): return .shares
     default: return .other
     }
 }
@@ -661,6 +871,10 @@ func configPlistIdentity(_ value: Any, context: ConfigPlistContext) -> String? {
         return (dict["id"] as? String).map(canonicalProfileID)
     case .targets, .target:
         return (dict["mount_path"] as? String) ?? (dict["mountPath"] as? String)
+    case .hosts, .host:
+        return dict["host"] as? String
+    case .shares, .share:
+        return (dict["mount_point"] as? String) ?? (dict["smb_url"] as? String)
     case .root, .other:
         return nil
     }
@@ -692,7 +906,14 @@ func mergeConfigPlistValue(original: Any, generated: Any, context: ConfigPlistCo
             }
         }
         var mergedArray: [[String: Any]] = []
-        let childContext: ConfigPlistContext = context == .profiles ? .profile : (context == .targets ? .target : .other)
+        let childContext: ConfigPlistContext
+        switch context {
+        case .profiles: childContext = .profile
+        case .targets: childContext = .target
+        case .hosts: childContext = .host
+        case .shares: childContext = .share
+        default: childContext = .other
+        }
         for item in generatedArray {
             if let id = configPlistIdentity(item, context: context), let originalItem = originalByID[id] {
                 let mergedItem = mergeConfigPlistValue(original: originalItem, generated: item, context: childContext) as? [String: Any] ?? item
@@ -1154,10 +1375,178 @@ struct TerminalUI {
         }
     }
 
-    static func readByte() -> UInt8 {
+    static func readByte() -> UInt8? {
         var b: UInt8 = 0
-        read(STDIN_FILENO, &b, 1)
+        let n = read(STDIN_FILENO, &b, 1)
+        if n <= 0 {
+            return nil
+        }
         return b
+    }
+
+    static func hasPendingInput(timeoutMs: Int = 0) -> Bool {
+        var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        let res = poll(&pfd, 1, Int32(timeoutMs))
+        return res > 0 && (pfd.revents & Int16(POLLIN)) != 0
+    }
+}
+
+// MARK: - POSIX termios 轻量安全行输入 (Esc 放弃与退格擦除)
+
+var mockLineInput: String? = nil
+var mockLineInputs: [String]? = nil
+
+func promptLineWithEsc(prompt: String, defaultValue: String? = nil) -> String? {
+    if mockLineInputs != nil && !mockLineInputs!.isEmpty {
+        let next = mockLineInputs!.removeFirst()
+        if next == "\u{1B}" { // 模拟 Esc 放弃
+            print("\r\u{1B}[K" + tr("(已取消)", "(Cancelled)"))
+            return nil
+        }
+        let trimmed = next.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty, let def = defaultValue {
+            return def
+        }
+        return trimmed
+    }
+    if let mock = mockLineInput {
+        if mock == "\u{1B}" { // 模拟 Esc 放弃
+            print("\r\u{1B}[K" + tr("(已取消)", "(Cancelled)"))
+            return nil
+        }
+        let trimmed = mock.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty, let def = defaultValue {
+            return def
+        }
+        return trimmed
+    }
+
+    if !isInteractiveTerminal() {
+        print(prompt, terminator: "")
+        fflush(stdout)
+        guard let line = readLine() else { return nil }
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty, let def = defaultValue {
+            return def
+        }
+        return trimmed
+    }
+
+    print(prompt, terminator: "")
+    fflush(stdout)
+    TerminalUI.setRawMode(true)
+    defer {
+        TerminalUI.setRawMode(false)
+    }
+
+    var buffer: [UInt8] = []
+
+    while true {
+        guard let b = TerminalUI.readByte() else {
+            // STDIN 流终止 (EOF) 或错误，安全退出并返回 nil
+            return nil
+        }
+        if b == 27 { // ASCII 27: Esc 键
+            if TerminalUI.hasPendingInput(timeoutMs: 50) {
+                // 逃逸序列 (如方向键)，读取并丢弃后续控制字节
+                _ = TerminalUI.readByte()
+                if TerminalUI.hasPendingInput(timeoutMs: 10) {
+                    _ = TerminalUI.readByte()
+                }
+                continue
+            }
+            // 独立 Esc 键：立即清除当前行并安全返回 nil
+            print("\r\u{1B}[K" + tr("(已取消)", "(Cancelled)"))
+            return nil
+        } else if b == 10 || b == 13 { // 回车键
+            print("")
+            let str = String(bytes: buffer, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if str.isEmpty, let def = defaultValue {
+                return def
+            }
+            return str
+        } else if b == 127 || b == 8 { // 退格键 (ASCII 127 / ASCII 8)
+            if !buffer.isEmpty {
+                if var currentStr = String(bytes: buffer, encoding: .utf8) {
+                    currentStr.removeLast()
+                    buffer = Array(currentStr.utf8)
+                    print("\r\u{1B}[K\(prompt)\(currentStr)", terminator: "")
+                    fflush(stdout)
+                } else {
+                    buffer.removeLast()
+                    print("\r\u{1B}[K\(prompt)", terminator: "")
+                    fflush(stdout)
+                }
+            }
+        } else if b == 3 { // Ctrl+C 中断
+            TerminalUI.setRawMode(false)
+            exit(130)
+        } else if b >= 32 { // 可打印字符与多字节 UTF-8 序列
+            buffer.append(b)
+            if let str = String(bytes: buffer, encoding: .utf8) {
+                print("\r\u{1B}[K\(prompt)\(str)", terminator: "")
+                fflush(stdout)
+            }
+        }
+    }
+}
+
+// MARK: - 运行期卷宗发现与候选主机倒推
+
+struct DiscoveredMount: Equatable {
+    var mountPoint: String       // 实际本地挂载路径（可能带 -1 临时冲突后缀）
+    var rawSmbUrl: String        // 内核挂载表返回的原始 URL
+    var host: String             // 提取解析出的主机 IP 或域名
+    var shareName: String        // 从 URL 提取的标准真实共享名
+    var cleanMountPoint: String  // 推导出的标准规整路径 /Volumes/<shareName>
+    var standardSMBURL: String   // 标准 smb://<host>/<shareName>
+    var smbURL: String { standardSMBURL }
+}
+
+struct DiscoveredHostGroup: Equatable {
+    var host: String
+    var mounts: [DiscoveredMount]
+    var isConfigured: Bool = false
+}
+
+var mockCandidateHosts: [DiscoveredHostGroup]? = nil
+
+func discoverCandidateHosts() -> [DiscoveredHostGroup] {
+    if let mock = mockCandidateHosts {
+        return mock
+    }
+    let entries = getKernelMountEntries().filter { $0.fileSystemType.lowercased() == "smbfs" }
+    var hostMap: [String: [DiscoveredMount]] = [:]
+    var hostOrder: [String] = []
+
+    for entry in entries {
+        let rawURL = entry.source
+        let host = extractHost(from: rawURL)
+        guard !host.isEmpty else { continue }
+        guard let shareName = extractShareName(from: rawURL) else { continue }
+        let cleanMount = "/Volumes/\(shareName)"
+        let stdURL = "smb://\(host)/\(shareName)"
+
+        let item = DiscoveredMount(
+            mountPoint: entry.mountPoint,
+            rawSmbUrl: rawURL,
+            host: host,
+            shareName: shareName,
+            cleanMountPoint: cleanMount,
+            standardSMBURL: stdURL
+        )
+
+        if hostMap[host] == nil {
+            hostMap[host] = []
+            hostOrder.append(host)
+        }
+        if !hostMap[host]!.contains(where: { $0.shareName.lowercased() == shareName.lowercased() }) {
+            hostMap[host]!.append(item)
+        }
+    }
+
+    return hostOrder.map { h in
+        DiscoveredHostGroup(host: h, mounts: hostMap[h] ?? [], isConfigured: false)
     }
 }
 
@@ -1190,7 +1579,7 @@ func promptInteractiveCheckbox(title: String, options: [SelectionOption]) -> [In
     render()
 
     while true {
-        let b = TerminalUI.readByte()
+        guard let b = TerminalUI.readByte() else { return nil }
         if b == 10 || b == 13 {
             break
         } else if b == 32 {
@@ -1208,9 +1597,9 @@ func promptInteractiveCheckbox(title: String, options: [SelectionOption]) -> [In
             else { selected = Set(0..<options.count) }
             render()
         } else if b == 27 {
-            let b2 = TerminalUI.readByte()
+            guard let b2 = TerminalUI.readByte() else { return nil }
             if b2 == 91 {
-                let b3 = TerminalUI.readByte()
+                guard let b3 = TerminalUI.readByte() else { return nil }
                 if b3 == 65 {
                     cursor = (cursor - 1 + options.count) % options.count
                     render()
@@ -1253,7 +1642,7 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
     render()
 
     while true {
-        let b = TerminalUI.readByte()
+        guard let b = TerminalUI.readByte() else { return nil }
         if b == 10 || b == 13 {
             break
         } else if b == 106 {
@@ -1263,9 +1652,9 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
             cursor = (cursor - 1 + options.count) % options.count
             render()
         } else if b == 27 {
-            let b2 = TerminalUI.readByte()
+            guard let b2 = TerminalUI.readByte() else { return nil }
             if b2 == 91 {
-                let b3 = TerminalUI.readByte()
+                guard let b3 = TerminalUI.readByte() else { return nil }
                 if b3 == 65 {
                     cursor = (cursor - 1 + options.count) % options.count
                     render()
@@ -1283,6 +1672,165 @@ func promptInteractiveRadio(title: String, options: [SelectionOption], defaultIn
 
 // MARK: - 初始化向导 (--init) 与日常配置管理 (--config)
 
+func handleCandidateHostConfiguration(candidate: DiscoveredHostGroup) -> HostConfig? {
+    print(tr("\n--- 配置主机: \(candidate.host) ---", "\n--- Configure Host: \(candidate.host) ---"))
+    let aliasPrompt = tr("请输入该主机的人类友好别名 (直接回车保持默认 [\(candidate.host)], 按 Esc 取消): ",
+                         "Enter alias for host (Enter for default [\(candidate.host)], Esc to cancel): ")
+    guard let aliasInput = promptLineWithEsc(prompt: aliasPrompt) else {
+        print(tr("(已取消主机配置)", "(Host configuration canceled)"))
+        return nil
+    }
+    let trimmedAlias = aliasInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    let alias: String? = trimmedAlias.isEmpty ? nil : trimmedAlias
+
+    print(tr("\n请选择需要自动挂载的共享文件夹:", "\nSelect shared folders to mount automatically:"))
+    for (idx, mount) in candidate.mounts.enumerated() {
+        let stdMountPoint = deriveStandardMountPoint(from: mount.smbURL) ?? "/Volumes/\(mount.shareName)"
+        print("  [ ] \(idx + 1). \(mount.shareName) (\(redactedSMBURL(mount.smbURL)) -> \(stdMountPoint))")
+    }
+
+    let selectionPrompt = tr("\n输入编号切换选择 (例如 '1 2' 或 'all', 回车确认, 按 Esc 取消): ",
+                             "\nEnter numbers to select (e.g. '1 2' or 'all', Enter to confirm, Esc to cancel): ")
+    guard let selInput = promptLineWithEsc(prompt: selectionPrompt) else {
+        print(tr("(已取消主机配置)", "(Host configuration canceled)"))
+        return nil
+    }
+    let trimmedSel = selInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    var selectedIndices: Set<Int> = []
+    if trimmedSel == "all" || trimmedSel.isEmpty {
+        selectedIndices = Set(0..<candidate.mounts.count)
+    } else {
+        let tokens = trimmedSel.split(separator: " ").compactMap { Int($0) }
+        for t in tokens where t >= 1 && t <= candidate.mounts.count {
+            selectedIndices.insert(t - 1)
+        }
+    }
+
+    if selectedIndices.isEmpty {
+        print(tr("未选择任何共享文件夹，已取消该主机配置。", "No shares selected, canceled host configuration."))
+        return nil
+    }
+
+    for idx in 0..<candidate.mounts.count {
+        let mount = candidate.mounts[idx]
+        let stdMountPoint = deriveStandardMountPoint(from: mount.smbURL) ?? "/Volumes/\(mount.shareName)"
+        let checkMark = selectedIndices.contains(idx) ? "[✓]" : "[ ]"
+        print("  \(checkMark) \(idx + 1). \(mount.shareName) (\(redactedSMBURL(mount.smbURL)) -> \(stdMountPoint))")
+    }
+
+    let confirmPrompt = tr("确认添加上述共享？[Y/n]: ", "Confirm adding these shares? [Y/n]: ")
+    guard let confirmInput = promptLineWithEsc(prompt: confirmPrompt, defaultValue: "Y") else {
+        return nil
+    }
+    let trimmedConfirm = confirmInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if !trimmedConfirm.isEmpty && trimmedConfirm != "y" && trimmedConfirm != "yes" {
+        print(tr("已放弃添加上述共享。", "Discarded adding shares."))
+        return nil
+    }
+
+    var shares: [SMBShareConfig] = []
+    for idx in selectedIndices.sorted() {
+        let mount = candidate.mounts[idx]
+        let stdMountPoint = deriveStandardMountPoint(from: mount.smbURL) ?? "/Volumes/\(mount.shareName)"
+        shares.append(SMBShareConfig(
+            name: mount.shareName,
+            smbURL: mount.smbURL,
+            mountPoint: stdMountPoint,
+            enabled: true
+        ))
+    }
+
+    return HostConfig(
+        host: candidate.host,
+        alias: alias,
+        port: 445,
+        timeoutMs: 1000,
+        preventSpotlightIndex: true,
+        enabled: true,
+        shares: shares
+    )
+}
+
+func handleManualHostEntry(existingHosts: [HostConfig]) -> HostConfig? {
+    print(tr("\n--- 手动添加主机 ---", "\n--- Manually Add Host ---"))
+    let hostPrompt = tr("请输入主机 IP 地址或域名 (按 Esc 取消): ", "Enter host IP or domain (Esc to cancel): ")
+    guard let hostInput = promptLineWithEsc(prompt: hostPrompt) else { return nil }
+    let host = hostInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    if host.isEmpty { return nil }
+
+    let aliasPrompt = tr("请输入该主机的人类友好别名 (直接回车保持默认 [\(host)], 按 Esc 跳过): ",
+                         "Enter alias for host (Enter for default [\(host)], Esc to skip): ")
+    let aliasInput = promptLineWithEsc(prompt: aliasPrompt)
+    let trimmedAlias = aliasInput?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let alias: String? = trimmedAlias.isEmpty ? nil : trimmedAlias
+
+    print(tr("正在测试主机 \(host) 的 SMB 服务端口 (445)...", "Testing SMB service port (445) on \(host)..."))
+    let reachable = HostReachabilityProbe.canConnect(host: host, port: 445, timeoutMs: 1500)
+    if reachable {
+        print(tr("连接测试成功。\n", "Connection test succeeded.\n"))
+    } else {
+        print(tr("""
+        ⚠️ 警告: 无法连通目标主机 \(host) 的 445 端口 (连接超时或网络不可达)。
+        该主机可能当前处于离线状态，或当前网络无法直连。
+        """, """
+        ⚠️ Warning: Cannot connect to TCP port 445 on \(host) (timeout or unreachable).
+        The host may be offline or unreachable on this network.
+        """))
+        let offlineConfirm = tr("是否仍然添加该主机？[y/N]: ", "Add this offline host anyway? [y/N]: ")
+        guard let offlineInput = promptLineWithEsc(prompt: offlineConfirm, defaultValue: "N") else { return nil }
+        let c = offlineInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if c != "y" && c != "yes" {
+            print(tr("已取消添加未连通主机。", "Canceled adding unreachable host."))
+            return nil
+        }
+        print(tr("已确认添加离线主机 \(host)。\n", "Confirmed adding offline host \(host).\n"))
+    }
+
+    print(tr("系统未在该主机下检测到已挂载卷宗，请手动录入共享路径：",
+             "No active mounts detected for this host. Please enter share path manually:"))
+    let sharePrompt = tr("请输入从属 SMB 共享路径 (格式如 smb://\(host)/Backup, 按 Esc 取消): ",
+                         "Enter SMB share path (e.g. smb://\(host)/Backup, Esc to cancel): ")
+    guard let shareInput = promptLineWithEsc(prompt: sharePrompt) else { return nil }
+    let rawURL = shareInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    if rawURL.isEmpty { return nil }
+    if let err = validateMountTargetURL(rawURL) {
+        print("✗ \(err)")
+        return nil
+    }
+
+    let stdMountPoint = deriveStandardMountPoint(from: rawURL) ?? "/Volumes/share"
+    print(tr("标准目标挂载点将设置为: \(stdMountPoint)", "Standard mount point will be set to: \(stdMountPoint)"))
+    let confirmPrompt = tr("确认添加该共享？[Y/n]: ", "Confirm adding this share? [Y/n]: ")
+    guard let confirmInput = promptLineWithEsc(prompt: confirmPrompt, defaultValue: "Y") else { return nil }
+    let trimmedConfirm = confirmInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if !trimmedConfirm.isEmpty && trimmedConfirm != "y" && trimmedConfirm != "yes" {
+        print(tr("已取消添加共享。", "Canceled adding share."))
+        return nil
+    }
+
+    let shareName = extractShareName(from: rawURL) ?? "share"
+    let shares = [
+        SMBShareConfig(name: shareName, smbURL: rawURL, mountPoint: stdMountPoint, enabled: true)
+    ]
+
+    print(tr("\n提示：对于手动添加的新网络共享，请确保已在 macOS 系统中成功连接过一次并勾选“在我的钥匙串中记住此密码”，认证凭据将由系统钥匙串自动安全管理。",
+             "\nNote: For manually added network shares, ensure you have connected at least once in macOS and checked 'Remember password in Keychain'. Credentials are managed securely by Keychain."))
+
+    let aliasDisplay = alias ?? host
+    print(tr("已成功添加主机 [\(aliasDisplay)] 及其从属共享。\n",
+             "Successfully added host [\(aliasDisplay)] and its shares.\n"))
+
+    return HostConfig(
+        host: host,
+        alias: alias,
+        port: 445,
+        timeoutMs: 1000,
+        preventSpotlightIndex: true,
+        enabled: true,
+        shares: shares
+    )
+}
+
 func runInitWizard(offerServiceInstallation: Bool = true) -> Bool {
     print(tr("""
     automnt - 初始化配置向导 (v\(automntVersion))
@@ -1292,142 +1840,99 @@ func runInitWizard(offerServiceInstallation: Bool = true) -> Bool {
     ====================================
     """))
 
-    print(tr("\n[1/3] 选择本地局域网挂载目标", "\n[1/3] Select Local LAN Mount Targets"))
-    var homeTargets: [MountTarget] = []
-    let activeMounts = discoverActiveSMBMounts()
+    print(tr("正在检测系统当前挂载的网络存储...", "Detecting currently mounted network storage..."))
+    var candidateHosts = discoverCandidateHosts()
+    var configuredHosts: [HostConfig] = []
 
-    if !activeMounts.isEmpty {
-        let options = activeMounts.map { SelectionOption(title: URL(fileURLWithPath: $0.path).lastPathComponent, subtitle: redactedSMBURL($0.url)) }
-        let selectedIndices = promptInteractiveCheckbox(
-            title: tr("发现当前系统中已挂载的 SMB 卷宗，请选择需要纳入自动挂载的目标 (按 Space 勾选，Enter 完成)：",
-                      "Discovered mounted SMB volumes. Select targets (Space to toggle, Enter to confirm):"),
-            options: options
-        ) ?? []
-        for idx in selectedIndices {
-            let item = activeMounts[idx]
-            homeTargets.append(MountTarget(url: item.url, mountPath: item.path))
-            print(tr("  ✓ 已添加: \(item.path) (\(redactedSMBURL(item.url)))", "  ✓ Added: \(item.path) (\(redactedSMBURL(item.url)))"))
+    while true {
+        if candidateHosts.isEmpty {
+            print(tr("\n未检测到系统当前挂载的网络存储。", "\nNo active mounted network storage detected."))
+        } else {
+            print(tr("\n检测到以下候选主机：\n", "\nDiscovered the following candidate hosts:\n"))
+            for (idx, candidate) in candidateHosts.enumerated() {
+                let num = idx + 1
+                if candidate.isConfigured {
+                    let matching = configuredHosts.first(where: { $0.host == candidate.host })
+                    let aliasText = matching?.alias.map { " [\($0)]" } ?? ""
+                    let count = matching?.shares.count ?? candidate.mounts.count
+                    print(tr("  [✓] \(num). \(candidate.host)\(aliasText) (已配置 \(count) 个共享)",
+                             "  [✓] \(num). \(candidate.host)\(aliasText) (\(count) shares configured)"))
+                } else {
+                    print(tr("  [\(num)] \(candidate.host) (检测到 \(candidate.mounts.count) 个已挂载共享)",
+                             "  [\(num)] \(candidate.host) (\(candidate.mounts.count) mounted shares detected)"))
+                }
+            }
         }
-    }
 
-    if homeTargets.isEmpty {
-        print(tr("  当前未选择已挂载卷宗，请输入共享地址 (直接按回车可跳过此步骤)：",
-                 "  No active mounts selected. Enter share URL (Enter to skip this step):"))
-        while true {
-            print(tr("  挂载地址 (例如 smb://server.local/share): ",
-                     "  Mount URL (e.g. smb://server.local/share): "), terminator: "")
-            let urlInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if urlInput.isEmpty { break }
-            if let err = validateMountTargetURL(urlInput) {
-                print("  ✗ \(err)")
+        print(tr("""
+
+        操作选项：
+          [m] 手动添加新主机地址
+          [s] 跳过主机配置 (稍后通过 automnt --config 配置)
+          [d] 完成主机配置并进入下一步
+        """, """
+
+        Options:
+          [m] Manually add host address
+          [s] Skip host configuration (configure later via automnt --config)
+          [d] Complete host configuration and proceed to next step
+        """))
+
+        let promptHint = candidateHosts.isEmpty ? "[m / s / d]" : "[1-\(candidateHosts.count) / m / s / d]"
+        let promptText = tr("请选择操作 \(promptHint) (按 Esc 退出向导): ", "Select option \(promptHint) (Press Esc to exit): ")
+        guard let input = promptLineWithEsc(prompt: promptText) else {
+            print(tr("已取消向导。", "Setup wizard canceled."))
+            return false
+        }
+        let choice = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if choice == "s" {
+            print(tr("已跳过主机配置。", "Skipped host configuration."))
+            break
+        } else if choice == "d" {
+            break
+        } else if choice == "m" {
+            if let newHost = handleManualHostEntry(existingHosts: configuredHosts) {
+                configuredHosts.append(newHost)
+                if let cIdx = candidateHosts.firstIndex(where: { $0.host == newHost.host }) {
+                    candidateHosts[cIdx].isConfigured = true
+                }
+            }
+        } else if let num = Int(choice), num >= 1, num <= candidateHosts.count {
+            let candidateIdx = num - 1
+            if candidateHosts[candidateIdx].isConfigured {
+                print(tr("该主机已配置，不可重复选择，请选择其他候选主机或点选 [d] 完成。",
+                         "Host already configured. Select another or enter 'd' to finish."))
                 continue
             }
-            let defaultName = urlInput.split(separator: "/").last.map(String.init) ?? "share"
-            let defaultPath = "/Volumes/\(defaultName)"
-            print(tr("  本地挂载点 [默认: \(defaultPath)]: ", "  Mount path [Default: \(defaultPath)]: "), terminator: "")
-            let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let mountPath = pathInput.isEmpty ? defaultPath : pathInput
-            homeTargets.append(MountTarget(url: urlInput, mountPath: mountPath))
-            print(tr("  ✓ 已添加: \(mountPath) (\(redactedSMBURL(urlInput)))", "  ✓ Added: \(mountPath) (\(redactedSMBURL(urlInput)))"))
-            break
-        }
-    }
-
-    var homeHost = "localhost"
-    if let first = homeTargets.first {
-        homeHost = extractHost(from: first.url)
-    }
-
-    let homeProfileDesc = tr("本地局域网高速直连", "Local LAN High-Speed Direct Connection")
-    let homeProfile = NetworkProfile(
-        id: "local_lan",
-        description: homeProfileDesc,
-        host: homeHost,
-        port: 445,
-        timeoutMs: 1000,
-        preventSpotlightIndex: true,
-        targets: homeTargets
-    )
-
-    print(tr("\n[2/3] 配置远程互联降级策略 (Tailscale / 域名 / IP)",
-             "\n[2/3] Configure Remote Fallback Profile (Tailscale / Domain / IP)"))
-    var profiles: [NetworkProfile] = [homeProfile]
-    let discoveredPeers = discoverTailscalePeers()
-
-    var remoteOptions: [SelectionOption] = []
-    if !discoveredPeers.isEmpty {
-        for peer in discoveredPeers {
-            remoteOptions.append(SelectionOption(
-                title: tr("Tailscale 设备: \(peer.name)", "Tailscale Device: \(peer.name)"),
-                subtitle: "\(peer.ip) (\(peer.os))"
-            ))
-        }
-    }
-    remoteOptions.append(SelectionOption(title: tr("手动输入远程主机 IP 或域名", "Manually enter remote IP or domain"), subtitle: nil))
-    remoteOptions.append(SelectionOption(title: tr("跳过远程策略配置", "Skip remote profile"), subtitle: nil))
-
-    if let rSel = promptInteractiveRadio(
-        title: tr("请选择远程连接接入方式：", "Select remote connection method:"),
-        options: remoteOptions,
-        defaultIndex: remoteOptions.count - 1
-    ) {
-        if rSel < discoveredPeers.count {
-            let peer = discoveredPeers[rSel]
-            let remoteTargets = homeTargets.map { target -> MountTarget in
-                let remoteURL = target.url.replacingOccurrences(of: homeHost, with: peer.ip)
-                return MountTarget(url: remoteURL, mountPath: target.mountPath)
+            let candidate = candidateHosts[candidateIdx]
+            if let hostConfig = handleCandidateHostConfiguration(candidate: candidate) {
+                configuredHosts.append(hostConfig)
+                candidateHosts[candidateIdx].isConfigured = true
+                let aliasDisplay = hostConfig.alias ?? hostConfig.host
+                print(tr("已保存主机 [\(aliasDisplay)] 的配置。", "Saved configuration for host [\(aliasDisplay)]."))
             }
-            let desc = tr("远程互联 (\(peer.name))", "Remote Network (\(peer.name))")
-            let remoteProfile = NetworkProfile(
-                id: "remote_network",
-                description: desc,
-                host: peer.ip,
-                port: 445,
-                timeoutMs: 1000,
-                preventSpotlightIndex: true,
-                targets: remoteTargets
-            )
-            profiles.append(remoteProfile)
-            print(tr("  ✓ 已添加远程互联策略: \(peer.name) (\(peer.ip))",
-                     "  ✓ Added remote network profile: \(peer.name) (\(peer.ip))"))
-        } else if rSel == discoveredPeers.count {
-            print(tr("  远程主机地址 (IP 或域名): ", "  Remote host address (IP or domain): "), terminator: "")
-            let rHost = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !rHost.isEmpty {
-                let remoteTargets = homeTargets.map { target -> MountTarget in
-                    let remoteURL = target.url.replacingOccurrences(of: homeHost, with: rHost)
-                    return MountTarget(url: remoteURL, mountPath: target.mountPath)
-                }
-                let remoteProfile = NetworkProfile(
-                    id: "remote_network",
-                    description: tr("远程互联 (\(rHost))", "Remote Network (\(rHost))"),
-                    host: rHost,
-                    port: 445,
-                    timeoutMs: 1000,
-                    preventSpotlightIndex: true,
-                    targets: remoteTargets
-                )
-                profiles.append(remoteProfile)
-                print(tr("  ✓ 已添加远程互联策略: \(rHost)", "  ✓ Added remote network profile: \(rHost)"))
-            }
+        } else {
+            print(tr("无效的选择，请重新输入。", "Invalid choice, please re-enter."))
         }
     }
 
-    print(tr("\n[3/3] 软件更新策略设置", "\n[3/3] Software Update Channel"))
-    let channelOptions = [
-        SelectionOption(title: "off", subtitle: tr("关闭自动检查 (推荐，零网络请求，手动运行 'automnt --update')",
-                                                  "Disable auto-checks (Recommended, update manually via 'automnt --update')")),
-        SelectionOption(title: "notify", subtitle: tr("发现新版本时发送系统通知，由您手动执行更新",
-                                                     "Send system notification on new version, update manually")),
-        SelectionOption(title: "auto", subtitle: tr("发现新版本时自动下载预编译二进制并平滑升级",
-                                                   "Auto-download prebuilt binary and update silently"))
-    ]
-    let selChannelIdx = promptInteractiveRadio(
-        title: tr("请选择更新信道：", "Select update channel:"),
-        options: channelOptions,
-        defaultIndex: 0
-    ) ?? 0
-    let selectedChannel = channelOptions[selChannelIdx].title
+    print(tr("\n[2/3] 软件更新策略设置", "\n[2/3] Software Update Channel"))
+    print(tr("""
+      [1] off    - 关闭自动检查 (推荐，零网络请求，手动运行 'automnt --update')
+      [2] notify - 发现新版本时发送系统通知，由您手动执行更新
+      [3] auto   - 发现新版本时自动下载预编译二进制并平滑升级
+    """, """
+      [1] off    - Disable auto-checks (Recommended, update manually via 'automnt --update')
+      [2] notify - Send system notification on new version, update manually
+      [3] auto   - Auto-download prebuilt binary and update silently
+    """))
+    let channelChoice = promptLineWithEsc(prompt: tr("请选择更新策略 [1-3] (默认 1): ", "Select update policy [1-3] (Default 1): "), defaultValue: "1")
+    let selectedChannel: String
+    switch channelChoice?.trimmingCharacters(in: .whitespacesAndNewlines) {
+    case "2", "notify": selectedChannel = "notify"
+    case "3", "auto": selectedChannel = "auto"
+    default: selectedChannel = "off"
+    }
 
     let config = AutomntConfig(
         version: automntVersion,
@@ -1435,34 +1940,38 @@ func runInitWizard(offerServiceInstallation: Bool = true) -> Bool {
         retryPolicy: RetryPolicy(),
         lastUpdateCheckTimestamp: nil,
         lastNotifiedVersion: nil,
-        profiles: profiles
+        hosts: configuredHosts,
+        profiles: []
     )
-
     let saved = saveConfig(config)
     guard saved else {
         fputs(tr("✗ 保存配置失败。\n", "✗ Failed to save configuration.\n"), stderr)
         return false
     }
-
     print(tr("\n✓ 恭喜！automnt 配置已顺利完成！", "\n✓ Configuration completed successfully!"))
-    if offerServiceInstallation {
-        print(tr("\n是否立即安装并启用后台事件驱动守护服务？", "\nDeploy background event-driven LaunchAgent daemon now?"))
-        let daemonOptions = [
-            SelectionOption(title: tr("立即部署并启用守护服务 (推荐)", "Deploy and start daemon service (Recommended)"), subtitle: nil),
-            SelectionOption(title: tr("仅保存配置，暂不部署", "Save config only, do not deploy daemon"), subtitle: nil)
-        ]
-        let selDaemon = promptInteractiveRadio(
-            title: tr("请选择：", "Select:"),
-            options: daemonOptions,
-            defaultIndex: 0
-        ) ?? 0
 
-        if selDaemon == 0 {
+    if offerServiceInstallation {
+        print(tr("""
+        \n是否立即部署并在用户登录时自动运行后台守护服务？
+          - 选择 [Y]: 自动安装 LaunchAgent，当网络环境变化时自动触发顺位挂载探测。
+          - 选择 [n]: 仅保存配置文件，不向系统注册任何后台常驻服务。
+        """, """
+        \nDeploy background event-driven LaunchAgent daemon now?
+          - Select [Y]: Automatically install LaunchAgent to mount shares upon network change.
+          - Select [n]: Save config only, do not register background service.
+        """))
+        let deployPrompt = tr("请确认部署意愿 [Y/n] (默认 Y): ", "Confirm deployment intention [Y/n] (Default Y): ")
+        let deployChoice = promptLineWithEsc(prompt: deployPrompt, defaultValue: "Y")
+        if let choice = deployChoice?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           choice == "y" || choice == "yes" {
             print("")
             installLaunchAgent()
         } else {
-            print(tr("  ✓ 已跳过后台服务安装。后续可随时运行 'automnt --install' 进行部署。\n",
-                     "  ✓ Skipped background service deployment. You can run 'automnt --install' anytime.\n"))
+            print(tr("  ✓ 已跳过后台服务部署。", "  ✓ Skipped background service deployment."))
+            let activeConfigURL = getActiveConfigURL()
+            print(tr("  配置已成功保存至: \(activeConfigURL.path)", "  Config successfully saved to: \(activeConfigURL.path)"))
+            print(tr("  后续可通过运行 'automnt' 手动执行挂载，或使用 'automnt --config' 管理配置。\n",
+                     "  You can run 'automnt' anytime to mount manually, or 'automnt --config' to manage.\n"))
         }
     }
     return true
@@ -1491,7 +2000,7 @@ func runInitCommand(resetExistingConfig: Bool = false) -> Bool {
         }
     }
 
-    guard isatty(STDIN_FILENO) == 1 else {
+    guard isInteractiveTerminal() else {
         fputs(tr("✗ 当前没有可用配置且输入不是交互终端；请在 Terminal 中运行 `automnt --init`。\n",
                  "✗ No usable config exists and stdin is not interactive; run `automnt --init` in Terminal.\n"), stderr)
         return false
@@ -1506,7 +2015,7 @@ func prepareManagementConfigURL() -> URL? {
     case .usable:
         return activeConfigURL
     case .missing:
-        guard isatty(STDIN_FILENO) == 1 else {
+        guard isInteractiveTerminal() else {
             fputs(tr("✗ 没有可用配置。请在交互式 Terminal 中运行 `automnt --init`。\n",
                      "✗ No usable config exists. Run `automnt --init` in an interactive Terminal.\n"), stderr)
             return nil
@@ -1582,194 +2091,164 @@ func pauseForUser() {
     _ = readLine()
 }
 
-func manageMountTargets(config: inout AutomntConfig) {
+func manageHostShares(hostConfig: inout HostConfig, allHosts: [HostConfig]) {
     while true {
-        let pOptions = config.profiles.enumerated().map {
-            SelectionOption(title: "[\($0 + 1)] \($1.id) (\($1.description ?? tr("无描述", "No description")))",
-                            subtitle: "\($1.targets.count) targets")
-        }
-        guard let pIdx = promptInteractiveRadio(
-            title: tr("\n选择要管理挂载目标的策略：", "\nSelect profile to manage mount targets:"),
-            options: pOptions + [SelectionOption(title: tr("↩ 返回上一级", "↩ Back"), subtitle: nil)]
-        ) else {
-            return
-        }
-        if pIdx >= config.profiles.count { return }
-
-        let curP = config.profiles[pIdx]
-        print(tr("\n策略 '\(curP.id)' 当前挂载目标列表：", "\nProfile '\(curP.id)' current targets:"))
-        for (tIdx, t) in curP.targets.enumerated() {
-            print("  [\(tIdx + 1)] \(t.mountPath) -> \(redactedSMBURL(t.url))")
-        }
-
-        let mOptions = [
-            SelectionOption(title: tr("添加挂载目标", "Add Mount Target"), subtitle: nil),
-            SelectionOption(title: tr("删除挂载目标", "Delete Mount Target"), subtitle: nil),
-            SelectionOption(title: tr("↩ 返回", "↩ Back"), subtitle: nil)
-        ]
-        guard let mSel = promptInteractiveRadio(title: tr("\n操作选项：", "\nActions:"), options: mOptions) else { continue }
-        if mSel == 0 {
-            print(tr("输入挂载地址 (smb://host/share): ", "Enter mount URL (smb://host/share): "), terminator: "")
-            let urlInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if let err = validateMountTargetURL(urlInput) {
-                print("✗ \(err)")
-                pauseForUser()
-                continue
-            }
-            let defaultName = urlInput.split(separator: "/").last.map(String.init) ?? "share"
-            let defaultPath = "/Volumes/\(defaultName)"
-            print(tr("输入本地挂载点 [默认: \(defaultPath)]: ", "Enter mount path [Default: \(defaultPath)]: "), terminator: "")
-            let pathInput = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let mountPath = pathInput.isEmpty ? defaultPath : pathInput
-            config.profiles[pIdx].targets.append(MountTarget(url: urlInput, mountPath: mountPath))
-            _ = saveConfig(config)
-            print(tr("✓ 挂载目标添加成功！", "✓ Target added successfully!"))
-            pauseForUser()
-        } else if mSel == 1 {
-            if config.profiles[pIdx].targets.isEmpty {
-                print(tr("当前无挂载目标可删除。", "No targets to delete."))
-                pauseForUser()
-                continue
-            }
-            let delOptions = config.profiles[pIdx].targets.enumerated().map {
-                SelectionOption(title: "[\($0 + 1)] \($1.mountPath)", subtitle: redactedSMBURL($1.url))
-            }
-            if let dIdx = promptInteractiveRadio(title: tr("选择要删除的目标：", "Select target to delete:"), options: delOptions) {
-                config.profiles[pIdx].targets.remove(at: dIdx)
-                _ = saveConfig(config)
-                print(tr("✓ 目标删除成功！", "✓ Target removed successfully!"))
-                pauseForUser()
-            }
+        let hostDisplay = hostConfig.alias.map { "\($0) (\(hostConfig.host))" } ?? hostConfig.host
+        print(tr("\n--- 主机管理: \(hostDisplay) ---", "\n--- Host Management: \(hostDisplay) ---"))
+        print(tr("当前从属共享:", "Current shares:"))
+        if hostConfig.shares.isEmpty {
+            print(tr("  (当前未配置任何共享)", "  (No shares configured)"))
         } else {
-            continue
+            for (idx, share) in hostConfig.shares.enumerated() {
+                let status = share.enabled ? tr("启用", "Enabled") : tr("禁用", "Disabled")
+                print("  [\(idx + 1)] \(share.name) (\(share.mountPoint)) [\(status)]")
+            }
         }
-    }
-}
 
-func manageNetworkProfiles(config: inout AutomntConfig) {
-    while true {
-        let pOptions = [
-            SelectionOption(title: tr("调整策略评估顺序 (上移/下移)", "Reorder Profile Pipeline"), subtitle: nil),
-            SelectionOption(title: tr("新增网络策略", "Add New Profile"), subtitle: nil),
-            SelectionOption(title: tr("编辑策略探测属性 (Host/Port/Timeout)", "Edit Profile Probe Properties"), subtitle: nil),
-            SelectionOption(title: tr("删除网络策略", "Delete Profile"), subtitle: nil),
-            SelectionOption(title: tr("↩ 返回主菜单", "↩ Back to Main Menu"), subtitle: nil)
-        ]
-        guard let sel = promptInteractiveRadio(title: tr("\n网络策略管理：", "\nManage Network Profiles:"), options: pOptions) else { return }
-        switch sel {
-        case 0:
-            let list = config.profiles.enumerated().map {
-                SelectionOption(title: "[\($0 + 1)] \($1.id)", subtitle: "\($1.host):\($1.port ?? 445)")
-            }
-            if let idx = promptInteractiveRadio(title: tr("选择要调整顺序的策略：", "Select profile to reorder:"), options: list) {
-                let dirOptions = [SelectionOption(title: tr("⬆ 上移一位", "⬆ Move Up"), subtitle: nil),
-                                  SelectionOption(title: tr("⬇ 下移一位", "⬇ Move Down"), subtitle: nil)]
-                if let dir = promptInteractiveRadio(title: tr("移动方向：", "Direction:"), options: dirOptions) {
-                    if dir == 0 && idx > 0 {
-                        config.profiles.swapAt(idx, idx - 1)
-                        _ = saveConfig(config)
-                    } else if dir == 1 && idx < config.profiles.count - 1 {
-                        config.profiles.swapAt(idx, idx + 1)
-                        _ = saveConfig(config)
-                    }
-                }
-            }
-        case 1:
-            print(tr("输入新策略唯一标识符 (id, 如 office_lan): ", "Enter profile ID (e.g. office_lan): "), terminator: "")
-            let pId = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if pId.isEmpty { continue }
-            print(tr("输入策略描述名称: ", "Enter profile description: "), terminator: "")
-            let pDesc = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            print(tr("输入探测主机 (IP 或域名): ", "Enter probe host (IP or domain): "), terminator: "")
-            let pHost = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if pHost.isEmpty { continue }
+        print(tr("""
 
-            let newProfile = NetworkProfile(
-                id: pId,
-                description: pDesc.isEmpty ? nil : pDesc,
-                host: pHost,
-                port: 445,
-                timeoutMs: 1000,
-                preventSpotlightIndex: true,
-                targets: []
-            )
-            config.profiles.append(newProfile)
-            _ = saveConfig(config)
-            print(tr("✓ 策略已创建！", "✓ Profile created!"))
-            pauseForUser()
-        case 2:
-            let editList = config.profiles.enumerated().map {
-                SelectionOption(title: "[\($0 + 1)] \($1.id)", subtitle: "\($1.host):\($1.port ?? 445) (\($1.timeoutMs ?? 1000)ms)")
-            }
-            if let eIdx = promptInteractiveRadio(title: tr("选择要编辑的策略：", "Select profile to edit:"), options: editList) {
-                let curP = config.profiles[eIdx]
-                let attrOptions = [
-                    SelectionOption(title: tr("修改策略描述名称", "Edit Profile Description"), subtitle: curP.description ?? tr("无描述", "No description")),
-                    SelectionOption(title: tr("更新探测主机 (Host)", "Update Probe Host"), subtitle: curP.host),
-                    SelectionOption(title: tr("更新探测端口 (Port)", "Update Probe Port"), subtitle: String(curP.port ?? 445)),
-                    SelectionOption(title: tr("更新超时毫秒 (Timeout)", "Update Timeout (ms)"), subtitle: "\(curP.timeoutMs ?? 1000)ms"),
-                    SelectionOption(title: tr("切换 Spotlight 防索引开关", "Toggle Prevent Spotlight Index"), subtitle: (curP.preventSpotlightIndex ?? true) ? "ON" : "OFF"),
-                    SelectionOption(title: tr("↩ 返回", "↩ Back"), subtitle: nil)
-                ]
-                if let aSel = promptInteractiveRadio(title: tr("选择要修改的属性：", "Select property:"), options: attrOptions) {
-                    if aSel == 0 {
-                        print(tr("输入新描述名称: ", "Enter new description: "), terminator: "")
-                        let val = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        config.profiles[eIdx].description = val.isEmpty ? nil : val
-                        _ = saveConfig(config)
-                    } else if aSel == 1 {
-                        print(tr("输入新探测主机: ", "Enter new host: "), terminator: "")
-                        let val = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        if !val.isEmpty { config.profiles[eIdx].host = val; _ = saveConfig(config) }
-                    } else if aSel == 2 {
-                        print(tr("输入新端口 [默认 445]: ", "Enter new port [Default 445]: "), terminator: "")
-                        if let val = Int(readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") {
-                            config.profiles[eIdx].port = val; _ = saveConfig(config)
-                        }
-                    } else if aSel == 3 {
-                        print(tr("输入超时毫秒 [默认 1000]: ", "Enter timeout ms [Default 1000]: "), terminator: "")
-                        if let val = Int(readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") {
-                            config.profiles[eIdx].timeoutMs = val; _ = saveConfig(config)
-                        }
-                    } else if aSel == 4 {
-                        let cur = config.profiles[eIdx].preventSpotlightIndex ?? true
-                        config.profiles[eIdx].preventSpotlightIndex = !cur
-                        _ = saveConfig(config)
-                    }
+        操作：
+          [a] 从当前挂载卷追加共享 / 手动输入路径
+          [d] 删除/移除指定共享
+          [t] 切换启用/禁用状态
+          [b] 返回上一级菜单 (或按 Esc)
+        """, """
+
+        Actions:
+          [a] Append share from active mount / manual input
+          [d] Remove specified share
+          [t] Toggle enabled/disabled state
+          [b] Return to parent menu (or press Esc)
+        """))
+
+        let promptText = tr("请选择操作: ", "Select action: ")
+        guard let input = promptLineWithEsc(prompt: promptText) else { return }
+        let action = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if action == "b" {
+            return
+        } else if action == "a" {
+            print(tr("\n选择追加共享方式：\n  [1] 从当前挂载卷追加\n  [2] 手动录入共享路径\n",
+                     "\nSelect method:\n  [1] Append from active mounted volumes\n  [2] Manually enter share path\n"))
+            let mPrompt = tr("请选择 [1/2] (默认 1, 按 Esc 取消): ", "Select [1/2] (Default 1, Esc to cancel): ")
+            guard let mChoice = promptLineWithEsc(prompt: mPrompt, defaultValue: "1") else { continue }
+            let method = mChoice.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if method == "2" {
+                let pathPrompt = tr("请输入从属 SMB 共享路径: ", "Enter SMB share path: ")
+                guard let pathInput = promptLineWithEsc(prompt: pathPrompt) else { continue }
+                let rawURL = pathInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                if rawURL.isEmpty { continue }
+
+                // 防呆检测：检查是否已存在于该主机名下
+                let sName = extractShareName(from: rawURL) ?? "share"
+                let stdMount = deriveStandardMountPoint(from: rawURL) ?? "/Volumes/\(sName)"
+                if hostConfig.shares.contains(where: { $0.smbURL.lowercased() == rawURL.lowercased() || $0.mountPoint == stdMount }) {
+                    print(tr("提示：共享路径 \(rawURL) 已存在于该主机名下，已自动忽略重复添加。",
+                             "Notice: Share path \(rawURL) already exists under this host, duplicate ignored."))
+                    continue
                 }
+
+                if let err = validateMountTargetURL(rawURL) {
+                    print("✗ \(err)")
+                    continue
+                }
+
+                print(tr("标准目标挂载点将设置为: \(stdMount)", "Standard mount point will be set to: \(stdMount)"))
+                let confirmPrompt = tr("确认添加该共享？[Y/n]: ", "Confirm adding this share? [Y/n]: ")
+                guard let confirm = promptLineWithEsc(prompt: confirmPrompt, defaultValue: "Y") else { continue }
+                let tc = confirm.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if tc == "y" || tc == "yes" {
+                    hostConfig.shares.append(SMBShareConfig(name: sName, smbURL: rawURL, mountPoint: stdMount, enabled: true))
+                    print(tr("\n提示：对于手动添加的新网络共享，请确保已在 macOS 系统中成功连接过一次并勾选“在我的钥匙串中记住此密码”，认证凭据将由系统钥匙串自动安全管理。",
+                             "\nNote: For manually added network shares, ensure you have connected at least once in macOS and checked 'Remember password in Keychain'. Credentials are managed securely by Keychain."))
+                    print(tr("已添加共享 [\(sName)]。", "Added share [\(sName)]."))
+                }
+            } else {
+                let candidateMounts = discoverCandidateHosts().first(where: { $0.host == hostConfig.host })?.mounts ?? []
+                if candidateMounts.isEmpty {
+                    print(tr("系统未在该主机下检测到已挂载卷宗，请选择手动录入。",
+                             "No active mounts detected for this host. Please enter manually."))
+                    continue
+                }
+                print(tr("\n发现以下已挂载的共享卷宗：", "\nDiscovered mounted share volumes:"))
+                for (idx, m) in candidateMounts.enumerated() {
+                    let stdMount = deriveStandardMountPoint(from: m.smbURL) ?? "/Volumes/\(m.shareName)"
+                    print("  [\(idx + 1)] \(m.shareName) (\(redactedSMBURL(m.smbURL)) -> \(stdMount))")
+                }
+                let pickPrompt = tr("请选择要追加的共享编号 [1-\(candidateMounts.count)] (按 Esc 取消): ",
+                                    "Select share to add [1-\(candidateMounts.count)] (Esc to cancel): ")
+                guard let pInput = promptLineWithEsc(prompt: pickPrompt),
+                      let pIdx = Int(pInput.trimmingCharacters(in: .whitespacesAndNewlines)),
+                      pIdx >= 1 && pIdx <= candidateMounts.count else { continue }
+                let chosen = candidateMounts[pIdx - 1]
+                let stdMount = deriveStandardMountPoint(from: chosen.smbURL) ?? "/Volumes/\(chosen.shareName)"
+                if hostConfig.shares.contains(where: { $0.smbURL.lowercased() == chosen.smbURL.lowercased() || $0.mountPoint == stdMount }) {
+                    print(tr("提示：共享路径 \(chosen.smbURL) 已存在于该主机名下，已自动忽略重复添加。",
+                             "Notice: Share path \(chosen.smbURL) already exists under this host, duplicate ignored."))
+                    continue
+                }
+                hostConfig.shares.append(SMBShareConfig(name: chosen.shareName, smbURL: chosen.smbURL, mountPoint: stdMount, enabled: true))
+                print(tr("已添加共享 [\(chosen.shareName)]。", "Added share [\(chosen.shareName)]."))
             }
-        case 3:
-            if config.profiles.count <= 1 {
-                print(tr("至少需要保留 1 个策略，不可全部删除。", "At least 1 profile must be kept."))
-                pauseForUser()
+        } else if action == "d" {
+            if hostConfig.shares.isEmpty {
+                print(tr("当前无共享可删除。", "No shares to delete."))
                 continue
             }
-            let delList = config.profiles.enumerated().map {
-                SelectionOption(title: "[\($0 + 1)] \($1.id)", subtitle: "\($1.description ?? "")")
+            let delPrompt = tr("请输入要删除的共享编号 [1-\(hostConfig.shares.count)] (按 Esc 取消): ",
+                               "Enter share number to delete [1-\(hostConfig.shares.count)] (Esc to cancel): ")
+            guard let delInput = promptLineWithEsc(prompt: delPrompt),
+                  let delIdx = Int(delInput.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  delIdx >= 1 && delIdx <= hostConfig.shares.count else { continue }
+            let removed = hostConfig.shares.remove(at: delIdx - 1)
+            print(tr("已从主机移除共享 [\(removed.name)]。", "Removed share [\(removed.name)] from host."))
+        } else if action == "t" {
+            if hostConfig.shares.isEmpty {
+                print(tr("当前无共享可切换状态。", "No shares to toggle."))
+                continue
             }
-            if let dIdx = promptInteractiveRadio(title: tr("选择要删除的策略：", "Select profile to delete:"), options: delList) {
-                config.profiles.remove(at: dIdx)
-                _ = saveConfig(config)
-                print(tr("✓ 策略已删除！", "✓ Profile deleted!"))
-                pauseForUser()
-            }
-        default:
-            return
+            let togglePrompt = tr("请输入要切换状态的共享编号 [1-\(hostConfig.shares.count)] (按 Esc 取消): ",
+                                  "Enter share number to toggle [1-\(hostConfig.shares.count)] (Esc to cancel): ")
+            guard let tInput = promptLineWithEsc(prompt: togglePrompt),
+                  let tIdx = Int(tInput.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  tIdx >= 1 && tIdx <= hostConfig.shares.count else { continue }
+            hostConfig.shares[tIdx - 1].enabled.toggle()
+            let newState = hostConfig.shares[tIdx - 1].enabled ? tr("启用", "Enabled") : tr("禁用", "Disabled")
+            print(tr("共享 [\(hostConfig.shares[tIdx - 1].name)] 状态已切换为: [\(newState)]",
+                     "Share [\(hostConfig.shares[tIdx - 1].name)] toggled to: [\(newState)]"))
+        } else {
+            print(tr("无效的选择，请重新输入。", "Invalid choice, please re-enter."))
         }
     }
 }
 
 func manageUpdateChannel(config: inout AutomntConfig) {
-    let options = [
-        SelectionOption(title: "off", subtitle: tr("关闭自动检查", "Disable auto-checks")),
-        SelectionOption(title: "notify", subtitle: tr("新版本系统通知提醒", "Notify only")),
-        SelectionOption(title: "auto", subtitle: tr("后台静默下载并自动升级", "Auto silent update"))
-    ]
-    if let sel = promptInteractiveRadio(title: tr("\n选择自动更新信道：", "\nSelect update channel:"), options: options) {
-        config.updateChannel = options[sel].title
-        _ = saveConfig(config)
-        print(tr("✓ 更新信道已修改为: \(options[sel].title)", "✓ Update channel set to: \(options[sel].title)"))
-        pauseForUser()
+    print(tr("\n软件更新策略设置：", "\nSoftware Update Channel:"))
+    print(tr("""
+      [1] off    - 关闭自动检查
+      [2] notify - 新版本系统通知提醒
+      [3] auto   - 后台静默下载并自动升级
+    """, """
+      [1] off    - Disable auto-checks
+      [2] notify - Notify only
+      [3] auto   - Auto silent update
+    """))
+    let prompt = tr("请选择更新策略 [1-3] (按 Esc 取消): ", "Select update policy [1-3] (Esc to cancel): ")
+    guard let input = promptLineWithEsc(prompt: prompt) else { return }
+    let choice = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    switch choice {
+    case "1", "off":
+        config.updateChannel = "off"
+        print(tr("✓ 更新信道已修改为: off", "✓ Update channel set to: off"))
+    case "2", "notify":
+        config.updateChannel = "notify"
+        print(tr("✓ 更新信道已修改为: notify", "✓ Update channel set to: notify"))
+    case "3", "auto":
+        config.updateChannel = "auto"
+        print(tr("✓ 更新信道已修改为: auto", "✓ Update channel set to: auto"))
+    default:
+        print(tr("未识别的策略，未做修改。", "Unrecognized policy, unchanged."))
     }
 }
 
@@ -1778,38 +2257,174 @@ func manageConfiguration() {
           var config = loadConfig(from: configURL) else { return }
 
     while true {
-        let channelStr = getUpdateChannelDisplay(config.updateChannel ?? "off")
-        let daemonStr = getLaunchAgentStatusSummary()
-        let menuOptions = [
-            SelectionOption(title: tr("挂载目标管理", "Manage Mount Targets"), subtitle: tr("添加或删除共享挂载点", "Add or remove shares")),
-            SelectionOption(title: tr("网络策略管理", "Manage Network Profiles"), subtitle: tr("配置优先级与探测目标", "Manage priority and probe hosts")),
-            SelectionOption(title: tr("自动更新信道设置", "Update Channel Settings"), subtitle: channelStr),
-            SelectionOption(title: tr("部署或重载守护服务", "Deploy/Reload Daemon"), subtitle: daemonStr),
-            SelectionOption(title: tr("🚪 退出管理", "🚪 Exit"), subtitle: nil)
-        ]
+        let hostsHint = config.hosts.isEmpty
+            ? tr("  (当前未配置任何主机)", "  (No hosts configured)")
+            : config.hosts.enumerated().map { (idx, h) in
+                let aliasText = h.alias.map { " [\($0)]" } ?? ""
+                let enabledSharesCount = h.shares.filter { $0.enabled }.count
+                return tr("  顺位 \(idx + 1): \(h.host)\(aliasText) (启用的共享: \(enabledSharesCount) 个)",
+                          "  Priority \(idx + 1): \(h.host)\(aliasText) (Enabled shares: \(enabledSharesCount))")
+            }.joined(separator: "\n")
 
+        let maxChoice = max(1, config.hosts.count)
         print(tr("""
-        automnt - 日常配置管理 (v\(automntVersion))
-        ====================================
-        配置文件: \(configURL.path)
-        守护服务: \(daemonStr)
+        === automnt 日常配置管理 ===
+        活动配置文件: \(configURL.path) (规范版本: \(config.version))
+
+        当前配置的主机顺位列表 (探测时按由高到低排他执行):
+        \(hostsHint)
+
+        管理操作：
+          [1-\(maxChoice)] 进入指定主机管理其从属共享
+          [a]   新增主机 (扫描当前挂载 / 手动录入)
+          [m]   调整主机顺位优先级
+          [d]   删除主机 (支持清空所有主机)
+          [u]   修改自动更新检查策略
+          [q]   保存并退出 (按 Esc 等同放弃未保存修改退出)
         """, """
-        automnt - Daily Configuration Management (v\(automntVersion))
-        =======================================================
-        Config: \(configURL.path)
-        Daemon: \(daemonStr)
+        === automnt Daily Configuration Management ===
+        Active config: \(configURL.path) (Schema version: \(config.version))
+
+        Configured hosts priority pipeline (probed top-down with short-circuit):
+        \(hostsHint)
+
+        Actions:
+          [1-\(maxChoice)] Enter host to manage shares
+          [a]   Add new host (Scan current mounts / Manual entry)
+          [m]   Reorder host priority
+          [d]   Delete host (Supports deleting all hosts)
+          [u]   Modify update channel
+          [q]   Save and exit (Esc discards unsaved changes)
         """))
 
-        guard let sel = promptInteractiveRadio(title: tr("请选择要执行的操作：", "Choose action:"), options: menuOptions) else { break }
-        switch sel {
-        case 0: manageMountTargets(config: &config)
-        case 1: manageNetworkProfiles(config: &config)
-        case 2: manageUpdateChannel(config: &config)
-        case 3:
-            installLaunchAgent()
-            pauseForUser()
-        default:
+        let prompt = tr("请选择操作 [1-\(maxChoice) / a / m / d / u / q]: ",
+                        "Select action [1-\(maxChoice) / a / m / d / u / q]: ")
+        guard let input = promptLineWithEsc(prompt: prompt) else {
+            print(tr("已放弃未保存修改并退出。", "Discarded unsaved changes and exited."))
             return
+        }
+        let action = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if action == "q" {
+            _ = saveConfig(config, to: configURL)
+            print(tr("✓ 配置已保存并退出。", "✓ Configuration saved and exited."))
+            return
+        } else if action == "a" {
+            print(tr("\n新增主机接入方式：\n  [1] 扫描当前挂载网络存储\n  [2] 手动录入新主机\n",
+                     "\nAdd host method:\n  [1] Scan active mounted storage\n  [2] Manually enter new host\n"))
+            let methodChoice = promptLineWithEsc(prompt: tr("请选择 [1/2] (默认 1, 按 Esc 取消): ", "Select [1/2] (Default 1, Esc to cancel): "), defaultValue: "1")
+            if let method = methodChoice?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                if method == "2" {
+                    if let newHost = handleManualHostEntry(existingHosts: config.hosts) {
+                        config.hosts.append(newHost)
+                        _ = saveConfig(config, to: configURL)
+                    }
+                } else {
+                    let candidateHosts = discoverCandidateHosts().filter { c in
+                        !config.hosts.contains(where: { $0.host == c.host })
+                    }
+                    if candidateHosts.isEmpty {
+                        print(tr("未扫描到尚未配置的新挂载主机，请尝试手动录入。",
+                                 "No unconfigured mounted hosts discovered. Please try manual entry."))
+                    } else {
+                        print(tr("\n发现以下未配置的候选主机：", "\nDiscovered unconfigured candidate hosts:"))
+                        for (idx, c) in candidateHosts.enumerated() {
+                            print("  [\(idx + 1)] \(c.host) (\(c.mounts.count) 个共享)")
+                        }
+                        let cPrompt = tr("请选择要添加的主机 [1-\(candidateHosts.count)] (按 Esc 取消): ",
+                                         "Select host to add [1-\(candidateHosts.count)] (Esc to cancel): ")
+                        if let cInput = promptLineWithEsc(prompt: cPrompt),
+                           let cIdx = Int(cInput.trimmingCharacters(in: .whitespacesAndNewlines)),
+                           cIdx >= 1 && cIdx <= candidateHosts.count {
+                            let candidate = candidateHosts[cIdx - 1]
+                            if let newHost = handleCandidateHostConfiguration(candidate: candidate) {
+                                config.hosts.append(newHost)
+                                _ = saveConfig(config, to: configURL)
+                            }
+                        }
+                    }
+                }
+            }
+        } else if action == "m" {
+            if config.hosts.count < 2 {
+                print(tr("当前配置主机少于 2 台，无需调整顺位。", "Fewer than 2 hosts configured, no reordering needed."))
+                continue
+            }
+            print(tr("\n当前主机顺位：", "\nCurrent host priority:"))
+            for (idx, h) in config.hosts.enumerated() {
+                let aliasText = h.alias.map { " [\($0)]" } ?? ""
+                print("  [\(idx + 1)] \(h.host)\(aliasText)")
+            }
+            let pickPrompt = tr("选择要调整顺位的主机编号 [1-\(config.hosts.count)] (按 Esc 取消): ",
+                                "Select host to move [1-\(config.hosts.count)] (Esc to cancel): ")
+            guard let pickInput = promptLineWithEsc(prompt: pickPrompt),
+                  let pickIdx = Int(pickInput.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  pickIdx >= 1 && pickIdx <= config.hosts.count else { continue }
+            let hostIndex = pickIdx - 1
+
+            let dirPrompt = tr("移动方向：[u] 上移一位 / [d] 下移一位 (按 Esc 取消): ",
+                               "Direction: [u] Move Up / [d] Move Down (Esc to cancel): ")
+            guard let dirInput = promptLineWithEsc(prompt: dirPrompt) else { continue }
+            let dir = dirInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if dir == "u" && hostIndex > 0 {
+                config.hosts.swapAt(hostIndex, hostIndex - 1)
+                _ = saveConfig(config, to: configURL)
+                print(tr("✓ 主机顺位已提升！", "✓ Host moved up!"))
+            } else if dir == "d" && hostIndex < config.hosts.count - 1 {
+                config.hosts.swapAt(hostIndex, hostIndex + 1)
+                _ = saveConfig(config, to: configURL)
+                print(tr("✓ 主机顺位已降低！", "✓ Host moved down!"))
+            }
+        } else if action == "d" {
+            if config.hosts.isEmpty {
+                print(tr("当前无主机可删除。", "No hosts to delete."))
+                continue
+            }
+            print(tr("\n当前配置的主机：", "\nConfigured hosts:"))
+            for (idx, h) in config.hosts.enumerated() {
+                let aliasText = h.alias.map { " [\($0)]" } ?? ""
+                print("  [\(idx + 1)] \(h.host)\(aliasText)")
+            }
+            let delPrompt = tr("请输入要删除的主机编号 [1-\(config.hosts.count)] (按 Esc 取消): ",
+                               "Enter host number to delete [1-\(config.hosts.count)] (Esc to cancel): ")
+            guard let delInput = promptLineWithEsc(prompt: delPrompt),
+                  let delIdx = Int(delInput.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  delIdx >= 1 && delIdx <= config.hosts.count else { continue }
+            let removed = config.hosts.remove(at: delIdx - 1)
+            _ = saveConfig(config, to: configURL)
+            let aliasDisplay = removed.alias ?? removed.host
+            print(tr("✓ 已移除主机 [\(aliasDisplay)]。", "✓ Removed host [\(aliasDisplay)]."))
+
+            if config.hosts.isEmpty {
+                print(tr("""
+
+                当前主机列表为空 (0 台主机)。
+                系统将该状态视为合法的静默休眠配置。
+                """, """
+
+                All hosts removed (0 hosts).
+                This is considered a valid dormant sleep configuration.
+                """))
+                let saveEmptyPrompt = tr("保存并退出配置？[Y/n]: ", "Save and exit? [Y/n]: ")
+                let saveChoice = promptLineWithEsc(prompt: saveEmptyPrompt, defaultValue: "Y")
+                if let choice = saveChoice?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                   choice == "y" || choice == "yes" {
+                    _ = saveConfig(config, to: configURL)
+                    print(tr("配置已更新。后台服务在被系统唤醒时将处于安全休眠状态。",
+                             "Configuration updated. The background daemon will stay in safe dormant sleep."))
+                    return
+                } else {
+                    print(tr("已取消保存退出，继续停留在配置菜单。", "Cancelled saving and exit, staying in configuration menu."))
+                }
+            }
+        } else if action == "u" {
+            manageUpdateChannel(config: &config)
+            _ = saveConfig(config, to: configURL)
+        } else if let num = Int(action), num >= 1, num <= config.hosts.count {
+            manageHostShares(hostConfig: &config.hosts[num - 1], allHosts: config.hosts)
+            _ = saveConfig(config, to: configURL)
+        } else {
+            print(tr("无效的选择，请重新输入。", "Invalid choice, please re-enter."))
         }
     }
 }
@@ -2190,14 +2805,31 @@ func checkServiceStatus() {
     print(tr("  • 守护服务状态: \(getLaunchAgentStatusSummary())", "  • Service Summary: \(getLaunchAgentStatusSummary())"))
 
     if let config = loadConfig(from: activeConfigURL, migrate: false) {
-        print(tr("\n已配置策略流水线 (\(config.profiles.count) 个)：", "\nConfigured Profile Pipeline (\(config.profiles.count)):"))
-        for (idx, p) in config.profiles.enumerated() {
-            print(tr("  [\(idx + 1)] '\(p.id)' (\(p.description ?? "")) -> 主机: \(p.host):\(p.port ?? 445), 超时: \(p.timeoutMs ?? 1000)ms, 挂载目标: \(p.targets.count) 个",
-                     "  [\(idx + 1)] '\(p.id)' (\(p.description ?? "")) -> Host: \(p.host):\(p.port ?? 445), Timeout: \(p.timeoutMs ?? 1000)ms, Targets: \(p.targets.count)"))
-            for t in p.targets {
-                let mounted = getKernelMountSource(for: t.mountPath) != nil
-                let statusStr = mounted ? tr("已挂载", "Mounted") : tr("未挂载", "Unmounted")
-                print("      - \(t.mountPath) [\(statusStr)] -> \(redactedSMBURL(t.url))")
+        if config.hosts.isEmpty && config.profiles.isEmpty {
+            print(tr("\n当前未配置任何主机 (安全休眠状态)。", "\nNo hosts configured (safe dormant sleep state)."))
+        } else if !config.hosts.isEmpty {
+            print(tr("\n已配置主机顺位 (\(config.hosts.count) 个)：", "\nConfigured Host Pipeline (\(config.hosts.count)):"))
+            for (idx, h) in config.hosts.enumerated() {
+                let aliasText = h.alias.map { " '\($0)'" } ?? ""
+                print(tr("  [\(idx + 1)]\(aliasText) -> 主机: \(h.host):\(h.port), 超时: \(h.timeoutMs)ms, 共享: \(h.shares.count) 个",
+                         "  [\(idx + 1)]\(aliasText) -> Host: \(h.host):\(h.port), Timeout: \(h.timeoutMs)ms, Shares: \(h.shares.count)"))
+                for s in h.shares {
+                    let mounted = getKernelMountSource(for: s.mountPoint) != nil
+                    let statusStr = mounted ? tr("已挂载", "Mounted") : tr("未挂载", "Unmounted")
+                    let enabledStr = s.enabled ? tr("启用", "Enabled") : tr("禁用", "Disabled")
+                    print("      - \(s.name) (\(s.mountPoint)) [\(statusStr), \(enabledStr)] -> \(redactedSMBURL(s.smbURL))")
+                }
+            }
+        } else {
+            print(tr("\n已配置策略流水线 (\(config.profiles.count) 个)：", "\nConfigured Profile Pipeline (\(config.profiles.count)):"))
+            for (idx, p) in config.profiles.enumerated() {
+                print(tr("  [\(idx + 1)] '\(p.id)' (\(p.description ?? "")) -> 主机: \(p.host):\(p.port ?? 445), 超时: \(p.timeoutMs ?? 1000)ms, 挂载目标: \(p.targets.count) 个",
+                         "  [\(idx + 1)] '\(p.id)' (\(p.description ?? "")) -> Host: \(p.host):\(p.port ?? 445), Timeout: \(p.timeoutMs ?? 1000)ms, Targets: \(p.targets.count)"))
+                for t in p.targets {
+                    let mounted = getKernelMountSource(for: t.mountPath) != nil
+                    let statusStr = mounted ? tr("已挂载", "Mounted") : tr("未挂载", "Unmounted")
+                    print("      - \(t.mountPath) [\(statusStr)] -> \(redactedSMBURL(t.url))")
+                }
             }
         }
     } else {
@@ -2427,6 +3059,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
             failed += 1
             print("FAIL \(name)")
         }
+        fflush(stdout)
     }
 
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("automnt-selftest-\(UUID().uuidString)")
@@ -2483,7 +3116,8 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
         retryPolicy: RetryPolicy(),
         lastUpdateCheckTimestamp: nil,
         lastNotifiedVersion: nil,
-        profiles: [testProfile]
+        hosts: [HostConfig(host: "nas.local", alias: "本地局域网直连", shares: [SMBShareConfig(name: "share", smbURL: "smb://nas.local/share", mountPoint: "/Volumes/share")])],
+        profiles: []
     )
     check(!configNeedsMigration(testConfig), "modern config does not need migration")
 
@@ -2491,9 +3125,9 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     oldConfig.version = "2.7.1"
     check(configNeedsMigration(oldConfig), "older version config needs migration")
 
-    var legacyIdConfig = testConfig
-    legacyIdConfig.profiles[0].id = "home_lan"
-    check(configNeedsMigration(legacyIdConfig), "legacy profile ID needs migration")
+    var legacyProfileConfig = testConfig
+    legacyProfileConfig.profiles = [testProfile]
+    check(configNeedsMigration(legacyProfileConfig), "legacy profiles need migration")
 
     // 4. Migration & Unknown fields retention
     let migrationURL = tempDir.appendingPathComponent("migration_test.plist")
@@ -2521,7 +3155,7 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     \t\t\t<array>
     \t\t\t\t<dict>
     \t\t\t\t\t<key>mount_path</key>
-    \t\t\t\t\t<string>/Volumes/share</string>
+    \t\t\t\t\t<string>/Volumes/share-1</string>
     \t\t\t\t\t<key>url</key>
     \t\t\t\t\t<string>smb://nas.local/share</string>
     \t\t\t\t</dict>
@@ -2536,7 +3170,8 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     let migrationSuccess = migrateConfigIfNeeded(config: &loadedLegacy, at: migrationURL)
     check(migrationSuccess, "config migration executes successfully")
     check(loadedLegacy.version == automntVersion, "migrated version is updated to current")
-    check(loadedLegacy.profiles.first?.id == "local_lan", "migrated profile id updated to local_lan")
+    check(loadedLegacy.hosts.first?.host == "nas.local", "migrated host is updated to hosts")
+    check(loadedLegacy.hosts.first?.shares.first?.mountPoint == "/Volumes/share", "migrated share mountPoint is /Volumes/share with -1 cleaned")
     let postMigrationString = (try? String(contentsOf: migrationURL, encoding: .utf8)) ?? ""
     check(postMigrationString.contains("custom_root_field") && postMigrationString.contains("custom_value"),
           "migration preserves unknown plist fields")
@@ -2635,9 +3270,19 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     check(!HostReachabilityProbe.canConnect(host: "127.0.0.1", port: 59999, timeoutMs: 50),
           "HostReachabilityProbe handles unreachable host gracefully")
 
-    // 12. Active Canonical Paths tests
+    // 12. Active Canonical Paths & Environment Simulation tests
+    let customConfigURL = tempDir.appendingPathComponent("custom_test.plist")
+    configURLOverride = customConfigURL
+    check(getActiveConfigURL() == customConfigURL, "getActiveConfigURL respects configURLOverride")
+    configURLOverride = nil
     check(getActiveConfigURL().lastPathComponent == "automnt.plist", "getActiveConfigURL targets automnt.plist")
     check(getActiveInstalledBinaryURL().lastPathComponent == "automnt", "getActiveInstalledBinaryURL targets automnt executable")
+
+    isTTYOverride = false
+    check(!isInteractiveTerminal(), "isInteractiveTerminal respects isTTYOverride = false")
+    isTTYOverride = true
+    check(isInteractiveTerminal(), "isInteractiveTerminal respects isTTYOverride = true")
+    isTTYOverride = nil
 
     // 13. InstallationManager & InstallState
     let downloadBin = tempDir.appendingPathComponent("downloads/automnt")
@@ -2668,6 +3313,175 @@ func runSelfTests(includeNetworkChecks: Bool = false) -> Bool {
     var unhealthyState = healthyState
     unhealthyState.isServicePlistValid = false
     check(!unhealthyState.isHealthy, "InstallState detects unhealthy state when service plist is invalid")
+
+    // 14. Feature 002 Foundational tests (T003 - T008)
+    // Mount point derivation (T005)
+    check(deriveStandardMountPoint(from: "smb://192.168.1.100/Public") == "/Volumes/Public",
+          "deriveStandardMountPoint extracts clean /Volumes/Public")
+    check(deriveStandardMountPoint(from: "smb://192.168.1.100/data-1") == "/Volumes/data-1",
+          "deriveStandardMountPoint strictly preserves legal data-1 share name")
+    check(deriveStandardMountPoint(from: "//user@192.168.1.100/Work") == "/Volumes/Work",
+          "deriveStandardMountPoint strips credentials and normalizes to /Volumes/Work")
+    check(deriveStandardMountPoint(from: "smb://server.local/My%20Data") == "/Volumes/My Data",
+          "deriveStandardMountPoint decodes percent-encoded share name")
+
+    // Zero-host config inspection (T004)
+    let zeroHostConfig = AutomntConfig(version: automntVersion, hosts: [])
+    let zeroHostURL = tempDir.appendingPathComponent("zero_host.plist")
+    if let data = try? PropertyListEncoder().encode(zeroHostConfig) {
+        try? data.write(to: zeroHostURL)
+        check(inspectConfigFile(at: zeroHostURL).state == .usable,
+              "inspectConfigFile treats zero-host config as usable rather than invalid")
+    }
+
+    // HostConfig & SMBShareConfig serialization (T003)
+    let testShare = SMBShareConfig(name: "Data", smbURL: "smb://10.0.0.1/Data", mountPoint: "/Volumes/Data")
+    let testHost = HostConfig(host: "10.0.0.1", alias: "My NAS", port: 445, timeoutMs: 1200, shares: [testShare])
+    let multiHostConfig = AutomntConfig(version: automntVersion, hosts: [testHost])
+    let multiHostURL = tempDir.appendingPathComponent("multi_host.plist")
+    if let data = try? PropertyListEncoder().encode(multiHostConfig) {
+        try? data.write(to: multiHostURL)
+        let loaded = inspectConfigFile(at: multiHostURL).config
+        check(loaded?.hosts.first?.alias == "My NAS", "HostConfig alias is preserved across plist encode/decode")
+        check(loaded?.hosts.first?.port == 445 && loaded?.hosts.first?.timeoutMs == 1200, "HostConfig port and timeoutMs preserved across encode/decode")
+    }
+
+    // promptLineWithEsc non-TTY fallback & simulation (T006)
+    mockLineInput = ""
+    check(promptLineWithEsc(prompt: "", defaultValue: "default_fallback") == "default_fallback",
+          "promptLineWithEsc returns defaultValue when input is empty")
+    mockLineInput = "  Custom NAS  "
+    check(promptLineWithEsc(prompt: "", defaultValue: "default_fallback") == "Custom NAS",
+          "promptLineWithEsc trims and returns valid user input")
+    mockLineInput = "\u{1B}"
+    check(promptLineWithEsc(prompt: "") == nil,
+          "promptLineWithEsc returns nil on Esc cancel")
+    mockLineInput = nil
+
+    // 15. User Story 1 Tests (T009 - T013)
+    let mockMount1 = DiscoveredMount(
+        mountPoint: "/Volumes/Public-1",
+        rawSmbUrl: "smb://192.168.1.100/Public",
+        host: "192.168.1.100",
+        shareName: "Public",
+        cleanMountPoint: "/Volumes/Public",
+        standardSMBURL: "smb://192.168.1.100/Public"
+    )
+    let mockMount2 = DiscoveredMount(
+        mountPoint: "/Volumes/data-1",
+        rawSmbUrl: "smb://192.168.1.100/data-1",
+        host: "192.168.1.100",
+        shareName: "data-1",
+        cleanMountPoint: "/Volumes/data-1",
+        standardSMBURL: "smb://192.168.1.100/data-1"
+    )
+    let mockGroup = DiscoveredHostGroup(host: "192.168.1.100", mounts: [mockMount1, mockMount2], isConfigured: false)
+
+    // Test drill-down configuration via handleCandidateHostConfiguration
+    // Inputs: alias ("家庭 NAS"), selection ("all"), confirm ("Y")
+    mockLineInputs = ["家庭 NAS", "all", "Y"]
+    let drilledHost = handleCandidateHostConfiguration(candidate: mockGroup)
+    check(drilledHost != nil, "handleCandidateHostConfiguration succeeds with valid inputs")
+    check(drilledHost?.alias == "家庭 NAS", "HostConfig alias is recorded properly")
+    check(drilledHost?.shares.count == 2, "Both candidate mounts selected")
+    check(drilledHost?.shares[0].mountPoint == "/Volumes/Public", "Derived mount point is /Volumes/Public without -1 suffix")
+    check(drilledHost?.shares[1].mountPoint == "/Volumes/data-1", "Legal data-1 mount point strictly preserved")
+
+    // Test skip host branch in runInitWizard
+    // Inputs: "s" (skip hosts), "1" (update channel off), "n" (skip daemon)
+    let initWizardURL = tempDir.appendingPathComponent("init_wizard_skip.plist")
+    configURLOverride = initWizardURL
+    mockCandidateHosts = [mockGroup]
+    mockLineInputs = ["s", "1", "n"]
+    let initSuccess = runInitWizard(offerServiceInstallation: true)
+    check(initSuccess, "runInitWizard completes successfully when skipping hosts")
+    let skippedConfig = inspectConfigFile(at: initWizardURL).config
+    check(skippedConfig?.hosts.isEmpty == true, "Skipped wizard produces a valid 0-host configuration")
+    check(skippedConfig?.updateChannel == "off", "Update channel defaults to off")
+    configURLOverride = nil
+    mockCandidateHosts = nil
+    mockLineInputs = nil
+
+    // 16. User Story 2 Tests (T014, T015)
+    check(deriveStandardMountPoint(from: "smb://fileserver/Public-1") == "/Volumes/Public-1", "SMB URL with literal Public-1 is treated as standard /Volumes/Public-1")
+    check(deriveStandardMountPoint(from: "smb://fileserver/Backup-2") == "/Volumes/Backup-2", "SMB URL with literal Backup-2 is treated as standard /Volumes/Backup-2")
+    check(deriveStandardMountPoint(from: "smb://host/Shared%20Folder") == "/Volumes/Shared Folder", "Spaces in URL decoded cleanly")
+
+    // 17. User Story 3 Tests (T016 - T019)
+    var testHostMgmt = HostConfig(host: "192.168.1.100", alias: "Home NAS", shares: [
+        SMBShareConfig(name: "Public", smbURL: "smb://192.168.1.100/Public", mountPoint: "/Volumes/Public")
+    ])
+    // Test share removal in manageHostShares: 'd', '1', 'b'
+    mockLineInputs = ["d", "1", "b"]
+    manageHostShares(hostConfig: &testHostMgmt, allHosts: [testHostMgmt])
+    check(testHostMgmt.shares.isEmpty, "manageHostShares successfully removes selected share")
+
+    // Test duplicate share detection and prevention
+    testHostMgmt.shares = [SMBShareConfig(name: "Public", smbURL: "smb://192.168.1.100/Public", mountPoint: "/Volumes/Public")]
+    mockLineInputs = ["a", "2", "smb://192.168.1.100/Public", "b"]
+    manageHostShares(hostConfig: &testHostMgmt, allHosts: [testHostMgmt])
+    check(testHostMgmt.shares.count == 1, "Duplicate share is ignored by manageHostShares")
+    mockLineInputs = nil
+
+    // 18. User Story 4 Tests (T020 - T022)
+    mockLineInputs = ["\u{1B}"]
+    check(promptLineWithEsc(prompt: "Test: ") == nil, "promptLineWithEsc via mockLineInputs returns nil on Esc key")
+    mockLineInputs = ["   sequence test   "]
+    check(promptLineWithEsc(prompt: "Test: ") == "sequence test", "promptLineWithEsc via mockLineInputs trims surrounding whitespace")
+    mockLineInputs = [""]
+    check(promptLineWithEsc(prompt: "Test: ", defaultValue: "seq_fallback") == "seq_fallback", "promptLineWithEsc via mockLineInputs returns fallback on empty input")
+    mockLineInputs = nil
+
+    // 19. User Story 5 Tests (T023, T024)
+    let emptyHostsConfig = AutomntConfig(version: automntVersion, updateChannel: "off", hosts: [], profiles: [])
+    let emptyHostsURL = tempDir.appendingPathComponent("empty_hosts.plist")
+    check(saveConfig(emptyHostsConfig, to: emptyHostsURL), "0-host config saved successfully")
+    let emptyInspection = inspectConfigFile(at: emptyHostsURL)
+    check(emptyInspection.state == .usable, "0-host config inspected as .usable")
+    check(emptyInspection.config?.hosts.isEmpty == true, "Loaded config has 0 hosts")
+
+    // 20. User Story 6 Tests (T025, T026)
+    let legacyProfile = NetworkProfile(
+        id: "office_lan",
+        description: "Office Direct",
+        host: "office.local",
+        port: 445,
+        timeoutMs: 1500,
+        preventSpotlightIndex: true,
+        targets: [
+            MountTarget(url: "smb://office.local/Finance", mountPath: "/Volumes/Finance-1")
+        ]
+    )
+    var legacyConfig = AutomntConfig(
+        version: "3.0.0",
+        updateChannel: "off",
+        retryPolicy: RetryPolicy(),
+        hosts: [],
+        profiles: [legacyProfile]
+    )
+    let legacyMigrationURL = tempDir.appendingPathComponent("legacy_v300_migration.plist")
+    check(saveConfig(legacyConfig, to: legacyMigrationURL), "Legacy config written to file")
+    check(configNeedsMigration(legacyConfig), "Legacy config with profiles requires migration")
+    check(migrateConfigIfNeeded(config: &legacyConfig, at: legacyMigrationURL), "migrateConfigIfNeeded succeeds")
+    check(legacyConfig.version == automntVersion, "Migrated config version is updated to current")
+    check(legacyConfig.hosts.count == 1, "Profiles converted to hosts")
+    check(legacyConfig.hosts[0].host == "office.local", "Host address preserved")
+    check(legacyConfig.hosts[0].alias == "Office Direct", "Description mapped to alias")
+    check(legacyConfig.hosts[0].shares.count == 1, "Shares preserved")
+    check(legacyConfig.hosts[0].shares[0].mountPoint == "/Volumes/Finance", "Historical -1 suffix cleaned to /Volumes/Finance")
+    check(legacyConfig.profiles.isEmpty, "Legacy profiles array emptied after migration")
+
+    // 21. Phase 10 Convergence Boundary Tests (T030 - T032)
+    // T030: Esc on deploy prompt skips LaunchAgent deployment safely
+    let wizardEscURL = tempDir.appendingPathComponent("init_wizard_esc.plist")
+    configURLOverride = wizardEscURL
+    mockCandidateHosts = [mockGroup]
+    mockLineInputs = ["s", "1", "\u{1B}"] // Skip hosts, channel off, Esc on deployment
+    let escDeploySuccess = runInitWizard(offerServiceInstallation: true)
+    check(escDeploySuccess, "runInitWizard completes successfully when Esc pressed on deploy prompt")
+    configURLOverride = nil
+    mockCandidateHosts = nil
+    mockLineInputs = nil
 
     print("\nSelf-tests: \(passed) passed, \(skipped) skipped, \(failed) failed")
     return failed == 0
@@ -2811,37 +3625,61 @@ func main() {
     ======================
     """))
 
-    var loadedConfig = loadConfig()
-    if loadedConfig == nil || loadedConfig?.profiles.isEmpty == true {
-        if isatty(STDIN_FILENO) != 0 {
+    let inspection = inspectConfigFile(at: getActiveConfigURL())
+    if inspection.state == .missing {
+        if isInteractiveTerminal() {
             print(tr("未检测到有效配置文件，正在自动启动初始化配置向导...\n",
                      "No valid configuration found. Starting setup wizard...\n"))
             let initSucceeded = runInitCommand()
-            if initSucceeded {
-                installLaunchAgent()
-                loadedConfig = loadConfig()
+            if !initSucceeded {
+                writeLog("Init wizard canceled or failed, exiting with status 1")
+                exit(1)
             }
+        } else {
+            fputs(tr("✗ 未找到有效配置，请在终端中运行 'automnt --init' 初始化。\n",
+                     "✗ Configuration not found. Please run 'automnt --init' first.\n"), stderr)
+            writeLog("Config missing, exiting with status 2")
+            exit(2)
         }
-    }
-
-    guard var config = loadedConfig, !config.profiles.isEmpty else {
-        fputs(tr("✗ 未找到有效配置，请在终端中运行 'automnt --init' 初始化。\n",
-                 "✗ Configuration not found or empty. Please run 'automnt --init' first.\n"), stderr)
-        writeLog("Config not found or empty, exiting with status 2")
+    } else if inspection.state == .invalid {
+        fputs(tr("✗ 配置文件损坏或无法解析，请检查配置或运行 'automnt --init' 重新生成。\n",
+                 "✗ Configuration is corrupted or invalid. Please check configuration or run 'automnt --init'.\n"), stderr)
+        writeLog("Config invalid: \(inspection.diagnostic ?? "unknown error"), exiting with status 2")
         exit(2)
     }
 
-    // 顺序评估网络策略路由
-    print(tr("\n[1] 顺序评估网络策略路由...", "\n[1] Evaluating policy profiles..."))
-    var matchedProfile: NetworkProfile?
+    guard var config = loadConfig() else {
+        fputs(tr("✗ 无法读取配置文件，退出。\n", "✗ Unable to read config, exiting.\n"), stderr)
+        writeLog("Unable to load config, exiting with status 2")
+        exit(2)
+    }
 
-    for (idx, profile) in config.profiles.enumerated() {
-        print(tr("  正在校验 [\(idx + 1)] '\(profile.id)' (\(profile.description ?? "")):",
-                 "  Checking [\(idx + 1)] '\(profile.id)' (\(profile.description ?? "")):"))
+    // 检查 0 台主机合法空配置状态 (Safe Dormant Sleep)
+    if config.hosts.isEmpty {
+        let sleepMsgZh = "当前未配置任何主机，automnt 保持安全休眠状态。"
+        let sleepMsgEn = "No hosts configured. automnt remains in safe dormant sleep state."
+        print(tr(sleepMsgZh, sleepMsgEn))
+        writeLog("No hosts configured; safe dormant sleep state entered, exiting with status 0")
+        exit(0)
+    }
 
-        let host = profile.host
-        let port = profile.port ?? 445
-        let timeout = profile.timeoutMs ?? 1000
+    // 顺序评估主机顺位探测 (Host-based Priority Probing)
+    print(tr("\n[1] 顺序评估主机顺位探测...", "\n[1] Evaluating host priority probing..."))
+    var matchedHost: HostConfig?
+
+    for (idx, hostConfig) in config.hosts.enumerated() {
+        guard hostConfig.enabled else {
+            print(tr("  跳过已禁用的主机 [\(idx + 1)] '\(hostConfig.host)'",
+                     "  Skipping disabled host [\(idx + 1)] '\(hostConfig.host)'"))
+            continue
+        }
+        let hostDisplay = hostConfig.alias.map { "'\($0)' (\(hostConfig.host))" } ?? "'\(hostConfig.host)'"
+        print(tr("  正在校验顺位 [\(idx + 1)] \(hostDisplay):",
+                 "  Checking priority [\(idx + 1)] \(hostDisplay):"))
+
+        let host = hostConfig.host
+        let port = hostConfig.port
+        let timeout = hostConfig.timeoutMs
         let retryRunner = EvaluationRetryRunner(policy: config.retryPolicy ?? RetryPolicy())
 
         print(tr("    正在探测 TCP 端口 \(port): \(host) (超时: \(timeout)ms)...",
@@ -2852,34 +3690,39 @@ func main() {
         }
 
         if reachable {
-            print(tr("    ✓ 策略命中！(目标 \(host):\(port) 可达)",
+            print(tr("    ✓ 顺位命中！(目标 \(host):\(port) 可达)",
                      "    ✓ Matched! (Host \(host):\(port) is reachable)"))
-            matchedProfile = profile
-            break
+            matchedHost = hostConfig
+            break // 强排他性短路：首个通畅则立即停止后续探测
         } else {
             print(tr("    ✗ 目标 \(host):\(port) 不可达，评估下一顺位。",
-                     "    ✗ Target \(host):\(port) unreachable, falling back to next profile."))
+                     "    ✗ Target \(host):\(port) unreachable, falling back to next host."))
         }
     }
 
-    guard let profile = matchedProfile else {
-        print(tr("\n[DONE] 当前网络状态未匹配到任何策略。正常退出。",
-                 "\n[DONE] No matching profile for current network state. Exiting cleanly."))
-        writeLog("No matching profile for current network, exiting with status 2")
+    guard let host = matchedHost else {
+        print(tr("\n[DONE] 当前网络状态未匹配到任何可用主机。正常退出。",
+                 "\n[DONE] No matching host reachable for current network state. Exiting cleanly."))
+        writeLog("No matching host reachable for current network, exiting with status 2")
         triggerBackgroundUpdateCheckIfNeeded(config: &config)
         exit(2)
     }
 
-    print(tr("\n[2] 执行匹配策略: '\(profile.id)'", "\n[2] Executing active profile: '\(profile.id)'"))
-    writeLog("Executing profile: \(profile.id)")
+    let hostTitle = host.alias.map { "\($0) (\(host.host))" } ?? host.host
+    print(tr("\n[2] 执行挂载命中主机: \(hostTitle)", "\n[2] Executing mounts for active host: \(hostTitle)"))
+    writeLog("Executing mounts for host: \(host.host)")
 
     var mountedCount = 0
     var failedCount = 0
-    for target in profile.targets {
-        print(tr("  目标: \(target.mountPath) (\(redactedSMBURL(target.url)))",
-                 "  Target: \(target.mountPath) (\(redactedSMBURL(target.url)))"))
+    for share in host.shares {
+        guard share.enabled else {
+            print(tr("  跳过已禁用共享: \(share.mountPoint)", "  Skipping disabled share: \(share.mountPoint)"))
+            continue
+        }
+        print(tr("  目标: \(share.mountPoint) (\(redactedSMBURL(share.smbURL)))",
+                 "  Target: \(share.mountPoint) (\(redactedSMBURL(share.smbURL)))"))
 
-        let status = ensureMountPointReady(target: target)
+        let status = ensureMountPointReady(target: MountTarget(url: share.smbURL, mountPath: share.mountPoint))
         switch status {
         case .alreadyMountedHealthy:
             print(tr("    ✓ 卷宗已挂载且响应正常，跳过。", "    ✓ Already mounted and responsive, skipping."))
@@ -2888,13 +3731,15 @@ func main() {
 
         case .readyToMount:
             print(tr("    正在通过 NetFS 系统框架静默挂载...", "    Mounting volume via NetFS..."))
-            if silentMount(urlString: target.url, mountPath: target.mountPath) {
+            if silentMount(urlString: share.smbURL, mountPath: share.mountPoint) {
                 mountedCount += 1
-                if profile.preventSpotlightIndex ?? true {
-                    disableSpotlightIndex(at: target.mountPath)
+                if host.preventSpotlightIndex {
+                    disableSpotlightIndex(at: share.mountPoint)
                 }
             } else {
                 failedCount += 1
+                fputs(tr("    ✗ 挂载失败，请检查网络连通性或钥匙串凭据。\n",
+                         "    ✗ Mount failed. Check network or Keychain credentials.\n"), stderr)
             }
 
         case .unmountFailed:
@@ -2903,9 +3748,9 @@ func main() {
         }
     }
 
-    print(tr("\n[DONE] 策略 '\(profile.id)' 下已成功挂载 \(mountedCount)/\(profile.targets.count) 个卷宗。",
-             "\n[DONE] \(mountedCount)/\(profile.targets.count) volumes mounted under '\(profile.id)'."))
-    writeLog("Finished execution of '\(profile.id)': \(mountedCount)/\(profile.targets.count) mounted.")
+    print(tr("\n[DONE] 主机 '\(hostTitle)' 下已成功挂载 \(mountedCount)/\(host.shares.count) 个卷宗。",
+             "\n[DONE] \(mountedCount)/\(host.shares.count) volumes mounted under '\(hostTitle)'."))
+    writeLog("Finished execution of '\(host.host)': \(mountedCount)/\(host.shares.count) mounted.")
     triggerBackgroundUpdateCheckIfNeeded(config: &config)
     if failedCount > 0 {
         writeLog("Mount evaluation failed for \(failedCount) configured target(s).")
